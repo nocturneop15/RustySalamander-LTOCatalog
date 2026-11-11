@@ -22,7 +22,8 @@ use lto_catalog::{Catalog, Tape};
 use lto_scsi::library::Devices;
 use ltfs::names::{from_windows, safe_relative, to_windows};
 use ltfs::Time;
-use sal_plugin_api::ui::{decode, encode};
+use lto_catalog::place::{self, Settings};
+use sal_plugin_api::ui::decode;
 use sal_plugin_api::{
     export_plugin, join_inner, mount_of, n_, tr, trf, Command, Field, FieldKind, FolderPlugin, Form, Index, Item, Mount, Plugin, Progress, Reply, Sink, Values, ATTR_DIRECTORY,
 };
@@ -31,68 +32,6 @@ use sal_plugin_api::{
 const SCHEME: &str = "lto";
 const AUTHORITY: &str = "library";
 const ATTR_READONLY: u32 = 0x1;
-
-/// The plugin's settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Settings {
-    /// The changer's device; empty: found.
-    changer: String,
-    /// Tape drives, comma-separated; empty: all.
-    drives: String,
-    /// The catalog file; empty: the default.
-    catalog: String,
-}
-
-impl Settings {
-    fn load(file: &Path) -> Settings {
-        let mut s = Settings::default();
-        let Ok(text) = fs::read_to_string(file) else { return s };
-        let Some(parts) = decode(&text) else { return s };
-        for kv in parts.chunks(2) {
-            if let [k, v] = kv {
-                match k.as_str() {
-                    "changer" => s.changer = v.clone(),
-                    "drives" => s.drives = v.clone(),
-                    "catalog" => s.catalog = v.clone(),
-                    _ => {}
-                }
-            }
-        }
-        s
-    }
-
-    fn save(&self, file: &Path) -> io::Result<()> {
-        let parts = ["changer", &self.changer, "drives", &self.drives, "catalog", &self.catalog];
-        if let Some(d) = file.parent() {
-            fs::create_dir_all(d)?;
-        }
-        fs::write(file, encode(&parts))
-    }
-
-    fn catalog_path(&self) -> PathBuf {
-        if self.catalog.trim().is_empty() {
-            default_catalog()
-        } else {
-            PathBuf::from(self.catalog.trim())
-        }
-    }
-}
-
-/// The catalog `ltocat` uses too, so both see the same tapes.
-fn default_catalog() -> PathBuf {
-    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("RustySalamander").join("ltocatalog").join("catalog.sqlite")
-}
-
-/// A folder the plugin may write its settings to: its own, or
-/// `%APPDATA%\RustySalamander\ltocatalog` when that isn't writable.
-fn data_dir(plugin_dir: &Path) -> PathBuf {
-    let probe = plugin_dir.join(".write-test");
-    if fs::write(&probe, b"").is_ok() {
-        let _ = fs::remove_file(&probe);
-        return plugin_dir.to_path_buf();
-    }
-    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("RustySalamander").join("ltocatalog")
-}
 
 /// Answers questions about missing tapes in tests.
 type Asker = Box<dyn Fn(&str, bool) -> Answer + Send + Sync>;
@@ -124,7 +63,7 @@ fn devices(data: &Path, s: &Settings) -> Result<Box<dyn Devices>, String> {
 }
 
 fn open_archive(data: &Path, s: &Settings) -> Result<Archive, String> {
-    let path = s.catalog_path();
+    let path = s.catalog_path(data);
     if let Some(d) = path.parent() {
         let _ = fs::create_dir_all(d);
     }
@@ -142,8 +81,9 @@ impl Plugin for LtoCatalog {
     const PROGRAM_MIN: &'static str = "0.9.4-beta";
 
     fn start(dir: &Path) -> Result<Self, String> {
-        let data = data_dir(dir);
-        let settings = Settings::load(&data.join("settings"));
+        // its own folder, or %APPDATA% in multi-user mode (lto_catalog::place)
+        let data = sal_plugin_api::data_dir(dir);
+        let settings = Settings::load(&place::settings_file(&data));
         let archive = open_archive(&data, &settings)?;
         Ok(LtoCatalog::with(data, settings, archive, None))
     }
@@ -580,7 +520,7 @@ impl LtoCatalog {
                 note(tr("Leave the devices empty to find them. The program needs to run as administrator to reach the library.")),
                 field("changer", tr("Changer (\\\\.\\Changer0 or scsi:port:bus:target:lun)"), FieldKind::Text, &s.changer),
                 field("drives", tr("Tape drives (\\\\.\\Tape0, \\\\.\\Tape1)"), FieldKind::Text, &s.drives),
-                field("catalog", tr("Catalog file"), FieldKind::File, &s.catalog_path().display().to_string()),
+                field("catalog", tr("Catalog file"), FieldKind::File, &s.catalog_path(&self.data).display().to_string()),
             ],
         })
     }
@@ -591,11 +531,11 @@ impl LtoCatalog {
             drives: values.get("drives").cloned().unwrap_or_default(),
             catalog: values.get("catalog").cloned().unwrap_or_default(),
         };
-        if Path::new(s.catalog.trim()) == default_catalog() {
+        if Path::new(s.catalog.trim()) == place::default_catalog(&self.data) {
             s.catalog.clear();
         }
         let archive = open_archive(&self.data, &s).map_err(io::Error::other)?;
-        s.save(&self.data.join("settings"))?;
+        s.save(&place::settings_file(&self.data))?;
         *self.settings.lock().unwrap() = s;
         *self.archive.lock().unwrap() = Arc::new(archive);
         Ok(Reply::Message(tr("Saved. The library is opened again when it is needed.")))

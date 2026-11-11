@@ -33,13 +33,13 @@ cargo test --workspace      # everything, on the simulated library
 
 ## Installing
 
-1. Copy `dist\plugins\ltocatalog` into the `plugins` folder next to `rustysalamander.exe`.
+1. Unzip `ltocatalog-<version>.zip` into the RustySalamander folder (the one with `rustysalamander.exe`): `plugins\ltocatalog` lands among the other plugins and `ltocat.exe` next to the program, where it finds the plugin's catalog and settings by itself.
 2. **Run RustySalamander as administrator.** SCSI pass-through needs it.
 3. The tape drives need their Windows driver, so that `\\.\Tape0` and `\\.\Tape1` exist; IBM's tape driver or Windows' own LTO driver both work. The changer needs no driver. Without one, the plugin reaches it through the SAS adapter (the TS3100's changer is LUN 1 of the first drive).
 
 ## First use on the library (step by step)
 
-Check the hardware with `ltocat` first, in an administrator prompt. Until step 4, nothing is moved or written:
+Check the hardware with `ltocat` first, in an administrator prompt. Until step 4, nothing is moved or written. Next to `rustysalamander.exe`, `ltocat` uses the plugin's catalog and library settings; anywhere else, tell it where the program is with `--program <RustySalamander folder>` (or name a catalog with `--catalog <file>`):
 
 ```text
 ltocat devices          the drives (with serial numbers) and the changer Windows shows
@@ -70,12 +70,16 @@ $env:RUSTYSALAMANDER_PLUGINS = "D:\Projects\RustySalamander_LTOCatalog\target\re
 D:\Projects\RustySalamander\target\release\rustysalamander.exe
 ```
 
-`ltocat --sim <file> …` does the same for the command line. The simulated tapes hold 256 MiB each.
+`ltocat --sim <file> --catalog <file> …` does the same for the command line. The simulated tapes hold 256 MiB each.
 
 ## Where things are kept
 
-- The catalog: `%APPDATA%\RustySalamander\ltocatalog\catalog.sqlite`, shared by the plugin and `ltocat`. *Library settings…* (`--catalog`) can put it elsewhere, such as a backed-up share.
-- The plugin's settings: `settings` in the plugin's folder, or under `%APPDATA%` if that folder isn't writable.
+Wherever RustySalamander keeps its settings, so the plugin is as portable as the program:
+
+- **Portable (the default):** `catalog.sqlite` and `settings` in the plugin's folder, `plugins\ltocatalog`. Nothing is written outside the program's folder.
+- **Multi-user mode** (RustySalamander's Settings → General → Settings location; `multiuser.toml` next to the program): in each user's `%APPDATA%\RustySalamander\plugins\ltocatalog`. Switching moves both files there.
+- *Library settings…* can put the catalog elsewhere, such as a backed-up share; `ltocat --program` then uses that one too.
+- `ltocat` finds them through the program's folder (its own folder, or `--program`), the same way the plugin does; `--catalog`, `--changer` and `--drives` override what the plugin's settings say.
 
 ## How it works with the tapes
 

@@ -3,6 +3,8 @@
 //! Browsing needs no tape; reading and writing check the tape's index
 //! generation against the catalog's.
 
+pub mod place;
+
 use std::path::Path;
 
 use ltfs::{Index, Node, Time};

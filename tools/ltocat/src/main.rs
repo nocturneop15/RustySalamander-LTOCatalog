@@ -4,10 +4,11 @@
 
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use lto_archive::{Answer, Archive, ReadSink, Ui};
+use lto_catalog::place::{self, Settings};
 use lto_catalog::{Catalog, Tape};
 use lto_scsi::library::Devices;
 use ltfs::Time;
@@ -46,7 +47,11 @@ files:
   format <barcode> [--name <volume name>]  ERASES the tape, makes it an empty LTFS volume
 
 options:
-  --catalog <file>   the catalog (default: %APPDATA%\\RustySalamander\\ltocatalog\\catalog.sqlite)
+  --program <folder> the RustySalamander folder (with rustysalamander.exe): use the plugin's
+                     catalog and library settings, wherever the program keeps them (its folder,
+                     or %APPDATA% in multi-user mode). Default: ltocat's own folder, when
+                     rustysalamander.exe is there.
+  --catalog <file>   this catalog instead
   --changer <dev>    the changer: \\\\.\\Changer0 or scsi:<port>:<bus>:<target>:<lun> (default: found)
   --drives <list>    tape drives, comma-separated: \\\\.\\Tape0,\\\\.\\Tape1 (default: all)
   --sim <file>       a simulated library kept in <file>, instead of the hardware
@@ -54,7 +59,9 @@ options:
 ";
 
 struct Opts {
-    catalog: PathBuf,
+    /// The catalog: --catalog, or the plugin's (--program); none when
+    /// neither is known.
+    catalog: Option<PathBuf>,
     changer: String,
     drives: Vec<String>,
     sim: Option<PathBuf>,
@@ -64,17 +71,16 @@ struct Opts {
     args: Vec<String>,
 }
 
-fn default_catalog() -> PathBuf {
-    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("RustySalamander").join("ltocatalog").join("catalog.sqlite")
-}
 
 fn parse() -> Result<Opts, String> {
-    let mut o = Opts { catalog: default_catalog(), changer: String::new(), drives: Vec::new(), sim: None, yes: false, rescan: false, name: String::new(), args: Vec::new() };
+    let mut o = Opts { catalog: None, changer: String::new(), drives: Vec::new(), sim: None, yes: false, rescan: false, name: String::new(), args: Vec::new() };
+    let mut program: Option<PathBuf> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         let mut val = |what: &str| it.next().ok_or_else(|| format!("{what} needs a value"));
         match a.as_str() {
-            "--catalog" => o.catalog = PathBuf::from(val("--catalog")?),
+            "--catalog" => o.catalog = Some(PathBuf::from(val("--catalog")?)),
+            "--program" => program = Some(PathBuf::from(val("--program")?)),
             "--changer" => o.changer = val("--changer")?,
             "--drives" => o.drives = val("--drives")?.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect(),
             "--sim" => o.sim = Some(PathBuf::from(val("--sim")?)),
@@ -93,7 +99,34 @@ fn parse() -> Result<Opts, String> {
         print!("{HELP}");
         std::process::exit(0);
     }
+    // the plugin's catalog and library settings, from RustySalamander's folder
+    let own = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).filter(|d| place::is_program_dir(d));
+    if let Some(dir) = program.or(own) {
+        if !place::is_program_dir(&dir) {
+            return Err(format!("{} has no {}", dir.display(), place::PROGRAM_EXE));
+        }
+        let data = place::data_dir_of_program(&dir);
+        let s = Settings::load(&place::settings_file(&data));
+        o.catalog.get_or_insert_with(|| s.catalog_path(&data));
+        if o.changer.is_empty() {
+            o.changer = s.changer.trim().to_owned();
+        }
+        if o.drives.is_empty() {
+            o.drives = s.drives.split([',', ';']).map(|d| d.trim().to_owned()).filter(|d| !d.is_empty()).collect();
+        }
+    }
     Ok(o)
+}
+
+impl Opts {
+    /// The catalog file (its folder made if new), or why there is none.
+    fn catalog(&self) -> Result<&Path, String> {
+        let file = self.catalog.as_deref().ok_or_else(|| "which catalog? Give --program <RustySalamander folder> or --catalog <file>".to_owned())?;
+        if let Some(dir) = file.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        Ok(file)
+    }
 }
 
 fn devices(o: &Opts) -> io::Result<Box<dyn Devices>> {
@@ -111,10 +144,8 @@ fn devices(o: &Opts) -> io::Result<Box<dyn Devices>> {
 }
 
 fn archive(o: &Opts) -> Result<Archive, String> {
-    if let Some(dir) = o.catalog.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    let cat = Catalog::open(&o.catalog).map_err(|e| format!("the catalog {}: {e}", o.catalog.display()))?;
+    let file = o.catalog()?;
+    let cat = Catalog::open(file).map_err(|e| format!("the catalog {}: {e}", file.display()))?;
     Ok(Archive::new(devices(o).map_err(|e| e.to_string())?, cat, &ltfs::creator()))
 }
 
@@ -334,7 +365,7 @@ fn run(o: &Opts) -> Result<(), String> {
             Ok(())
         }
         "tapes" => {
-            let c = Catalog::open(&o.catalog).map_err(|e| e.to_string())?;
+            let c = Catalog::open(o.catalog()?).map_err(|e| e.to_string())?;
             print_tapes(&c.tapes().map_err(|e| e.to_string())?);
             Ok(())
         }
@@ -384,7 +415,7 @@ fn run(o: &Opts) -> Result<(), String> {
         }
         "ls" => {
             need(o, 1, "ls <barcode>[\\path]")?;
-            let c = Catalog::open(&o.catalog).map_err(|e| e.to_string())?;
+            let c = Catalog::open(o.catalog()?).map_err(|e| e.to_string())?;
             let (b, p) = lto_archive::split_tape(&o.args[1]);
             let mut list = c.children(&b, &p).map_err(|e| e.to_string())?.ok_or("no such folder in the catalog")?;
             list.sort_by(|x, y| y.dir.cmp(&x.dir).then(x.name.to_lowercase().cmp(&y.name.to_lowercase())));
@@ -396,7 +427,7 @@ fn run(o: &Opts) -> Result<(), String> {
         }
         "search" => {
             need(o, 1, "search <text>")?;
-            let c = Catalog::open(&o.catalog).map_err(|e| e.to_string())?;
+            let c = Catalog::open(o.catalog()?).map_err(|e| e.to_string())?;
             for (b, p, s) in c.search(&o.args[1], 1000).map_err(|e| e.to_string())? {
                 println!("{b}\\{p}  ({})", size(s));
             }
@@ -404,12 +435,12 @@ fn run(o: &Opts) -> Result<(), String> {
         }
         "note" => {
             need(o, 2, "note <barcode> <text>")?;
-            let c = Catalog::open(&o.catalog).map_err(|e| e.to_string())?;
+            let c = Catalog::open(o.catalog()?).map_err(|e| e.to_string())?;
             c.set_note(&o.args[1], &o.args[2..].join(" ")).map_err(|e| e.to_string())
         }
         "forget" => {
             need(o, 1, "forget <barcode>")?;
-            let c = Catalog::open(&o.catalog).map_err(|e| e.to_string())?;
+            let c = Catalog::open(o.catalog()?).map_err(|e| e.to_string())?;
             c.forget(&o.args[1]).map_err(|e| e.to_string())
         }
         "get" => {

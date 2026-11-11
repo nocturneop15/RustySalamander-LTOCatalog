@@ -10,5 +10,7 @@ publish = false
 
 [dependencies]
 ltfs.workspace = true
+# the plugin's settings format, shared with ltocat (place.rs)
+sal-plugin-api.workspace = true
 # SQLite built in (with the MinGW gcc), no DLL to ship
 rusqlite = { version = "0.32", features = ["bundled"] }
