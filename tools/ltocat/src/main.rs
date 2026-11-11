@@ -10,6 +10,7 @@ use std::time::Instant;
 use lto_archive::{Answer, Archive, ReadSink, Ui};
 use lto_catalog::place::{self, Settings};
 use lto_catalog::{Catalog, Tape};
+use lto_scsi::site::{Ejected, Holds, Places};
 use lto_scsi::library::Devices;
 use ltfs::Time;
 
@@ -18,15 +19,15 @@ const HELP: &str = "ltocat - LTO tape library with an offline LTFS catalog
 usage: ltocat [options] <command> [arguments]
 
 checking the hardware (nothing is moved or written):
-  devices                    tape drives and the changer Windows shows
-  selftest                   open the library, match drives, read the inventory
+  devices                    tape drives and changers Windows shows
+  selftest                   open the libraries, match drives, read the inventories
 
-the library:
+libraries and drives (drives no library claims are standalone: tapes go in by hand):
   inventory [--rescan]       where every tape is (--rescan: scan barcodes again, slow)
-  load <barcode>             load a tape into a drive
-  unload                     put every tape in the drives back into the slots
-  eject <barcode>            move a tape to the mail slot
-  insert <barcode>           move a tape from the mail slot into a free slot
+  load <barcode>             get a tape into a drive (a library's robot, or asks for it)
+  unload                     tapes in library drives back to their slots, standalone drives eject
+  eject <barcode>            a library's tape to its mail slot, a standalone drive's out
+  insert <barcode>           move a tape from a library's mail slot into a free slot
 
 tapes and the catalog:
   tapes                      the tapes in the catalog
@@ -52,28 +53,52 @@ options:
                      or %APPDATA% in multi-user mode). Default: ltocat's own folder, when
                      rustysalamander.exe is there.
   --catalog <file>   this catalog instead
-  --changer <dev>    the changer: \\\\.\\Changer0 or scsi:<port>:<bus>:<target>:<lun> (default: found)
+  --changer <list>   changers, comma-separated: \\\\.\\Changer0 or scsi:<port>:<bus>:<target>:<lun>
+                     (default: every one found)
   --drives <list>    tape drives, comma-separated: \\\\.\\Tape0,\\\\.\\Tape1 (default: all)
-  --sim <file>       a simulated library kept in <file>, instead of the hardware
+  --sim <file>       simulated devices instead of the hardware: the first library in <file>,
+                     the rest next to it
+  --sim-libraries <n>  simulated libraries (1)
+  --sim-drives <n>   simulated standalone drives (0)
   --yes              don't ask before moving or writing tapes
+
+simulation only:
+  sim-move <barcode> drive<N>|mail<N>|shelf   move a tape by hand (a new one if it's nowhere)
 ";
 
 struct Opts {
     /// The catalog: --catalog, or the plugin's (--program); none when
     /// neither is known.
     catalog: Option<PathBuf>,
-    changer: String,
+    changers: Vec<String>,
     drives: Vec<String>,
     sim: Option<PathBuf>,
+    sim_libraries: usize,
+    sim_drives: usize,
     yes: bool,
     rescan: bool,
     name: String,
     args: Vec<String>,
 }
 
+/// A comma- or semicolon-separated list.
+fn list(s: &str) -> Vec<String> {
+    s.split([',', ';']).map(|d| d.trim().to_owned()).filter(|d| !d.is_empty()).collect()
+}
 
 fn parse() -> Result<Opts, String> {
-    let mut o = Opts { catalog: None, changer: String::new(), drives: Vec::new(), sim: None, yes: false, rescan: false, name: String::new(), args: Vec::new() };
+    let mut o = Opts {
+        catalog: None,
+        changers: Vec::new(),
+        drives: Vec::new(),
+        sim: None,
+        sim_libraries: 1,
+        sim_drives: 0,
+        yes: false,
+        rescan: false,
+        name: String::new(),
+        args: Vec::new(),
+    };
     let mut program: Option<PathBuf> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -81,9 +106,11 @@ fn parse() -> Result<Opts, String> {
         match a.as_str() {
             "--catalog" => o.catalog = Some(PathBuf::from(val("--catalog")?)),
             "--program" => program = Some(PathBuf::from(val("--program")?)),
-            "--changer" => o.changer = val("--changer")?,
-            "--drives" => o.drives = val("--drives")?.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect(),
+            "--changer" => o.changers = list(&val("--changer")?),
+            "--drives" => o.drives = list(&val("--drives")?),
             "--sim" => o.sim = Some(PathBuf::from(val("--sim")?)),
+            "--sim-libraries" => o.sim_libraries = val("--sim-libraries")?.parse().map_err(|_| "--sim-libraries needs a number")?,
+            "--sim-drives" => o.sim_drives = val("--sim-drives")?.parse().map_err(|_| "--sim-drives needs a number")?,
             "--name" => o.name = val("--name")?,
             "--yes" | "-y" => o.yes = true,
             "--rescan" => o.rescan = true,
@@ -108,11 +135,11 @@ fn parse() -> Result<Opts, String> {
         let data = place::data_dir_of_program(&dir);
         let s = Settings::load(&place::settings_file(&data));
         o.catalog.get_or_insert_with(|| s.catalog_path(&data));
-        if o.changer.is_empty() {
-            o.changer = s.changer.trim().to_owned();
+        if o.changers.is_empty() {
+            o.changers = list(&s.changer);
         }
         if o.drives.is_empty() {
-            o.drives = s.drives.split([',', ';']).map(|d| d.trim().to_owned()).filter(|d| !d.is_empty()).collect();
+            o.drives = list(&s.drives);
         }
     }
     Ok(o)
@@ -129,13 +156,17 @@ impl Opts {
     }
 }
 
+fn sim(o: &Opts) -> io::Result<Option<lto_sim::SimSite>> {
+    o.sim.as_ref().map(|f| lto_sim::SimSite::persistent(f, o.sim_libraries, o.sim_drives)).transpose()
+}
+
 fn devices(o: &Opts) -> io::Result<Box<dyn Devices>> {
-    if let Some(f) = &o.sim {
-        return Ok(Box::new(lto_sim::SimLibrary::persistent(f, &lto_sim::Config::default())?));
+    if let Some(site) = sim(o)? {
+        return Ok(Box::new(site));
     }
     #[cfg(windows)]
     {
-        Ok(Box::new(lto_scsi::windows::WindowsDevices { changer: o.changer.clone(), drives: o.drives.clone() }))
+        Ok(Box::new(lto_scsi::windows::WindowsDevices { changers: o.changers.clone(), drives: o.drives.clone() }))
     }
     #[cfg(not(windows))]
     {
@@ -153,8 +184,15 @@ fn ask(question: &str) -> String {
     print!("{question} ");
     let _ = io::stdout().flush();
     let mut s = String::new();
-    let _ = io::stdin().lock().read_line(&mut s);
-    s.trim().to_owned()
+    // no more input (a closed or redirected stdin): the answer is "q", never
+    // an endless Retry
+    match io::stdin().lock().read_line(&mut s) {
+        Ok(0) | Err(_) => {
+            println!();
+            "q".into()
+        }
+        Ok(_) => s.trim().to_owned(),
+    }
 }
 
 fn confirm(o: &Opts, what: &str) -> bool {
@@ -163,11 +201,34 @@ fn confirm(o: &Opts, what: &str) -> bool {
 
 struct Console;
 
+/// What a standalone drive holds, for people.
+fn holds(h: &Holds) -> String {
+    match h {
+        Holds::Empty => "nothing".into(),
+        Holds::Tape(b) => b.clone(),
+        Holds::Unknown => "a tape that can't be identified".into(),
+    }
+}
+
 impl Ui for Console {
-    fn missing_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool) -> Answer {
+    fn missing_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool, places: &Places) -> Answer {
         let note = tape.map(|t| t.note.as_str()).filter(|n| !n.is_empty()).map(|n| format!(" ({n})")).unwrap_or_default();
+        if let Some((d, h)) = &places.ejected {
+            println!("{d} ejected {} to make room.", holds(h));
+        }
+        for (d, h) in places.drives.iter().filter(|(_, h)| *h != Holds::Empty) {
+            println!("{d} holds {}.", holds(h));
+        }
+        let mut wher = Vec::new();
+        if !places.libraries.is_empty() {
+            wher.push(format!("into the mail slot of {}", places.libraries.join(" or ")));
+        }
+        if !places.drives.is_empty() {
+            wher.push(format!("into drive {}", places.drives.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>().join(" or ")));
+        }
         let a = ask(&format!(
-            "Tape {barcode}{note} is not in the library. Put it into the mail slot, then press Enter{} (q to cancel):",
+            "Tape {barcode}{note} is in no library or drive. Put it {}, then press Enter{} (q to cancel):",
+            wher.join(", or "),
             if skip { ", s to skip it" } else { "" }
         ));
         match a.to_lowercase().as_str() {
@@ -285,48 +346,66 @@ fn run(o: &Opts) -> Result<(), String> {
                         Err(e) => println!("drive   {n}: {e}"),
                     }
                 }
-                let wd = lto_scsi::windows::WindowsDevices { changer: o.changer.clone(), drives: o.drives.clone() };
-                let (found, tried) = if o.changer.is_empty() { wd.find_changer() } else { (Some(o.changer.clone()), Vec::new()) };
+                let wd = lto_scsi::windows::WindowsDevices { changers: o.changers.clone(), drives: o.drives.clone() };
+                let (found, tried) = if o.changers.is_empty() { wd.find_changers() } else { (o.changers.clone(), Vec::new()) };
                 for t in tried {
                     println!("        tried {t}");
                 }
-                match found {
-                    Some(c) => {
-                        let mut ch = lto_scsi::changer::Changer::new(lto_scsi::windows::open_any(&c).map_err(|e| e.to_string())?);
-                        let id = ch.inquiry().map(|i| format!("{} {} {}", i.vendor, i.product, i.revision)).unwrap_or_else(|e| format!("INQUIRY failed: {e}"));
-                        println!("changer {c:<14} {id}");
+                for c in &found {
+                    match lto_scsi::windows::open_any(c) {
+                        Ok(t) => {
+                            let mut ch = lto_scsi::changer::Changer::new(t);
+                            let id = ch.inquiry().map(|i| format!("{} {} {}", i.vendor, i.product, i.revision)).unwrap_or_else(|e| format!("INQUIRY failed: {e}"));
+                            let serial = ch.serial_number().unwrap_or_else(|e| format!("({e})"));
+                            println!("changer {c:<14} {id}  serial {serial}");
+                        }
+                        Err(e) => println!("changer {c}: {e}"),
                     }
-                    None => println!("changer not found; give it with --changer"),
+                }
+                if found.is_empty() {
+                    println!("no changer found: the drives are used as standalone drives (give a changer with --changer)");
                 }
             }
             Ok(())
         }
         "selftest" => {
             let a = archive(o)?;
-            let lib = a.library().map_err(e)?;
-            println!("changer: {} {} {} at {}", lib.identity.vendor, lib.identity.product, lib.identity.revision, lib.changer_name);
-            for n in &lib.notes {
+            let site = a.inventory(false).map_err(e)?;
+            for lib in &site.libraries {
+                println!("changer {}: {} {} {} at {}", lib.name, lib.identity.vendor, lib.identity.product, lib.identity.revision, lib.changer_name);
+                for (i, d) in lib.drives.iter().enumerate() {
+                    println!("  drive {}: element {:#06x}, {} serial {}, holds {}", i + 1, d.element, d.name, d.serial, d.tape().unwrap_or_else(|| "nothing".into()));
+                }
+                let inv = lib.inventory();
+                let full = inv.slots.iter().filter(|s| s.full).count();
+                println!("  slots: {} ({} with a tape), mail slots: {}, drives: {}", inv.slots.len(), full, inv.mail_slots.len(), inv.drives.len());
+                let no_label = inv.all().filter(|e| e.full && e.barcode.is_none()).count();
+                if no_label > 0 {
+                    println!("  warning: {no_label} tapes have no readable barcode");
+                }
+            }
+            for d in &site.standalone {
+                println!("standalone drive {} serial {}, holds {}", d.name, d.serial, holds(&d.holds()));
+            }
+            for n in site.all_notes() {
                 println!("note: {n}");
             }
-            for (i, d) in lib.drives.iter().enumerate() {
-                println!("drive {}: element {:#06x}, {} serial {}, holds {}", i + 1, d.element, d.name, d.serial, d.tape().unwrap_or_else(|| "nothing".into()));
-            }
-            let inv = lib.inventory();
-            let full = inv.slots.iter().filter(|s| s.full).count();
-            println!("slots: {} ({} with a tape), mail slots: {}, drives: {}", inv.slots.len(), full, inv.mail_slots.len(), inv.drives.len());
-            let no_label = inv.all().filter(|e| e.full && e.barcode.is_none()).count();
-            if no_label > 0 {
-                println!("warning: {no_label} tapes have no readable barcode");
-            }
-            println!("ok: the library can be used.");
+            println!("ok: {} libraries and {} drives can be used.", site.libraries.len(), site.drive_count());
             Ok(())
         }
         "inventory" => {
             let a = archive(o)?;
-            let inv = a.inventory(o.rescan).map_err(e)?;
-            for el in inv.all().filter(|e| e.kind != lto_scsi::changer::Kind::Transport) {
-                let what = if el.full { el.barcode.clone().unwrap_or_else(|| "(no barcode)".into()) } else { "-".into() };
-                println!("{:<12} {:#06x}  {what}{}", lto_archive::location_text(&inv, el.address), el.address, if el.exception { "  (exception)" } else { "" });
+            let site = a.inventory(o.rescan).map_err(e)?;
+            for lib in &site.libraries {
+                println!("{} ({}):", lib.name, lib.changer_name);
+                let inv = lib.inventory();
+                for el in inv.all().filter(|e| e.kind != lto_scsi::changer::Kind::Transport) {
+                    let what = if el.full { el.barcode.clone().unwrap_or_else(|| "(no barcode)".into()) } else { "-".into() };
+                    println!("  {:<12} {:#06x}  {what}{}", inv.place(el.address), el.address, if el.exception { "  (exception)" } else { "" });
+                }
+            }
+            for d in &site.standalone {
+                println!("standalone {:<14} {}", d.name, holds(&d.holds()));
             }
             Ok(())
         }
@@ -336,30 +415,32 @@ fn run(o: &Opts) -> Result<(), String> {
                 return Ok(());
             }
             let a = archive(o)?;
-            let lib = a.library().map_err(e)?;
-            let l = lib.acquire(&o.args[1], &|| false).map_err(|e| e.to_string())?;
-            println!("{} is in {}", l.barcode, l.drive_name);
+            let drive = a.load(&o.args[1].to_uppercase(), &Console).map_err(e)?;
+            println!("{} is in {drive}", o.args[1].to_uppercase());
             Ok(())
         }
         "unload" => {
-            if !confirm(o, "The robot will put every tape in the drives back into the slots.") {
+            if !confirm(o, "The robots will put every tape in the drives back into the slots, and standalone drives eject theirs.") {
                 return Ok(());
             }
             let a = archive(o)?;
-            a.library().map_err(e)?.unload_all().map_err(|e| e.to_string())?;
+            a.site().map_err(e)?.unload_all().map_err(|e| e.to_string())?;
             a.inventory(false).map_err(e)?;
             Ok(())
         }
         "eject" | "insert" => {
             need(o, 1, &format!("{cmd} <barcode>"))?;
             let a = archive(o)?;
-            let lib = a.library().map_err(e)?;
+            let site = a.inventory(false).map_err(e)?;
+            let b = o.args[1].to_uppercase();
             if cmd == "eject" {
-                lib.export(&o.args[1]).map_err(|e| e.to_string())?;
-                println!("{} is in the mail slot.", o.args[1]);
+                match site.eject(&b).map_err(|e| e.to_string())? {
+                    Ejected::MailSlot(lib) => println!("{b} is in the mail slot of {lib}."),
+                    Ejected::Drive(d) => println!("{b} came out of {d}."),
+                }
             } else {
-                lib.refresh(false).map_err(|e| e.to_string())?;
-                lib.import(&o.args[1]).map_err(|e| e.to_string())?;
+                let (lib, slot) = site.import(&b).map_err(|e| e.to_string())?;
+                println!("{b} is in {lib}, element {slot:#06x}.");
             }
             a.inventory(false).map_err(e)?;
             Ok(())
@@ -372,9 +453,7 @@ fn run(o: &Opts) -> Result<(), String> {
         "label" => {
             need(o, 1, "label <barcode>")?;
             let a = archive(o)?;
-            let lib = a.library().map_err(e)?;
-            let mut l = lib.acquire(&o.args[1], &|| false).map_err(|e| e.to_string())?;
-            match ltfs::probe(l.drive()).map_err(|e| e.to_string())? {
+            match a.label(&o.args[1].to_uppercase(), &Console).map_err(e)? {
                 Some(lb) => println!("{}", lb.to_xml()),
                 None => println!("{} holds no LTFS volume.", o.args[1]),
             }
@@ -384,8 +463,8 @@ fn run(o: &Opts) -> Result<(), String> {
             need(o, 1, "import <barcode>|all")?;
             let a = archive(o)?;
             let barcodes: Vec<String> = if o.args[1] == "all" {
-                let inv = a.inventory(false).map_err(e)?;
-                inv.all().filter(|e| e.full && e.kind != lto_scsi::changer::Kind::Transport).filter_map(|e| e.barcode.clone()).filter(|b| !b.to_uppercase().starts_with("CLN")).collect()
+                let site = a.inventory(false).map_err(e)?;
+                site.locations().into_iter().map(|(b, _)| b).filter(|b| !b.to_uppercase().starts_with("CLN")).collect()
             } else {
                 o.args[1..].to_vec()
             };
@@ -506,6 +585,13 @@ fn run(o: &Opts) -> Result<(), String> {
             let a = archive(o)?;
             let ix = a.format(b, &o.name, &Console).map_err(e)?;
             println!("{b} is an empty LTFS volume {}.", ix.volume_uuid);
+            Ok(())
+        }
+        "sim-move" => {
+            need(o, 2, "sim-move <barcode> drive<N>|mail<N>|shelf")?;
+            let site = sim(o).map_err(|e| e.to_string())?.ok_or("sim-move works on simulated devices only (--sim <file>)")?;
+            site.hand(&o.args[1], &o.args[2])?;
+            println!("{} is in {}.", o.args[1].to_uppercase(), o.args[2]);
             Ok(())
         }
         other => Err(format!("unknown command {other}; ltocat --help lists them")),

@@ -67,6 +67,19 @@ impl Inventory {
         self.transports.iter().chain(&self.slots).chain(&self.mail_slots).chain(&self.drives)
     }
 
+    /// A place in the library, for people: slot 3, drive 1, mail slot.
+    pub fn place(&self, address: u16) -> String {
+        let Some(el) = self.at(address) else { return String::new() };
+        let nth = |list: &[Element]| list.iter().position(|e| e.address == address).map(|i| i + 1).unwrap_or(0);
+        match el.kind {
+            Kind::Slot => format!("slot {}", nth(&self.slots)),
+            Kind::Drive => format!("drive {}", nth(&self.drives)),
+            Kind::MailSlot if self.mail_slots.len() > 1 => format!("mail slot {}", nth(&self.mail_slots)),
+            Kind::MailSlot => "mail slot".into(),
+            Kind::Transport => "robot".into(),
+        }
+    }
+
     /// Where the tape with this barcode is (case-insensitive).
     pub fn find(&self, barcode: &str) -> Option<&Element> {
         self.all().find(|e| e.full && e.barcode.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(barcode)))

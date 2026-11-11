@@ -160,6 +160,28 @@ pub fn probe(drive: &mut TapeDrive) -> Result<Option<Label>> {
     }
 }
 
+/// What tells the LTFS volume on the tape in `drive` apart: the volume
+/// serial of its VOL1 label (six characters, usually the start of the
+/// barcode) and its LTFS label (with the volume's UUID). `None` for a tape
+/// without LTFS.
+pub fn identify(drive: &mut TapeDrive) -> Result<Option<(String, Label)>> {
+    drive.set_variable_blocks()?;
+    if drive.partitions()? < 2 {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; 1024 * 1024];
+    drive.locate(0, 0)?;
+    let volser = match drive.read(&mut buf)? {
+        TapeRead::Record(n) if label::is_ltfs_vol1(&buf[..n]) => String::from_utf8_lossy(&buf[4..10]).trim().to_owned(),
+        _ => return Ok(None),
+    };
+    match read_label(drive, 0) {
+        Ok(l) => Ok(Some((volser, l))),
+        Err(Error::NotLtfs(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Read records up to the next filemark, as text.
 fn read_text(drive: &mut TapeDrive, buf: &mut [u8]) -> Result<String> {
     let mut out = Vec::new();

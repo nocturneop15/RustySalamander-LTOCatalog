@@ -8,6 +8,11 @@
 //! Partitioning follows the medium partition mode page and FORMAT MEDIUM.
 //! The state can be saved to a file and loaded again, so the plugin can be
 //! tried in the program without a library.
+//!
+//! A [`SimLibrary`] without a changer is a standalone drive, which a person
+//! loads by hand ([`SimLibrary::insert_drive`], [`SimLibrary::take_drive`]);
+//! [`SimSite`] puts several libraries and standalone drives together, as a
+//! computer with more than one may have.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -75,6 +80,8 @@ struct Drive {
     pos: usize,
     unit_attention: bool,
     compression: bool,
+    /// PREVENT MEDIUM REMOVAL: the eject button does nothing.
+    prevent: bool,
     /// Partitions asked for by MODE SELECT, applied by FORMAT MEDIUM:
     /// (additional partitions, unit exponent, sizes).
     pending: Option<(u8, u8, Vec<u16>)>,
@@ -97,6 +104,10 @@ pub struct State {
     pub fail_next: Option<(u8, Sense)>,
     /// Commands sent, by operation code (for tests).
     pub counts: BTreeMap<u8, u64>,
+    /// Which simulated library this is: tells serial numbers and names apart.
+    pub id: u8,
+    /// It has a changer; without one, its drives are standalone.
+    pub changer: bool,
 }
 
 /// A simulated library; clone it to share.
@@ -117,12 +128,37 @@ pub struct Config {
     pub capacity: u64,
     /// Barcodes of the tapes in the first slots.
     pub tapes: Vec<String>,
+    /// Which simulated library this is (serial numbers, device names).
+    pub id: u8,
+    /// With a changer (a library); without, standalone drives.
+    pub changer: bool,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { slots: 24, mail: 1, drives: 2, capacity: 256 * 1024 * 1024, tapes: (1..=6).map(|i| format!("LTO{i:03}L5")).collect() }
+        Config { slots: 24, mail: 1, drives: 2, capacity: 256 * 1024 * 1024, tapes: (1..=6).map(|i| format!("LTO{i:03}L5")).collect(), id: 0, changer: true }
     }
+}
+
+impl Config {
+    /// Another library, numbered `id` (1 is the default one), with its own
+    /// six tapes (`LT2001L5`…).
+    pub fn library(id: u8) -> Config {
+        if id <= 1 {
+            return Config::default();
+        }
+        Config { tapes: (1..=6).map(|i| format!("LT{id}{i:03}L5")).collect(), id, ..Config::default() }
+    }
+
+    /// A standalone drive, numbered `id` (keep it apart from the libraries').
+    pub fn standalone(id: u8) -> Config {
+        Config { slots: 0, mail: 0, drives: 1, tapes: Vec::new(), id, changer: false, ..Config::default() }
+    }
+}
+
+/// The serial number of drive `i` of simulated library `id`.
+fn drive_serial(id: u8, i: usize) -> String {
+    format!("1068{id:02}00{i:02}")
 }
 
 impl SimLibrary {
@@ -132,7 +168,7 @@ impl SimLibrary {
             slots[i] = Some(Cart::new(b, cfg.capacity));
         }
         let drives = (0..cfg.drives)
-            .map(|i| Drive { serial: format!("10680000{i:02}"), cart: None, from: None, loaded: false, part: 0, pos: 0, unit_attention: false, compression: true, pending: None })
+            .map(|i| Drive { serial: drive_serial(cfg.id, i), cart: None, from: None, loaded: false, part: 0, pos: 0, unit_attention: false, compression: true, prevent: false, pending: None })
             .collect();
         let state = State {
             slots,
@@ -143,6 +179,8 @@ impl SimLibrary {
             min_partition: (cfg.capacity / 40).max(1024 * 1024),
             fail_next: None,
             counts: BTreeMap::new(),
+            id: cfg.id,
+            changer: cfg.changer,
         };
         SimLibrary { state: Arc::new(Mutex::new(state)), file: None }
     }
@@ -208,6 +246,74 @@ impl SimLibrary {
         Some(f(c))
     }
 
+    /// Put a tape into standalone drive `i` by hand: it loads by itself.
+    pub fn insert_drive(&self, i: usize, cart: Cart) -> Result<(), Cart> {
+        let mut s = self.state.lock().unwrap();
+        let Some(d) = s.drives.get_mut(i) else { return Err(cart) };
+        if d.cart.is_some() {
+            return Err(cart);
+        }
+        d.cart = Some(cart);
+        d.from = None;
+        d.loaded = true;
+        d.part = 0;
+        d.pos = 0;
+        d.unit_attention = true;
+        drop(s);
+        let _ = self.save();
+        Ok(())
+    }
+
+    /// Press the eject button of drive `i` and take the tape: nothing while
+    /// a program locks the button.
+    pub fn take_drive(&self, i: usize) -> Option<Cart> {
+        let mut s = self.state.lock().unwrap();
+        let d = s.drives.get_mut(i)?;
+        if d.prevent {
+            return None;
+        }
+        d.loaded = false;
+        d.from = None;
+        let t = d.cart.take();
+        drop(s);
+        let _ = self.save();
+        t
+    }
+
+    /// Put a tape into the first free slot by hand (a magazine, or a shelf).
+    pub fn put_slot(&self, cart: Cart) -> Result<(), Cart> {
+        let mut s = self.state.lock().unwrap();
+        match s.slots.iter_mut().find(|c| c.is_none()) {
+            Some(slot) => {
+                *slot = Some(cart);
+                drop(s);
+                let _ = self.save();
+                Ok(())
+            }
+            None => Err(cart),
+        }
+    }
+
+    /// Whether a program locks the eject button of drive `i`.
+    pub fn drive_locked(&self, i: usize) -> bool {
+        self.state.lock().unwrap().drives.get(i).is_some_and(|d| d.prevent)
+    }
+
+    /// The barcode of the tape in drive `i`.
+    pub fn drive_tape(&self, i: usize) -> Option<String> {
+        self.state.lock().unwrap().drives.get(i).and_then(|d| d.cart.as_ref().map(|c| c.barcode.clone()))
+    }
+
+    /// Take a tape out wherever it is (a slot, the mail slot, or a drive
+    /// whose button isn't locked), as a person would.
+    pub fn take_anywhere(&self, barcode: &str) -> Option<Cart> {
+        if let Some(c) = self.remove(barcode) {
+            return Some(c);
+        }
+        let i = self.state.lock().unwrap().drives.iter().position(|d| d.cart.as_ref().is_some_and(|c| c.barcode.eq_ignore_ascii_case(barcode)))?;
+        self.take_drive(i)
+    }
+
     /// How many commands with this operation code were sent.
     pub fn count(&self, op: u8) -> u64 {
         self.state.lock().unwrap().counts.get(&op).copied().unwrap_or(0)
@@ -218,6 +324,14 @@ impl SimLibrary {
         Box::new(SimChanger { lib: self.clone() })
     }
 
+    /// The device-name prefix: `sim`, or `sim2`… for the others.
+    fn prefix(&self) -> String {
+        match self.state.lock().unwrap().id {
+            0 | 1 => "sim".into(),
+            n => format!("sim{n}"),
+        }
+    }
+
     /// The transport of drive `i`.
     pub fn drive(&self, i: usize) -> Box<dyn Transport> {
         Box::new(SimTape { lib: self.clone(), i })
@@ -225,12 +339,118 @@ impl SimLibrary {
 }
 
 impl Devices for SimLibrary {
-    fn open_changer(&self) -> io::Result<Box<dyn Transport>> {
-        Ok(self.changer())
+    fn open_changers(&self) -> io::Result<Vec<Box<dyn Transport>>> {
+        Ok(if self.state.lock().unwrap().changer { vec![self.changer()] } else { Vec::new() })
     }
     fn open_drives(&self) -> io::Result<Vec<Box<dyn Transport>>> {
         let n = self.state.lock().unwrap().drives.len();
         Ok((0..n).map(|i| self.drive(i)).collect())
+    }
+}
+
+/// Several simulated libraries and standalone drives, as one computer's.
+#[derive(Clone, Default)]
+pub struct SimSite {
+    pub parts: Vec<SimLibrary>,
+}
+
+/// The id of the shelf: where tapes taken out of everything wait.
+const SHELF: u8 = 99;
+
+impl SimSite {
+    /// Kept in files: `libraries` libraries (the first in `first`, the
+    /// others next to it as `sim-library-2.bin`…), `drives` standalone
+    /// drives (`sim-drive-1.bin`…) and a shelf for tapes taken out
+    /// (`sim-shelf.bin`).
+    pub fn persistent(first: &Path, libraries: usize, drives: usize) -> io::Result<SimSite> {
+        let dir = first.parent().unwrap_or(Path::new("."));
+        let mut parts = Vec::new();
+        for k in 1..=libraries {
+            let file = if k == 1 { first.to_path_buf() } else { dir.join(format!("sim-library-{k}.bin")) };
+            parts.push(SimLibrary::persistent(&file, &Config::library(k as u8))?);
+        }
+        for j in 1..=drives {
+            parts.push(SimLibrary::persistent(&dir.join(format!("sim-drive-{j}.bin")), &Config::standalone(10 + j as u8))?);
+        }
+        let shelf = Config { slots: 200, mail: 0, drives: 0, tapes: Vec::new(), id: SHELF, changer: false, ..Config::default() };
+        parts.push(SimLibrary::persistent(&dir.join("sim-shelf.bin"), &shelf)?);
+        Ok(SimSite { parts })
+    }
+
+    /// Take the tape out wherever it is (as a person would).
+    pub fn take(&self, barcode: &str) -> Option<Cart> {
+        self.parts.iter().find_map(|p| p.take_anywhere(barcode))
+    }
+
+    fn libraries(&self) -> Vec<&SimLibrary> {
+        self.parts.iter().filter(|p| p.state.lock().unwrap().changer).collect()
+    }
+
+    fn standalone(&self) -> Vec<&SimLibrary> {
+        self.parts
+            .iter()
+            .filter(|p| {
+                let s = p.state.lock().unwrap();
+                !s.changer && s.id != SHELF
+            })
+            .collect()
+    }
+
+    /// Move a tape by hand, from wherever it is, to `to`: `drive<N>` (a
+    /// standalone drive), `mail<N>` (a library's mail slot) or `shelf`. A
+    /// tape new to the simulation is made when `barcode` is nowhere.
+    pub fn hand(&self, barcode: &str, to: &str) -> Result<(), String> {
+        let barcode = barcode.to_uppercase();
+        let nth = |prefix: &str| to.strip_prefix(prefix).and_then(|n| n.parse::<usize>().ok()).filter(|n| *n >= 1).map(|n| n - 1);
+        let target = if let Some(i) = nth("drive") {
+            *self.standalone().get(i).ok_or_else(|| format!("there is no standalone drive {to}"))?
+        } else if let Some(i) = nth("mail") {
+            *self.libraries().get(i).ok_or_else(|| format!("there is no library {to}"))?
+        } else if to == "shelf" {
+            self.parts.iter().find(|p| p.state.lock().unwrap().id == SHELF).ok_or("there is no shelf")?
+        } else {
+            return Err(format!("where is {to}? drive<N>, mail<N> or shelf"));
+        };
+        let locked = self.parts.iter().any(|p| {
+            let n = p.state.lock().unwrap().drives.len();
+            (0..n).any(|i| p.drive_tape(i).as_deref() == Some(barcode.as_str()) && p.drive_locked(i))
+        });
+        if locked {
+            return Err(format!("{barcode} is in a drive whose eject button a program locks"));
+        }
+        let cart = self.take(&barcode).unwrap_or_else(|| Cart::new(&barcode, Config::default().capacity));
+        let put = if nth("drive").is_some() {
+            target.insert_drive(0, cart)
+        } else if nth("mail").is_some() {
+            target.insert(cart)
+        } else {
+            target.put_slot(cart)
+        };
+        // a full place: the tape goes onto the shelf instead of getting lost
+        if let Err(cart) = put {
+            if let Some(shelf) = self.parts.iter().find(|p| p.state.lock().unwrap().id == SHELF) {
+                let _ = shelf.put_slot(cart);
+            }
+            return Err(format!("{to} is full; {barcode} is on the shelf"));
+        }
+        Ok(())
+    }
+}
+
+impl Devices for SimSite {
+    fn open_changers(&self) -> io::Result<Vec<Box<dyn Transport>>> {
+        let mut out = Vec::new();
+        for p in &self.parts {
+            out.extend(p.open_changers()?);
+        }
+        Ok(out)
+    }
+    fn open_drives(&self) -> io::Result<Vec<Box<dyn Transport>>> {
+        let mut out = Vec::new();
+        for p in &self.parts {
+            out.extend(p.open_drives()?);
+        }
+        Ok(out)
     }
 }
 
@@ -377,7 +597,7 @@ impl Transport for SimChanger {
         }
         match cdb[0] {
             0x00 | 0x07 | 0x1E => good(0),
-            0x12 if cdb[1] & 1 != 0 => good(give(data, &serial_page("SIM0001234"))),
+            0x12 if cdb[1] & 1 != 0 => good(give(data, &serial_page(&format!("SIM{:07}", 1234 + s.id as u32)))),
             0x12 => good(give(data, &inquiry_data(lto_scsi::TYPE_CHANGER, "IBM", "3573-TL"))),
             0xB8 => {
                 let Some(kind) = [Kind::Transport, Kind::Slot, Kind::MailSlot, Kind::Drive].into_iter().find(|k| *k as u8 == cdb[1] & 0x0f) else {
@@ -406,7 +626,7 @@ impl Transport for SimChanger {
     }
 
     fn describe(&self) -> String {
-        "sim:changer".into()
+        format!("{}:changer", self.lib.prefix())
     }
 }
 
@@ -439,7 +659,7 @@ impl Transport for SimTape {
     }
 
     fn describe(&self) -> String {
-        format!("sim:tape{}", self.i)
+        format!("{}:tape{}", self.lib.prefix(), self.i)
     }
 }
 
@@ -449,7 +669,10 @@ fn tape_cmd(d: &mut Drive, cdb: &[u8], data: Data<'_>, ew: u64, min_part: u64) -
     match cdb[0] {
         0x12 if cdb[1] & 1 != 0 => return good(give(data, &serial_page(&d.serial))),
         0x12 => return good(give(data, &inquiry_data(lto_scsi::TYPE_TAPE, "IBM", "ULT3580-HH5"))),
-        0x1E => return good(0),
+        0x1E => {
+            d.prevent = cdb[4] & 1 != 0;
+            return good(0);
+        }
         _ => {}
     }
     if d.cart.is_none() {
@@ -714,6 +937,10 @@ fn tape_cmd(d: &mut Drive, cdb: &[u8], data: Data<'_>, ew: u64, min_part: u64) -
             attrs.insert(0x0000, (0x80, ((cart.caps[p as usize].saturating_sub(cart.used(p as usize))) / mib).to_be_bytes().to_vec()));
             attrs.insert(0x0001, (0x80, (cart.caps[p as usize] / mib).to_be_bytes().to_vec()));
             attrs.insert(0x0009, (0x80, cart.vcr.to_be_bytes().to_vec()));
+            // the cartridge's own serial number, set at the factory
+            let mut serial = format!("SIM{}", cart.barcode).into_bytes();
+            serial.resize(32, b' ');
+            attrs.insert(0x0401, (0x01, serial));
             for ((ap, id), v) in &cart.attrs {
                 if *ap == p {
                     attrs.insert(*id, v.clone());
@@ -819,6 +1046,8 @@ fn save(s: &State, file: &Path) -> io::Result<()> {
     }
     w64(&mut o, s.early_warning);
     w64(&mut o, s.min_partition);
+    o.push(s.id);
+    o.push(s.changer as u8);
     let tmp = file.with_extension("tmp");
     let mut f = fs::File::create(&tmp)?;
     f.write_all(&o)?;
@@ -904,11 +1133,14 @@ fn load(file: &Path) -> io::Result<State> {
             f => Some((f - 1) as u16),
         };
         let loaded = r.u8()? != 0;
-        drives.push(Drive { serial, cart, from, loaded, part: 0, pos: 0, unit_attention: true, compression: true, pending: None });
+        drives.push(Drive { serial, cart, from, loaded, part: 0, pos: 0, unit_attention: true, compression: true, prevent: false, pending: None });
     }
     let early_warning = r.u64()?;
     let min_partition = r.u64()?;
-    Ok(State { slots, mail, mail_accessible, drives, early_warning, min_partition, fail_next: None, counts: BTreeMap::new() })
+    // files from before standalone drives: library 0, with a changer
+    let id = r.u8().unwrap_or(0);
+    let changer = r.u8().map(|c| c != 0).unwrap_or(true);
+    Ok(State { slots, mail, mail_accessible, drives, early_warning, min_partition, fail_next: None, counts: BTreeMap::new(), id, changer })
 }
 
 #[cfg(test)]

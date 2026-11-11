@@ -23,6 +23,7 @@ use lto_scsi::library::Devices;
 use ltfs::names::{from_windows, safe_relative, to_windows};
 use ltfs::Time;
 use lto_catalog::place::{self, Settings};
+use lto_scsi::site::{Ejected, Holds, Places};
 use sal_plugin_api::ui::decode;
 use sal_plugin_api::{
     export_plugin, join_inner, mount_of, n_, tr, trf, Command, Field, FieldKind, FolderPlugin, Form, Index, Item, Mount, Plugin, Progress, Reply, Sink, Values, ATTR_DIRECTORY,
@@ -33,8 +34,9 @@ const SCHEME: &str = "lto";
 const AUTHORITY: &str = "library";
 const ATTR_READONLY: u32 = 0x1;
 
-/// Answers questions about missing tapes in tests.
-type Asker = Box<dyn Fn(&str, bool) -> Answer + Send + Sync>;
+/// Answers questions about missing tapes in tests: (barcode, skip possible,
+/// where it can be put).
+type Asker = Box<dyn Fn(&str, bool, &Places) -> Answer + Send + Sync>;
 
 pub struct LtoCatalog {
     data: PathBuf,
@@ -49,17 +51,27 @@ pub struct LtoCatalog {
 
 export_plugin!(LtoCatalog);
 
-/// The library's devices: the simulator when `LTOCATALOG_SIM` is set (`1`
-/// for a file in the plugin's folder, or the file), else the hardware.
+/// A list in a setting: comma- or semicolon-separated.
+fn list(s: &str) -> Vec<String> {
+    s.split([',', ';']).map(|d| d.trim().to_owned()).filter(|d| !d.is_empty()).collect()
+}
+
+/// A number from an environment variable.
+fn env_count(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// The tape devices: the simulator when `LTOCATALOG_SIM` is set (`1` for
+/// files in the plugin's data folder, or the first library's file), with
+/// `LTOCATALOG_SIM_LIBRARIES` libraries (1) and `LTOCATALOG_SIM_DRIVES`
+/// standalone drives (0); else the hardware.
 fn devices(data: &Path, s: &Settings) -> Result<Box<dyn Devices>, String> {
     if let Some(v) = std::env::var_os("LTOCATALOG_SIM").filter(|v| !v.is_empty()) {
         let file = if v == "1" { data.join("sim-library.bin") } else { PathBuf::from(v) };
-        return lto_sim::SimLibrary::persistent(&file, &lto_sim::Config::default()).map(|l| Box::new(l) as Box<dyn Devices>).map_err(|e| format!("{}: {e}", file.display()));
+        let (libraries, drives) = (env_count("LTOCATALOG_SIM_LIBRARIES", 1), env_count("LTOCATALOG_SIM_DRIVES", 0));
+        return lto_sim::SimSite::persistent(&file, libraries, drives).map(|l| Box::new(l) as Box<dyn Devices>).map_err(|e| format!("{}: {e}", file.display()));
     }
-    Ok(Box::new(lto_scsi::windows::WindowsDevices {
-        changer: s.changer.trim().to_owned(),
-        drives: s.drives.split([',', ';']).map(|d| d.trim().to_owned()).filter(|d| !d.is_empty()).collect(),
-    }))
+    Ok(Box::new(lto_scsi::windows::WindowsDevices { changers: list(&s.changer), drives: list(&s.drives) }))
 }
 
 fn open_archive(data: &Path, s: &Settings) -> Result<Archive, String> {
@@ -105,12 +117,12 @@ impl LtoCatalog {
         self.archive.lock().unwrap().clone()
     }
 
-    /// Ask for a missing tape.
-    fn ask_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool) -> Answer {
+    /// Ask for a missing tape, saying where it can be put.
+    fn ask_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool, places: &Places) -> Answer {
         if let Some(a) = &self.asker {
-            return a(barcode, skip);
+            return a(barcode, skip, places);
         }
-        let mut detail = Vec::new();
+        let (text, mut detail) = ask_text(barcode, places);
         if let Some(t) = tape {
             if !t.note.is_empty() {
                 detail.push(trf("Note: {note}", &[("note", &t.note)]));
@@ -125,7 +137,6 @@ impl LtoCatalog {
         }
         buttons.push(tr("Cancel"));
         let cancel = buttons.len() - 1;
-        let text = trf("Tape {barcode} is not in the library. Put it into the mail slot (or a magazine), then press Retry.", &[("barcode", &barcode)]);
         let look = self.look.lock().unwrap().clone();
         match ask::ask(&self.asks, look, tr("Insert tape"), text, detail.join("\n"), buttons, 0, cancel) {
             Some(0) => Answer::Retry,
@@ -133,6 +144,44 @@ impl LtoCatalog {
             _ => Answer::Cancel,
         }
     }
+}
+
+/// What a standalone drive holds, for people.
+fn holds_text(h: &Holds) -> String {
+    match h {
+        Holds::Empty => tr("empty"),
+        Holds::Tape(b) => b.clone(),
+        Holds::Unknown => tr("a tape that can't be identified"),
+    }
+}
+
+/// The question for a missing tape: where to put it, and what the
+/// standalone drives hold (after one was emptied to make room).
+fn ask_text(barcode: &str, places: &Places) -> (String, Vec<String>) {
+    let libs = places.libraries.join(", ");
+    let drives = places.drives.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>().join(", ");
+    let text = match (places.libraries.len(), places.drives.len()) {
+        (1, 0) => trf("Tape {barcode} is not in the library. Put it into the mail slot (or a magazine), then press Retry.", &[("barcode", &barcode)]),
+        (_, 0) => trf("Tape {barcode} is in none of the libraries. Put it into the mail slot of one of them ({libraries}), then press Retry.", &[("barcode", &barcode), ("libraries", &libs)]),
+        (0, 1) => trf("Tape {barcode} is not in the drive. Insert it into drive {drive}, then press Retry.", &[("barcode", &barcode), ("drive", &drives)]),
+        (0, _) => trf("Tape {barcode} is in none of the drives. Insert it into one of them ({drives}), then press Retry.", &[("barcode", &barcode), ("drives", &drives)]),
+        _ => trf("Tape {barcode} is in no library or drive. Put it into the mail slot of {libraries}, or insert it into drive {drives}, then press Retry.", &[("barcode", &barcode), ("libraries", &libs), ("drives", &drives)]),
+    };
+    let mut detail = Vec::new();
+    if let Some((d, h)) = &places.ejected {
+        detail.push(match h {
+            Holds::Tape(b) => trf("Tape {tape} was ejected from drive {drive} to make room.", &[("tape", b), ("drive", d)]),
+            _ => trf("The tape in drive {drive} was ejected to make room.", &[("drive", d)]),
+        });
+    }
+    for (d, h) in &places.drives {
+        match h {
+            Holds::Tape(b) => detail.push(trf("Drive {drive} holds tape {tape}.", &[("drive", d), ("tape", b)])),
+            Holds::Unknown => detail.push(trf("Drive {drive} holds a tape that can't be identified: no barcode in its memory, and its volume isn't in the catalog.", &[("drive", d)])),
+            Holds::Empty => {}
+        }
+    }
+    (text, detail)
 }
 
 /// The plugin as a job's [`Ui`].
@@ -145,8 +194,8 @@ impl Ui for JobUi<'_> {
     fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
     }
-    fn missing_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool) -> Answer {
-        let a = self.plugin.ask_tape(barcode, tape, skip);
+    fn missing_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool, places: &Places) -> Answer {
+        let a = self.plugin.ask_tape(barcode, tape, skip, places);
         if a == Answer::Cancel {
             self.cancelled.store(true, Ordering::Relaxed);
         }
@@ -183,7 +232,7 @@ fn io_err(e: lto_archive::Error) -> io::Error {
     use io::ErrorKind as K;
     let (kind, msg) = match e {
         E::Cancelled => return io::Error::new(K::Interrupted, tr("Cancelled.")),
-        E::NotInLibrary(b) => (K::NotFound, trf("Tape {barcode} is not in the library.", &[("barcode", &b)])),
+        E::NotInLibrary(b) => (K::NotFound, trf("Tape {barcode} is in no library or tape drive.", &[("barcode", &b)])),
         E::NotInCatalog(b) => (K::NotFound, trf("Tape {barcode} is not in the catalog yet. Import it first: Plugins → Import tapes….", &[("barcode", &b)])),
         E::NotLtfs(b) => (K::InvalidData, trf("Tape {barcode} isn't formatted for LTFS. Format it first: Plugins → Format a tape….", &[("barcode", &b)])),
         E::StaleCatalog(b) => (
@@ -193,7 +242,7 @@ fn io_err(e: lto_archive::Error) -> io::Error {
         E::Missing(list) => (K::NotFound, trf("Not on the tape: {items}", &[("items", &list.iter().map(|p| to_inner(p)).collect::<Vec<_>>().join(", "))])),
         E::Skipped(list) => (K::Other, trf("These tapes were skipped, their files weren't copied: {tapes}", &[("tapes", &list.join(", "))])),
         E::NoSpace(need, free) => (K::StorageFull, trf("Not enough space on the tape: {need} bytes needed, {free} bytes free.", &[("need", &need), ("free", &free)])),
-        E::NoLibrary(m) => (K::NotFound, trf("The tape library can't be used: {reason}", &[("reason", &m)])),
+        E::NoLibrary(m) => (K::NotFound, trf("No tape library or drive can be used: {reason}", &[("reason", &m)])),
         E::Io(e) => return e,
         E::Ltfs(ltfs::Error::Full) => (K::StorageFull, tr("The tape is full. The files copied before it filled up are on it.")),
         E::Ltfs(ltfs::Error::ReadOnly(m)) => (K::PermissionDenied, trf("The tape can't be written: {reason}", &[("reason", &m)])),
@@ -347,11 +396,13 @@ impl LtoCatalog {
 
     fn cmd_inventory(&self) -> io::Result<Reply> {
         let a = self.archive();
+        // libraries and drives connected since are found too
+        a.reopen_if_idle();
         a.inventory(false).map_err(io_err)?;
         let tapes = a.catalog.lock().unwrap().tapes().map_err(|e| io::Error::other(e.to_string()))?;
         let inside: Vec<&Tape> = tapes.iter().filter(|t| t.in_library() && !is_cleaning(&t.barcode)).collect();
         let new: Vec<&str> = inside.iter().filter(|t| t.imported.is_none()).map(|t| t.barcode.as_str()).collect();
-        let mut msg = trf("The library holds {n} tapes.", &[("n", &inside.len())]);
+        let mut msg = trf("Tapes in the libraries and drives: {n}.", &[("n", &inside.len())]);
         if !new.is_empty() {
             msg.push('\n');
             msg.push_str(&trf("Not in the catalog yet: {tapes}. Use Import tapes… to read them.", &[("tapes", &new.join(", "))]));
@@ -451,13 +502,16 @@ impl LtoCatalog {
     fn cmd_eject(&self, values: &Values) -> io::Result<Reply> {
         let b = values.get("barcode").map(|b| b.trim().to_uppercase()).unwrap_or_default();
         let a = self.archive();
-        let lib = a.library().map_err(io_err)?;
-        lib.export(&b).map_err(|e| match e {
+        let site = a.inventory(false).map_err(io_err)?;
+        let out = site.eject(&b).map_err(|e| match e {
             lto_scsi::library::LoadError::NotInLibrary(b) => io_err(lto_archive::Error::NotInLibrary(b)),
             other => io::Error::other(other.to_string()),
         })?;
         a.inventory(false).map_err(io_err)?;
-        Ok(Reply::Message(trf("Tape {barcode} is in the mail slot.", &[("barcode", &b)])))
+        Ok(Reply::Message(match out {
+            Ejected::MailSlot(_) => trf("Tape {barcode} is in the mail slot.", &[("barcode", &b)]),
+            Ejected::Drive(d) => trf("Tape {barcode} came out of drive {drive}.", &[("barcode", &b), ("drive", &d)]),
+        }))
     }
 
     fn cmd_note(&self, values: &Values) -> io::Result<Reply> {
@@ -482,21 +536,30 @@ impl LtoCatalog {
     fn cmd_status(&self) -> io::Result<Reply> {
         let a = self.archive();
         let mut lines = Vec::new();
-        match a.library() {
-            Ok(lib) => {
-                lines.push(trf("Library: {vendor} {product} ({device})", &[("vendor", &lib.identity.vendor), ("product", &lib.identity.product), ("device", &lib.changer_name)]));
-                for (i, d) in lib.drives.iter().enumerate() {
-                    let holds = d.tape().unwrap_or_else(|| tr("empty"));
-                    lines.push(trf("Drive {n}: {device}, serial {serial}: {tape}", &[("n", &(i + 1)), ("device", &d.name), ("serial", &d.serial), ("tape", &holds)]));
+        a.reopen_if_idle();
+        match a.inventory(false) {
+            Ok(site) => {
+                for lib in &site.libraries {
+                    lines.push(trf("Library: {vendor} {product} ({device})", &[("vendor", &lib.identity.vendor), ("product", &lib.name), ("device", &lib.changer_name)]));
+                    for (i, d) in lib.drives.iter().enumerate() {
+                        let holds = d.tape().unwrap_or_else(|| tr("empty"));
+                        lines.push(trf("Drive {n}: {device}, serial {serial}: {tape}", &[("n", &(i + 1)), ("device", &d.name), ("serial", &d.serial), ("tape", &holds)]));
+                    }
                 }
-                lines.extend(lib.notes.iter().cloned());
+                for d in &site.standalone {
+                    lines.push(trf("Standalone drive {device}, serial {serial}: {tape}", &[("device", &d.name), ("serial", &d.serial), ("tape", &holds_text(&d.holds()))]));
+                }
+                if site.libraries.is_empty() {
+                    lines.push(tr("No tape library was found: tapes are put into the drives by hand."));
+                }
+                lines.extend(site.all_notes());
             }
             Err(e) => lines.push(io_err(e).to_string()),
         }
         lines.push(String::new());
         let tapes = a.catalog.lock().unwrap().tapes().map_err(|e| io::Error::other(e.to_string()))?;
         for t in tapes.iter().filter(|t| !is_cleaning(&t.barcode)) {
-            let place = if t.in_library() { t.location.clone() } else { tr("outside the library") };
+            let place = if t.in_library() { t.location.clone() } else { tr("in no library or drive") };
             let what = if t.is_ltfs() {
                 trf("{files} files, {size}, {free} free", &[("files", &t.files), ("size", &size_text(t.bytes)), ("free", &t.remaining.map(size_text).unwrap_or_else(|| "?".into()))])
             } else if t.imported.is_some() {
@@ -517,9 +580,9 @@ impl LtoCatalog {
             ok: tr("Save"),
             command: "settings_do".into(),
             fields: vec![
-                note(tr("Leave the devices empty to find them. The program needs to run as administrator to reach the library.")),
-                field("changer", tr("Changer (\\\\.\\Changer0 or scsi:port:bus:target:lun)"), FieldKind::Text, &s.changer),
-                field("drives", tr("Tape drives (\\\\.\\Tape0, \\\\.\\Tape1)"), FieldKind::Text, &s.drives),
+                note(tr("Leave the devices empty to find every library and drive. Drives no library claims are standalone: tapes are put into them by hand. The program needs to run as administrator to reach the devices.")),
+                field("changer", tr("Changers (\\\\.\\Changer0 or scsi:port:bus:target:lun, comma-separated)"), FieldKind::Text, &s.changer),
+                field("drives", tr("Tape drives, in libraries and standalone (\\\\.\\Tape0, \\\\.\\Tape1)"), FieldKind::Text, &s.drives),
                 field("catalog", tr("Catalog file"), FieldKind::File, &s.catalog_path(&self.data).display().to_string()),
             ],
         })
@@ -560,9 +623,9 @@ impl FolderPlugin for LtoCatalog {
         let tapes = a.catalog.lock().unwrap().tapes().unwrap_or_default();
         let files: u64 = tapes.iter().map(|t| t.files).sum();
         let mut s = trf("Catalog: {tapes} tapes, {files} files", &[("tapes", &tapes.iter().filter(|t| t.is_ltfs()).count()), ("files", &files)]);
-        if let Some(lib) = a.library_if_open() {
+        if let Some(site) = a.site_if_open() {
             s.push_str("; ");
-            s.push_str(&trf("library: {product}, {drives} drives", &[("product", &lib.identity.product), ("drives", &lib.drives.len())]));
+            s.push_str(&trf("libraries: {libraries}, drives: {drives}", &[("libraries", &site.libraries.len()), ("drives", &site.drive_count())]));
         }
         s
     }
@@ -732,11 +795,11 @@ impl FolderPlugin for LtoCatalog {
         let c = |id: &str, label: String| Command { id: id.into(), label };
         vec![
             c("open", tr("Open tape catalog")),
-            c("inventory", tr("Inventory the library")),
+            c("inventory", tr("Inventory the libraries and drives")),
             c("import", tr("Import tapes…")),
             c("status", tr("Library status")),
             c("format", tr("Format a tape…")),
-            c("eject", tr("Move a tape to the mail slot…")),
+            c("eject", tr("Eject a tape…")),
             c("unload", tr("Put the tapes in the drives back")),
             c("note", tr("Note about a tape…")),
             c("forget", tr("Forget a tape…")),
@@ -757,11 +820,17 @@ impl FolderPlugin for LtoCatalog {
             "status" => self.cmd_status(),
             "format" => Ok(self.cmd_format_form(input)),
             "format_do" => self.cmd_format(input),
-            "eject" => Ok(self.one_tape_form(input, tr("Move a tape to the mail slot"), tr("Move"), "eject_do", Vec::new())),
+            "eject" => Ok(self.one_tape_form(
+                input,
+                tr("Eject a tape"),
+                tr("Eject"),
+                "eject_do",
+                vec![note(tr("A library moves the tape to its mail slot; a standalone drive ejects it."))],
+            )),
             "eject_do" => self.cmd_eject(input),
             "unload" => {
                 let a = self.archive();
-                a.library().map_err(io_err)?.unload_all().map_err(|e| io::Error::other(e.to_string()))?;
+                a.site().map_err(io_err)?.unload_all().map_err(|e| io::Error::other(e.to_string()))?;
                 a.inventory(false).map_err(io_err)?;
                 Ok(Reply::Done)
             }

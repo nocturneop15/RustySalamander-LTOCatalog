@@ -8,7 +8,12 @@
 //!   [`Archive::delete`]: change a tape's volume;
 //! - [`Archive::format`]: make a tape an empty LTFS volume.
 //!
-//! A job that needs a tape the library doesn't have asks [`Ui::missing_tape`]
+//! The tapes are in any number of libraries and standalone drives
+//! ([`lto_scsi::site::Site`]). A tape in a standalone drive is identified by
+//! the barcode in its cartridge memory, else by its LTFS volume: the
+//! volume's UUID in the catalog, or the volume serial of its VOL1 label.
+//!
+//! A job that needs a tape no library or drive has asks [`Ui::missing_tape`]
 //! what to do. Paths here are LTFS names, `\`-separated, the tape's barcode
 //! first.
 
@@ -19,14 +24,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use lto_catalog::{Catalog, Tape};
-use lto_scsi::changer::{Inventory, Kind};
-use lto_scsi::library::{Devices, Lease, Library, LoadError};
+use lto_scsi::library::{Lease, LoadError};
+use lto_scsi::site::{Devices, Places, Site};
+use lto_scsi::tape::{attr, TapeDrive};
 use ltfs::{File, Index, Node, Time, Times, Volume};
 
-/// What to do about a tape that isn't in the library.
+/// What to do about a tape that no library or drive has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
-    /// It was put into the mail slot (or a magazine): look again.
+    /// It was put into a mail slot (or a magazine) or a drive: look again.
     Retry,
     /// Go on without it.
     Skip,
@@ -40,16 +46,18 @@ pub trait Ui: Sync {
     fn cancelled(&self) -> bool {
         false
     }
-    /// The tape isn't in the library: ask for it. `skip` says whether
-    /// skipping it is possible (a read of several tapes).
-    fn missing_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool) -> Answer;
+    /// No library or drive has the tape: ask for it. `places` says where
+    /// it can be put (libraries' mail slots, standalone drives and what
+    /// they hold). `skip` says whether skipping it is possible (a read of
+    /// several tapes).
+    fn missing_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool, places: &Places) -> Answer;
 }
 
 /// A Ui that asks nothing: missing tapes stop the job.
 pub struct NoUi;
 
 impl Ui for NoUi {
-    fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool) -> Answer {
+    fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool, _: &Places) -> Answer {
         Answer::Cancel
     }
 }
@@ -57,9 +65,9 @@ impl Ui for NoUi {
 /// Why a job failed.
 #[derive(Debug)]
 pub enum Error {
-    /// The library couldn't be opened.
+    /// No library and no tape drive could be used.
     NoLibrary(String),
-    /// The tape isn't in the library and the person didn't insert it.
+    /// No library or drive has the tape, and the person didn't put it in.
     NotInLibrary(String),
     /// The tape isn't in the catalog (it was never imported).
     NotInCatalog(String),
@@ -86,8 +94,8 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::NoLibrary(m) => write!(f, "the tape library can't be used: {m}"),
-            Error::NotInLibrary(b) => write!(f, "tape {b} is not in the library"),
+            Error::NoLibrary(m) => write!(f, "no tape library or drive can be used: {m}"),
+            Error::NotInLibrary(b) => write!(f, "tape {b} is in no library or tape drive"),
             Error::NotInCatalog(b) => write!(f, "tape {b} is not in the catalog; import it first"),
             Error::NotLtfs(b) => write!(f, "tape {b} isn't formatted for LTFS"),
             Error::StaleCatalog(b) => write!(f, "the catalog of tape {b} was out of date; it has been updated from the tape, check the files and try again"),
@@ -148,10 +156,10 @@ pub trait ReadSink {
     fn end(&mut self) -> io::Result<()>;
 }
 
-/// A tape library and its catalog.
+/// The tape devices and the catalog.
 pub struct Archive {
     devices: Box<dyn Devices>,
-    library: Mutex<Option<Arc<Library>>>,
+    site: Mutex<Option<Arc<Site>>>,
     pub catalog: Mutex<Catalog>,
     creator: String,
 }
@@ -165,82 +173,138 @@ pub fn split_tape(path: &str) -> (String, String) {
     }
 }
 
-/// A place in the library, for people.
-pub fn location_text(inv: &Inventory, address: u16) -> String {
-    let Some(el) = inv.at(address) else { return String::new() };
-    let nth = |list: &[lto_scsi::changer::Element]| list.iter().position(|e| e.address == address).map(|i| i + 1).unwrap_or(0);
-    match el.kind {
-        Kind::Slot => format!("slot {}", nth(&inv.slots)),
-        Kind::Drive => format!("drive {}", nth(&inv.drives)),
-        Kind::MailSlot => "mail slot".into(),
-        Kind::Transport => "robot".into(),
-    }
-}
-
 impl Archive {
     pub fn new(devices: Box<dyn Devices>, catalog: Catalog, creator: &str) -> Archive {
-        Archive { devices, library: Mutex::new(None), catalog: Mutex::new(catalog), creator: creator.to_owned() }
+        Archive { devices, site: Mutex::new(None), catalog: Mutex::new(catalog), creator: creator.to_owned() }
     }
 
-    /// The library, opened the first time it is needed.
-    pub fn library(&self) -> Result<Arc<Library>> {
-        let mut l = self.library.lock().unwrap();
-        if let Some(lib) = &*l {
-            return Ok(lib.clone());
+    /// The libraries and drives, opened the first time they are needed.
+    pub fn site(&self) -> Result<Arc<Site>> {
+        let mut l = self.site.lock().unwrap();
+        if let Some(site) = &*l {
+            return Ok(site.clone());
         }
-        let lib = Arc::new(Library::open(&*self.devices).map_err(|e| Error::NoLibrary(e.to_string()))?);
-        *l = Some(lib.clone());
+        let site = Arc::new(Site::open(&*self.devices).map_err(|e| Error::NoLibrary(e.to_string()))?);
+        *l = Some(site.clone());
         drop(l);
         // where everything is, at once
-        let inv = lib.inventory();
-        let _ = self.record_locations(&inv);
-        Ok(lib)
+        let _ = site.refresh(false, &|d| self.identify(d, None));
+        let _ = self.record_locations(&site);
+        Ok(site)
     }
 
-    /// The library if it is open already (for status lines).
-    pub fn library_if_open(&self) -> Option<Arc<Library>> {
-        self.library.lock().unwrap().clone()
+    /// The libraries and drives if they are open already (for status lines).
+    pub fn site_if_open(&self) -> Option<Arc<Site>> {
+        self.site.lock().unwrap().clone()
     }
 
-    /// Close the library (it is opened again when needed, e.g. after the
-    /// settings changed).
-    pub fn close_library(&self) {
-        *self.library.lock().unwrap() = None;
+    /// Look for the devices again at their next use (a library or drive
+    /// connected since), unless a job is using them now.
+    pub fn reopen_if_idle(&self) {
+        let mut l = self.site.lock().unwrap();
+        if l.as_ref().is_some_and(|s| Arc::strong_count(s) == 1) {
+            *l = None;
+        }
     }
 
-    fn record_locations(&self, inv: &Inventory) -> Result<()> {
-        let locs: Vec<(String, String)> = inv.all().filter(|e| e.full && e.kind != Kind::Transport).filter_map(|e| Some((e.barcode.clone()?, location_text(inv, e.address)))).collect();
-        self.catalog.lock().unwrap().set_locations(&locs)?;
+    /// The LTFS label of the tape (got into a drive as a job would), or
+    /// `None` when it holds no LTFS volume.
+    pub fn label(&self, barcode: &str, ui: &dyn Ui) -> Result<Option<ltfs::Label>> {
+        let site = self.site()?;
+        let mut lease = self.acquire(&site, barcode, ui, false, false)?.expect("no skip");
+        Ok(ltfs::probe(lease.drive())?)
+    }
+
+    /// Get `barcode` into a drive (asking for it as a job would) and leave
+    /// it there: the drive's name.
+    pub fn load(&self, barcode: &str, ui: &dyn Ui) -> Result<String> {
+        let site = self.site()?;
+        let lease = self.acquire(&site, barcode, ui, false, false)?.expect("no skip");
+        Ok(lease.drive_name.clone())
+    }
+
+    fn record_locations(&self, site: &Site) -> Result<()> {
+        self.catalog.lock().unwrap().set_locations(&site.locations())?;
         Ok(())
     }
 
-    /// Read the library's inventory again and record where every tape is.
-    pub fn inventory(&self, rescan: bool) -> Result<Inventory> {
-        let lib = self.library()?;
-        let inv = lib.refresh(rescan)?;
-        self.record_locations(&inv)?;
-        Ok(inv)
+    /// Read the libraries' inventories again, look into the standalone
+    /// drives, and record where every tape is.
+    pub fn inventory(&self, rescan: bool) -> Result<Arc<Site>> {
+        let site = self.site()?;
+        site.refresh(rescan, &|d| self.identify(d, None))?;
+        self.record_locations(&site)?;
+        Ok(site)
     }
 
-    /// Load `barcode`, asking for it while it isn't in the library.
-    fn acquire<'l>(&self, lib: &'l Library, barcode: &str, ui: &dyn Ui, skip: bool) -> Result<Option<Lease<'l>>> {
+    /// Which tape is in a standalone drive (loaded and ready):
+    ///
+    /// 1. the barcode in its cartridge memory (written by a library, by
+    ///    Format, or by other LTFS software);
+    /// 2. its LTFS volume's UUID, for a tape the catalog has seen;
+    /// 3. the volume serial of its VOL1 label (the barcode's first six
+    ///    characters): the catalog's one tape not yet imported whose barcode
+    ///    starts with it, else, for a tape never seen, the serial itself.
+    ///
+    /// A tape without LTFS and without a barcode is unknown, except to a
+    /// Format, which takes it as `blank_as`.
+    fn identify(&self, drive: &mut TapeDrive, blank_as: Option<&str>) -> Option<String> {
+        if let Ok(Some(v)) = drive.read_attribute(0, attr::BARCODE) {
+            let b = lto_scsi::ascii(&v);
+            if !b.is_empty() {
+                return Some(b.to_uppercase());
+            }
+        }
+        match ltfs::volume::identify(drive) {
+            Ok(Some((volser, label))) => {
+                let cat = self.catalog.lock().unwrap();
+                if let Ok(Some(t)) = cat.tape_by_uuid(&label.volume_uuid) {
+                    return Some(t.barcode);
+                }
+                let volser = volser.to_uppercase();
+                if volser.is_empty() {
+                    return None;
+                }
+                let tapes = cat.tapes().unwrap_or_default();
+                // a full barcode beginning with the serial, of a tape not imported yet
+                let fresh: Vec<&Tape> = tapes.iter().filter(|t| t.uuid.is_empty() && t.barcode.len() > volser.len() && t.barcode.to_uppercase().starts_with(&volser)).collect();
+                match fresh[..] {
+                    [one] => Some(one.barcode.clone()),
+                    // a tape of that name holds another volume: can't tell
+                    [] if !tapes.iter().any(|t| t.barcode.eq_ignore_ascii_case(&volser) && !t.uuid.is_empty()) => Some(volser),
+                    _ => None,
+                }
+            }
+            Ok(None) => blank_as.map(str::to_owned),
+            Err(_) => None,
+        }
+    }
+
+    /// Get `barcode` into a drive, asking for it while no library or drive
+    /// has it. `blank`: a tape without LTFS or barcode in a standalone drive
+    /// is taken as this one (for Format).
+    fn acquire<'s>(&self, site: &'s Site, barcode: &str, ui: &dyn Ui, skip: bool, blank: bool) -> Result<Option<Lease<'s>>> {
+        let blank_as = blank.then_some(barcode);
+        let identify = |d: &mut TapeDrive| self.identify(d, blank_as);
         loop {
-            match lib.acquire(barcode, &|| ui.cancelled()) {
+            match site.acquire(barcode, &identify, &|| ui.cancelled()) {
                 Ok(l) => {
-                    let inv = lib.inventory();
-                    let _ = self.record_locations(&inv);
+                    let _ = self.record_locations(site);
                     return Ok(Some(l));
                 }
                 Err(LoadError::Cancelled) => return Err(Error::Cancelled),
                 Err(LoadError::Scsi(e)) => return Err(e.into()),
                 Err(LoadError::NotInLibrary(_)) => {
-                    // the library looked again: record where everything is
-                    let _ = self.record_locations(&lib.inventory());
+                    // everything was looked at again: record where things are
+                    let _ = self.record_locations(site);
                     let tape = self.catalog.lock().unwrap().tape(barcode)?;
-                    match ui.missing_tape(barcode, tape.as_ref(), skip) {
+                    // no empty standalone drive: eject the idle one's tape
+                    let ejected = site.make_room();
+                    let places = Places { ejected, ..site.places() };
+                    match ui.missing_tape(barcode, tape.as_ref(), skip, &places) {
                         Answer::Retry => {
-                            let inv = lib.refresh(false)?;
-                            self.record_locations(&inv)?;
+                            site.refresh(false, &identify)?;
+                            self.record_locations(site)?;
                         }
                         Answer::Skip if skip => return Ok(None),
                         Answer::Skip | Answer::Cancel => return Err(if ui.cancelled() { Error::Cancelled } else { Error::NotInLibrary(barcode.to_owned()) }),
@@ -273,8 +337,8 @@ impl Archive {
     /// Read the tape's index into the catalog (whether it holds LTFS at
     /// all, too). The volume's index comes back, `None` for a tape without LTFS.
     pub fn import(&self, barcode: &str, ui: &dyn Ui) -> Result<Option<Index>> {
-        let lib = self.library()?;
-        let mut lease = self.acquire(&lib, barcode, ui, false)?.expect("no skip");
+        let site = self.site()?;
+        let mut lease = self.acquire(&site, barcode, ui, false, false)?.expect("no skip");
         let drive = lease.drive();
         if ltfs::probe(drive)?.is_none() {
             let wp = drive.write_protected().unwrap_or(false);
@@ -288,8 +352,8 @@ impl Archive {
 
     /// Mount `barcode`'s volume (asking for the tape if needed) and run `f`.
     fn with_volume<R>(&self, barcode: &str, ui: &dyn Ui, f: impl FnOnce(&mut Volume) -> Result<R>) -> Result<R> {
-        let lib = self.library()?;
-        let mut lease = self.acquire(&lib, barcode, ui, false)?.expect("no skip");
+        let site = self.site()?;
+        let mut lease = self.acquire(&site, barcode, ui, false, false)?.expect("no skip");
         let mut v = match Volume::mount(lease.drive(), barcode, &self.creator) {
             Err(ltfs::Error::NotLtfs(_)) => return Err(Error::NotLtfs(barcode.to_owned())),
             r => r?,
@@ -313,8 +377,8 @@ impl Archive {
         if by_tape.is_empty() {
             return Ok(());
         }
-        let lib = self.library()?;
-        let loaded: Vec<String> = lib.drives.iter().filter_map(|d| d.tape()).map(|t| t.to_uppercase()).collect();
+        let site = self.site()?;
+        let loaded: Vec<String> = site.loaded().into_iter().map(|t| t.to_uppercase()).collect();
         let mut order: Vec<String> = by_tape.keys().cloned().collect();
         order.sort_by_key(|b| !loaded.contains(b));
         let (mut missing, mut skipped) = (Vec::new(), Vec::new());
@@ -323,7 +387,7 @@ impl Archive {
                 return Err(Error::Cancelled);
             }
             let paths = &by_tape[&barcode];
-            let Some(mut lease) = self.acquire(&lib, &barcode, ui, true)? else {
+            let Some(mut lease) = self.acquire(&site, &barcode, ui, true, false)? else {
                 skipped.push(barcode);
                 continue;
             };
@@ -527,11 +591,24 @@ impl Archive {
     }
 
     /// Format a tape as an empty LTFS volume. Everything on it is lost.
+    /// In a standalone drive, a tape without LTFS and without a barcode in
+    /// its memory is taken as `barcode` (a new tape); a tape that is
+    /// another one is never formatted in its place.
     pub fn format(&self, barcode: &str, name: &str, ui: &dyn Ui) -> Result<Index> {
-        let lib = self.library()?;
-        let mut lease = self.acquire(&lib, barcode, ui, false)?.expect("no skip");
+        let site = self.site()?;
+        let mut lease = self.acquire(&site, barcode, ui, false, true)?.expect("no skip");
+        let drive_name = lease.drive_name.clone();
         let drive = lease.drive();
-        let f = ltfs::format(drive, barcode, name, &self.creator)?;
+        let r = ltfs::format(drive, barcode, name, &self.creator);
+        let f = match r {
+            Ok(f) => f,
+            Err(e) => {
+                drop(lease);
+                // it was taken for this tape only to be formatted
+                site.forget(&drive_name);
+                return Err(e.into());
+            }
+        };
         let (remaining, capacity) = drive.capacity(1).unwrap_or((None, None));
         self.catalog.lock().unwrap().import(barcode, &f.index, capacity, remaining, false)?;
         Ok(f.index)

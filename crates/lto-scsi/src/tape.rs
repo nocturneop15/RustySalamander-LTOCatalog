@@ -61,6 +61,8 @@ pub mod attr {
     pub const USER_MEDIUM_TEXT_LABEL: u16 = 0x0803;
     /// Barcode.
     pub const BARCODE: u16 = 0x0806;
+    /// The cartridge's own serial number, set when it was made.
+    pub const MEDIUM_SERIAL_NUMBER: u16 = 0x0401;
     /// Volume coherency information (LTFS: index generation and position).
     pub const VOLUME_COHERENCY_INFORMATION: u16 = 0x080C;
 }

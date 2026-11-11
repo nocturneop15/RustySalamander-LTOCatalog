@@ -302,8 +302,9 @@ pub fn open_any(name: &str) -> io::Result<Box<dyn Transport>> {
 /// named.
 #[derive(Debug, Clone, Default)]
 pub struct WindowsDevices {
-    /// The changer (`\\.\Changer0` or `scsi:2:0:3:1`); empty: find it.
-    pub changer: String,
+    /// The changers (`\\.\Changer0` or `scsi:2:0:3:1`); empty: every one
+    /// found.
+    pub changers: Vec<String>,
     /// The tape drives (`\\.\Tape0`…); empty: every one there is.
     pub drives: Vec<String>,
 }
@@ -318,16 +319,27 @@ fn is_changer(t: &mut dyn Transport) -> bool {
 }
 
 impl WindowsDevices {
-    /// Look for a changer: by its driver's name, then next to the tape
-    /// drives on their adapters (the TS3100's changer is LUN 1 of the first
-    /// drive's target). Every place tried, and what it was, for `ltocat devices`.
-    pub fn find_changer(&self) -> (Option<String>, Vec<String>) {
+    /// Look for every changer: by their driver's names, then next to the
+    /// tape drives on their adapters (the TS3100's changer is LUN 1 of the
+    /// first drive's target). A changer found both ways counts once (by its
+    /// serial number). Every place tried, and what it was, for `ltocat devices`.
+    pub fn find_changers(&self) -> (Vec<String>, Vec<String>) {
         let mut tried = Vec::new();
+        let mut out: Vec<String> = Vec::new();
+        let mut serials: Vec<String> = Vec::new();
+        let mut keep = |name: String, t: &mut dyn Transport, out: &mut Vec<String>| {
+            let serial = crate::serial_number(t).unwrap_or_default();
+            if serial.is_empty() || !serials.contains(&serial) {
+                serials.push(serial);
+                out.push(name);
+            }
+        };
         for i in 0..16 {
             let n = format!("\\\\.\\Changer{i}");
             if let Ok(mut t) = DeviceTransport::open(&n) {
                 if is_changer(&mut t) {
-                    return (Some(n), tried);
+                    keep(n, &mut t, &mut out);
+                    continue;
                 }
                 tried.push(format!("{n}: not a changer"));
             }
@@ -353,7 +365,8 @@ impl WindowsDevices {
                 match AdapterTransport::open(at) {
                     Ok(mut t) => {
                         if is_changer(&mut t) {
-                            return (Some(t.describe()), tried);
+                            let n = t.describe();
+                            keep(n, &mut t, &mut out);
                         }
                     }
                     Err(e) => {
@@ -363,22 +376,18 @@ impl WindowsDevices {
                 }
             }
         }
-        (None, tried)
+        (out, tried)
     }
 }
 
 impl Devices for WindowsDevices {
-    fn open_changer(&self) -> io::Result<Box<dyn Transport>> {
-        if !self.changer.is_empty() {
-            return open_any(&self.changer);
+    /// The changers named, else every one found (none is fine: standalone
+    /// drives only).
+    fn open_changers(&self) -> io::Result<Vec<Box<dyn Transport>>> {
+        if !self.changers.is_empty() {
+            return self.changers.iter().map(|c| open_any(c)).collect();
         }
-        match self.find_changer() {
-            (Some(n), _) => open_any(&n),
-            (None, tried) => Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no tape library (medium changer) was found{}", if tried.is_empty() { String::new() } else { format!(": {}", tried.join("; ")) }),
-            )),
-        }
+        Ok(self.find_changers().0.iter().filter_map(|n| open_any(n).ok()).collect())
     }
 
     fn open_drives(&self) -> io::Result<Vec<Box<dyn Transport>>> {

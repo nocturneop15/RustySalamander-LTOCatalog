@@ -8,10 +8,12 @@
 //!   barcodes) and moving tapes.
 //! - [`library::Library`]: both together, with a tape loaded on demand into
 //!   a free drive, each drive used by one job at a time.
+//! - [`site::Site`]: every library and standalone drive there is.
 
 pub mod changer;
 pub mod library;
 pub mod sense;
+pub mod site;
 pub mod tape;
 #[cfg(windows)]
 pub mod windows;

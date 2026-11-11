@@ -122,8 +122,8 @@ fn names_windows_forbids() {
     // another program wrote a name with a colon and a question mark
     {
         let a = p.archive();
-        let lib = a.library().unwrap();
-        let mut l = lib.acquire("LTO002L5", &|| false).unwrap();
+        let site = a.site().unwrap();
+        let mut l = site.acquire("LTO002L5", &|_| None, &|| false).unwrap();
         let mut vol = ltfs::Volume::mount(l.drive(), "LTO002L5", "other").unwrap();
         vol.index.make_dirs("12:00 why?", Time::now()).unwrap();
         vol.commit().unwrap();
@@ -144,7 +144,7 @@ fn names_windows_forbids() {
 fn a_missing_tape_is_asked_for() {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let a2 = asked.clone();
-    let (sim, p, dir) = plugin(Some(Box::new(move |b: &str, skip| {
+    let (sim, p, dir) = plugin(Some(Box::new(move |b: &str, skip, _: &Places| {
         a2.lock().unwrap().push((b.to_owned(), skip));
         Answer::Cancel
     })));
@@ -165,7 +165,7 @@ fn a_missing_tape_is_asked_for() {
     assert_eq!(e.kind(), io::ErrorKind::Interrupted);
     assert_eq!(asked.lock().unwrap()[1], ("LTO003L5".to_string(), false));
     let Reply::Message(m) = p.run("status", &Values::new()).unwrap() else { panic!() };
-    assert!(m.contains("LTO003L5") && m.contains("outside the library"), "{m}");
+    assert!(m.contains("LTO003L5") && m.contains("in no library or drive"), "{m}");
     fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -261,4 +261,44 @@ fn language_files_match_the_code() {
     assert!(missing.is_empty() && unused.is_empty(), "missing in en.toml: {missing:#?}\nnot used: {unused:#?}");
     let untranslated: Vec<_> = en.difference(&cs).collect();
     assert!(untranslated.is_empty(), "missing in cs.toml: {untranslated:#?}");
+}
+
+/// The question for a missing tape names the places it can go, and what
+/// the standalone drives hold.
+#[test]
+fn the_question_says_where_to_put_the_tape() {
+    let one_lib = Places { libraries: vec!["3573-TL".into()], ..Places::default() };
+    assert!(ask_text("X", &one_lib).0.contains("mail slot"));
+    let one_drive = Places { drives: vec![(r"\\.\Tape2".into(), Holds::Tape("Y".into()))], ..Places::default() };
+    let (t, d) = ask_text("X", &one_drive);
+    assert!(t.contains(r"Insert it into drive \\.\Tape2"), "{t}");
+    assert_eq!(d, vec![r"Drive \\.\Tape2 holds tape Y.".to_string()]);
+    let both = Places { libraries: vec!["A 1".into(), "A 2".into()], drives: vec![("d".into(), Holds::Unknown)], ejected: Some(("d".into(), Holds::Tape("Z".into()))) };
+    let (t, d) = ask_text("X", &both);
+    assert!(t.contains("A 1, A 2") && t.contains("drive d"), "{t}");
+    assert!(d[0].contains("Z was ejected") && d[1].contains("can't be identified"), "{d:?}");
+}
+
+/// Only a standalone drive: the status says so, a new tape in it is
+/// formatted through the form and ejected by Eject.
+#[test]
+fn standalone_drive_in_the_plugin() {
+    let drive = SimLibrary::new(&Config::standalone(11));
+    let archive = Archive::new(Box::new(drive.clone()), Catalog::in_memory().unwrap(), "test");
+    let dir = std::env::temp_dir().join(format!("ltocatalog-plugin-sd-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let p = LtoCatalog::with(dir.clone(), Settings::default(), archive, None);
+    drive.insert_drive(0, lto_sim::Cart::new("SD0001L5", Config::default().capacity)).unwrap();
+    let mut v = Values::new();
+    v.insert("barcode".into(), "SD0001L5".into());
+    v.insert("confirm".into(), "SD0001L5".into());
+    p.run("format_do", &v).unwrap();
+    let Reply::Message(m) = p.run("status", &Values::new()).unwrap() else { panic!() };
+    assert!(m.contains("Standalone drive sim11:tape0") && m.contains("SD0001L5") && m.contains("No tape library was found"), "{m}");
+    let Reply::Message(m) = p.run("eject_do", &v).unwrap() else { panic!() };
+    assert!(m.contains("came out of drive sim11:tape0"), "{m}");
+    assert!(drive.take_drive(0).is_some());
+    let Reply::Message(m) = p.run("inventory", &Values::new()).unwrap() else { panic!() };
+    assert!(m.contains(": 0."), "{m}");
+    fs::remove_dir_all(&dir).unwrap();
 }

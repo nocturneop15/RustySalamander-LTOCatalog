@@ -110,6 +110,12 @@ impl Sense {
         self.key == key::NOT_READY && self.asc == 0x04 && matches!(self.ascq, 0x00 | 0x01 | 0x07 | 0x08)
     }
 
+    /// A tape is in the drive but not threaded (NOT READY, 04/02:
+    /// initializing command required): LOAD threads it.
+    pub fn needs_load(&self) -> bool {
+        self.key == key::NOT_READY && self.asc == 0x04 && self.ascq == 0x02
+    }
+
     /// Write protected (DATA PROTECT, 27/xx).
     pub fn write_protected(&self) -> bool {
         self.key == key::DATA_PROTECT && self.asc == 0x27

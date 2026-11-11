@@ -12,11 +12,11 @@ use crate::changer::{Changer, Inventory, Kind};
 use crate::tape::TapeDrive;
 use crate::{Error, Inquiry, Transport};
 
-/// Opens the devices of a library.
+/// Opens the devices: changers and tape drives (see [`crate::site::Site`]).
 pub trait Devices: Send + Sync {
-    /// The changer.
-    fn open_changer(&self) -> io::Result<Box<dyn Transport>>;
-    /// Every tape drive that can be found (the library's and others).
+    /// Every changer that can be found; none is fine (standalone drives).
+    fn open_changers(&self) -> io::Result<Vec<Box<dyn Transport>>>;
+    /// Every tape drive that can be found (the libraries' and standalone ones).
     fn open_drives(&self) -> io::Result<Vec<Box<dyn Transport>>>;
 }
 
@@ -50,7 +50,13 @@ impl From<Error> for LoadError {
 /// A drive and what it holds.
 pub struct DriveState {
     pub drive: TapeDrive,
-    last_used: Instant,
+    pub(crate) last_used: Instant,
+}
+
+impl DriveState {
+    pub(crate) fn new(drive: TapeDrive) -> DriveState {
+        DriveState { drive, last_used: Instant::now() - Duration::from_secs(3600) }
+    }
 }
 
 /// One drive of the library.
@@ -83,7 +89,9 @@ struct ChangerState {
 pub struct Lease<'a> {
     pub barcode: String,
     pub drive_name: String,
-    guard: MutexGuard<'a, DriveState>,
+    pub(crate) guard: MutexGuard<'a, DriveState>,
+    /// A standalone drive: its eject button is locked while the lease lasts.
+    pub(crate) standalone: bool,
 }
 
 impl Lease<'_> {
@@ -95,6 +103,9 @@ impl Lease<'_> {
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
         self.guard.last_used = Instant::now();
+        if self.standalone {
+            let _ = self.guard.drive.prevent_removal(false);
+        }
     }
 }
 
@@ -109,28 +120,40 @@ pub struct Library {
     /// Things noticed while opening (a drive whose serial number didn't
     /// match), for the status line.
     pub notes: Vec<String>,
+    /// How people know it: its product, numbered when there are several.
+    pub name: String,
 }
 
 /// How long a tape may take to become ready after it is put into a drive.
-const LOAD_LIMIT: Duration = Duration::from_secs(5 * 60);
+pub(crate) const LOAD_LIMIT: Duration = Duration::from_secs(5 * 60);
 
 impl Library {
-    /// Open the changer and its drives, and match the drives to the
-    /// changer's drive elements by serial number.
+    /// Open the first changer with every drive that can be found (a
+    /// single library; [`crate::site::Site`] handles several, and
+    /// standalone drives).
     pub fn open(devices: &dyn Devices) -> Result<Library, Error> {
-        let mut changer = Changer::new(devices.open_changer()?);
+        let changer = devices.open_changers()?.into_iter().next().ok_or_else(|| Error::Protocol("no tape library (medium changer) was found".into()))?;
+        let mut notes = Vec::new();
+        let mut found = crate::site::drives_with_serials(devices.open_drives()?, &mut notes);
+        let mut lib = Library::with_drives(changer, &mut found, true)?;
+        lib.notes.splice(0..0, notes);
+        if lib.drives.is_empty() {
+            return Err(Error::Protocol("none of the library's drives was found as a tape device".into()));
+        }
+        Ok(lib)
+    }
+
+    /// Open a changer and take its drives out of `found` (serial number,
+    /// drive), matched to the changer's drive elements by serial number; by
+    /// order only when `by_order` and that leaves no doubt. A library whose
+    /// drives aren't found is still opened (its mail slot works), without
+    /// drives.
+    pub fn with_drives(changer: Box<dyn Transport>, found: &mut Vec<(String, TapeDrive)>, by_order: bool) -> Result<Library, Error> {
+        let mut changer = Changer::new(changer);
         let identity = changer.inquiry()?;
         let changer_name = changer.describe();
         let inv = changer.inventory()?;
         let mut notes = Vec::new();
-        let mut found: Vec<(String, TapeDrive)> = Vec::new();
-        for t in devices.open_drives()? {
-            let mut d = TapeDrive::new(t);
-            match d.serial_number() {
-                Ok(s) => found.push((s, d)),
-                Err(e) => notes.push(format!("{}: {e}", d.describe())),
-            }
-        }
         let mut drives = Vec::new();
         let mut unmatched: Vec<&crate::changer::Element> = Vec::new();
         for el in &inv.drives {
@@ -146,7 +169,7 @@ impl Library {
         // a changer that doesn't report drive serial numbers: match by order,
         // when that leaves no doubt
         if !unmatched.is_empty() {
-            if unmatched.len() == found.len() {
+            if by_order && unmatched.len() == found.len() {
                 notes.push("the changer doesn't identify its drives; they are matched in order".into());
                 for (el, (serial, drive)) in unmatched.into_iter().zip(found.drain(..)) {
                     drives.push(cell(el.address, serial, drive, el.barcode.clone().filter(|_| el.full)));
@@ -158,10 +181,16 @@ impl Library {
             }
         }
         if drives.is_empty() {
-            return Err(Error::Protocol("none of the library's drives was found as a tape device".into()));
+            notes.push(format!("none of the drives of the library at {changer_name} was found as a tape device"));
         }
         drives.sort_by_key(|d| d.element);
-        Ok(Library { changer: Mutex::new(ChangerState { changer, inv }), drives, identity, changer_name, notes })
+        let name = identity.product.trim().to_owned();
+        Ok(Library { changer: Mutex::new(ChangerState { changer, inv }), drives, identity, changer_name, notes, name })
+    }
+
+    /// Whether one of its drives holds the tape.
+    pub fn holds(&self, barcode: &str) -> bool {
+        self.drives.iter().any(|d| d.tape().is_some_and(|t| t.eq_ignore_ascii_case(barcode)))
     }
 
     /// The changer's inventory as last read or updated.
@@ -201,7 +230,7 @@ impl Library {
             if let Some(cell) = self.drives.iter().find(|d| d.tape().is_some_and(|t| t.eq_ignore_ascii_case(barcode))) {
                 if let Ok(mut g) = cell.state.try_lock() {
                     g.drive.wait_ready(LOAD_LIMIT)?;
-                    return Ok(Lease { barcode: barcode.to_owned(), drive_name: cell.name.clone(), guard: g });
+                    return Ok(Lease { barcode: barcode.to_owned(), drive_name: cell.name.clone(), guard: g, standalone: false });
                 }
                 std::thread::sleep(Duration::from_millis(300));
                 continue;
@@ -209,6 +238,9 @@ impl Library {
             let Some(from) = self.changer.lock().unwrap().inv.find(barcode).map(|e| e.address) else {
                 return Err(LoadError::NotInLibrary(barcode.to_owned()));
             };
+            if self.drives.is_empty() {
+                return Err(LoadError::Scsi(Error::Protocol(format!("tape {barcode} is in the library at {}, but none of its drives was found", self.changer_name))));
+            }
             // a free drive: an empty one, else the one used least recently
             let mut free: Vec<(&DriveCell, MutexGuard<'_, DriveState>)> = self.drives.iter().filter_map(|d| d.state.try_lock().ok().map(|g| (d, g))).collect();
             free.sort_by_key(|(d, g)| (d.tape().is_some(), g.last_used));
@@ -243,7 +275,7 @@ impl Library {
             // drives in libraries load a tape put into them by themselves; LOAD is harmless if so
             let _ = g.drive.load();
             g.drive.wait_ready(LOAD_LIMIT)?;
-            return Ok(Lease { barcode: barcode.to_owned(), drive_name: cell.name.clone(), guard: g });
+            return Ok(Lease { barcode: barcode.to_owned(), drive_name: cell.name.clone(), guard: g, standalone: false });
         }
     }
 
@@ -310,5 +342,5 @@ impl Library {
 }
 
 fn cell(element: u16, serial: String, drive: TapeDrive, tape: Option<String>) -> DriveCell {
-    DriveCell { element, name: drive.describe(), serial, tape: Mutex::new(tape), state: Mutex::new(DriveState { drive, last_used: Instant::now() - Duration::from_secs(3600) }) }
+    DriveCell { element, name: drive.describe(), serial, tape: Mutex::new(tape), state: Mutex::new(DriveState::new(drive)) }
 }

@@ -158,6 +158,15 @@ impl Catalog {
         self.db.query_row(&format!("SELECT {} FROM tapes WHERE barcode = ?1", Self::TAPE_COLS), [barcode], Self::tape_row).optional()
     }
 
+    /// The tape whose LTFS volume has this UUID (a tape seen before,
+    /// wherever it is now).
+    pub fn tape_by_uuid(&self, uuid: &str) -> Result<Option<Tape>> {
+        if uuid.is_empty() {
+            return Ok(None);
+        }
+        self.db.query_row(&format!("SELECT {} FROM tapes WHERE uuid = ?1 COLLATE NOCASE", Self::TAPE_COLS), [uuid], Self::tape_row).optional()
+    }
+
     fn ensure(&self, barcode: &str) -> Result<()> {
         self.db.execute("INSERT OR IGNORE INTO tapes(barcode) VALUES(?1)", [barcode])?;
         Ok(())
