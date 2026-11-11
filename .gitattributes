@@ -1,0 +1,4 @@
+# text files are stored with LF and checked out as the platform prefers
+* text=auto
+# the 7-Zip source is kept exactly as released
+third_party/** -text

@@ -1,0 +1,14 @@
+[package]
+name = "lto-catalog"
+description = "The offline catalog of LTFS tapes: what each tape holds and where it is, in SQLite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ltfs.workspace = true
+# SQLite built in (with the MinGW gcc), no DLL to ship
+rusqlite = { version = "0.32", features = ["bundled"] }

@@ -1,0 +1,15 @@
+[package]
+name = "ltfs"
+description = "The Linear Tape File System format (LTFS 2.4): labels, indexes, reading, appending and formatting, on LTO drives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+lto-scsi.workspace = true
+
+[dev-dependencies]
+lto-sim.workspace = true

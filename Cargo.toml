@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/lto-scsi", "crates/lto-sim", "crates/ltfs", "crates/lto-catalog", "crates/lto-archive", "plugin", "tools/ltocat"]
+
+[workspace.package]
+version = "0.1.0-alpha"
+edition = "2021"
+rust-version = "1.88"
+license = "GPL-2.0-or-later"
+authors = ["RustySalamander contributors"]
+
+[workspace.dependencies]
+lto-scsi = { path = "crates/lto-scsi" }
+ltfs = { path = "crates/ltfs" }
+lto-catalog = { path = "crates/lto-catalog" }
+lto-sim = { path = "crates/lto-sim" }
+lto-archive = { path = "crates/lto-archive" }
+# RustySalamander's plugin interface, from the program's repository next to this one
+sal-plugin-api = { path = "../RustySalamander/crates/sal-plugin-api" }
+sal-window = { path = "../RustySalamander/crates/sal-window" }
+sal-ui = { path = "../RustySalamander/crates/sal-ui" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"

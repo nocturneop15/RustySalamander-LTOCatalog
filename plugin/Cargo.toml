@@ -1,0 +1,24 @@
+[package]
+name = "sal-plugin-ltocatalog"
+description = "RustySalamander plugin: LTFS tapes in an LTO library, browsed offline from a catalog, loaded by the robot when needed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+# Install: copy target\<profile>\sal_plugin_ltocatalog.dll to
+# plugins\ltocatalog\ltocatalog.spl next to rustysalamander.exe, with the lang folder beside it.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sal-plugin-api.workspace = true
+sal-window.workspace = true
+sal-ui.workspace = true
+lto-scsi.workspace = true
+ltfs.workspace = true
+lto-catalog.workspace = true
+lto-archive.workspace = true
+lto-sim.workspace = true

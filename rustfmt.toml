@@ -1,0 +1,3 @@
+# Long lines are the house style; rustfmt wraps only beyond this width.
+max_width = 180
+use_small_heuristics = "Max"

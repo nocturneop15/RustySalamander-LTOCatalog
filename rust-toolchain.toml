@@ -1,0 +1,4 @@
+# the same toolchain as RustySalamander (GNU; WinLibs MinGW on PATH, see env.ps1)
+[toolchain]
+channel = "stable"
+targets = ["x86_64-pc-windows-gnu"]

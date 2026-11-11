@@ -1,0 +1,16 @@
+[package]
+name = "ltocat"
+description = "Command line for the LTO tape library and its catalog: check the hardware, inventory, import, read, write, format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+lto-scsi.workspace = true
+ltfs.workspace = true
+lto-catalog.workspace = true
+lto-archive.workspace = true
+lto-sim.workspace = true

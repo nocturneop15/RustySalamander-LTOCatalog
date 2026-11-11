@@ -1,0 +1,17 @@
+[package]
+name = "lto-archive"
+description = "Jobs on a tape library with an offline catalog: inventory, import, read, write, format; what the plugin and ltocat share"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+lto-scsi.workspace = true
+ltfs.workspace = true
+lto-catalog.workspace = true
+
+[dev-dependencies]
+lto-sim.workspace = true
