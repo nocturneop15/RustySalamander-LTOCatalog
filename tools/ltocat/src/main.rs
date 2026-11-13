@@ -211,6 +211,19 @@ fn holds(h: &Holds) -> String {
 }
 
 impl Ui for Console {
+    fn step(&self, step: lto_archive::Step) {
+        use lto_archive::Step as S;
+        let text = match step {
+            S::Devices => "looking for tape libraries and drives".to_owned(),
+            S::Loading(b) => format!("{b}: getting it into a drive"),
+            S::Mounting(b, d) => format!("{b} is in {d}: reading its LTFS volume"),
+            S::Formatting(b) => format!("{b}: formatting (a few minutes)"),
+            S::Reading(b, p) => format!("{b}: reading {p}"),
+            S::Writing(b, p) => format!("{b}: writing {p}"),
+            S::WritingIndex(b) => format!("{b}: writing its index"),
+        };
+        eprintln!("... {text}");
+    }
     fn missing_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool, places: &Places) -> Answer {
         let note = tape.map(|t| t.note.as_str()).filter(|n| !n.is_empty()).map(|n| format!(" ({n})")).unwrap_or_default();
         if let Some((d, h)) = &places.ejected {

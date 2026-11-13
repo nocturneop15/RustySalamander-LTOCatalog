@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lto_archive::{Answer, Archive, ReadSink, Ui};
+use lto_archive::{Answer, Archive, ReadSink, Step, Ui};
 use lto_catalog::{Catalog, Tape};
 use lto_scsi::library::Devices;
 use ltfs::names::{from_windows, safe_relative, to_windows};
@@ -47,6 +47,41 @@ pub struct LtoCatalog {
     /// The program's look, from the last command (for the question windows).
     look: Mutex<Values>,
     asker: Option<Asker>,
+    /// The command running now (the program shows its step, with Cancel).
+    cmd: CommandState,
+}
+
+/// The state of the command [`LtoCatalog::run`] is running.
+#[derive(Default)]
+struct CommandState {
+    running: AtomicBool,
+    /// Cancel was pressed: the command stops at the next point it can.
+    cancel: AtomicBool,
+    /// What it is doing, translated.
+    step: Mutex<String>,
+}
+
+/// Marks a command as running while it lives.
+struct Running<'a>(&'a LtoCatalog);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.cmd.running.store(false, Ordering::Relaxed);
+        self.0.cmd.step.lock().unwrap().clear();
+    }
+}
+
+/// A step of a job in words.
+fn step_text(step: Step) -> String {
+    match step {
+        Step::Devices => tr("looking for tape libraries and drives…"),
+        Step::Loading(b) => trf("{barcode}: getting it into a drive…", &[("barcode", &b)]),
+        Step::Mounting(b, d) => trf("{barcode} is in {drive}: reading its LTFS volume…", &[("barcode", &b), ("drive", &d)]),
+        Step::Formatting(b) => trf("{barcode}: formatting (a few minutes; it can't be stopped halfway)…", &[("barcode", &b)]),
+        Step::Reading(b, p) => trf("{barcode}: reading {path}", &[("barcode", &b), ("path", &to_inner(p))]),
+        Step::Writing(b, p) => trf("{barcode}: writing {path}", &[("barcode", &b), ("path", &to_inner(p))]),
+        Step::WritingIndex(b) => trf("{barcode}: writing its index…", &[("barcode", &b)]),
+    }
 }
 
 export_plugin!(LtoCatalog);
@@ -110,7 +145,28 @@ impl LtoCatalog {
             asks: sal_window::Windows::new(sal_ui::icon::program, [480.0, 210.0]),
             look: Mutex::new(Values::new()),
             asker,
+            cmd: CommandState::default(),
         }
+    }
+
+    /// A command starts: it runs until the returned guard is dropped,
+    /// saying `what` until a job says more.
+    fn begin(&self, what: String) -> Running<'_> {
+        self.cmd.cancel.store(false, Ordering::Relaxed);
+        *self.cmd.step.lock().unwrap() = what;
+        self.cmd.running.store(true, Ordering::Relaxed);
+        Running(self)
+    }
+
+    /// What the running command does now.
+    fn say(&self, what: String) {
+        *self.cmd.step.lock().unwrap() = what;
+    }
+
+    /// The job interface of the running command (Cancel in the program
+    /// stops it).
+    fn command_ui(&self) -> JobUi<'_> {
+        JobUi { plugin: self, cancelled: &self.cmd.cancel }
     }
 
     fn archive(&self) -> Arc<Archive> {
@@ -193,6 +249,9 @@ struct JobUi<'a> {
 impl Ui for JobUi<'_> {
     fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+    }
+    fn step(&self, step: Step) {
+        self.plugin.say(step_text(step));
     }
     fn missing_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool, places: &Places) -> Answer {
         let a = self.plugin.ask_tape(barcode, tape, skip, places);
@@ -472,14 +531,16 @@ impl LtoCatalog {
         if barcodes.is_empty() {
             return Ok(Reply::Message(tr("There are no tapes to import.")));
         }
-        let cancelled = AtomicBool::new(false);
-        let ui = JobUi { plugin: self, cancelled: &cancelled };
+        let ui = self.command_ui();
         let mut lines = Vec::new();
-        for b in barcodes {
-            if cancelled.load(Ordering::Relaxed) {
+        let total = barcodes.len();
+        for (n, b) in barcodes.iter().enumerate() {
+            if ui.cancelled() {
+                lines.push(trf("Cancelled: {n} tapes weren't imported.", &[("n", &(total - n))]));
                 break;
             }
-            lines.push(match a.import(&b, &ui) {
+            self.say(trf("tape {n} of {total}: {barcode}", &[("n", &(n + 1)), ("total", &total), ("barcode", b)]));
+            lines.push(match a.import(b, &ui) {
                 Ok(Some(ix)) => {
                     let (n, s) = ix.totals();
                     trf("{barcode}: {files} files, {size}", &[("barcode", &b), ("files", &n), ("size", &size_text(s))])
@@ -517,8 +578,7 @@ impl LtoCatalog {
         if name.chars().any(char::is_control) || name.chars().count() > 256 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, tr("A volume name can have at most 256 characters, without line breaks or other control characters.")));
         }
-        let cancelled = AtomicBool::new(false);
-        let ix = self.archive().format(&barcode, name, &JobUi { plugin: self, cancelled: &cancelled }).map_err(io_err)?;
+        let ix = self.archive().format(&barcode, name, &self.command_ui()).map_err(io_err)?;
         Ok(Reply::Message(trf("Tape {barcode} is now an empty LTFS volume ({uuid}).", &[("barcode", &barcode), ("uuid", &ix.volume_uuid)])))
     }
 
@@ -832,6 +892,24 @@ impl FolderPlugin for LtoCatalog {
         self.archive().mkdir(&b, &p, &JobUi { plugin: self, cancelled: &cancelled }).map_err(io_err)
     }
 
+    /// The empty root is the command running now: what it does, for the
+    /// program's status bar.
+    fn activity(&self, root: &Path) -> sal_plugin_api::Activity {
+        if !root.as_os_str().is_empty() {
+            return sal_plugin_api::Activity::default();
+        }
+        sal_plugin_api::Activity { running: self.cmd.running.load(Ordering::Relaxed), text: self.cmd.step.lock().unwrap().clone() }
+    }
+
+    /// Cancel of the running command: it stops at the next point it can
+    /// (between tapes, between files; never in the middle of a format).
+    fn stop(&self, root: &Path) {
+        if root.as_os_str().is_empty() {
+            self.cmd.cancel.store(true, Ordering::Relaxed);
+            self.say(tr("cancelling…"));
+        }
+    }
+
     fn commands(&self) -> Vec<Command> {
         let c = |id: &str, label: String| Command { id: id.into(), label };
         vec![
@@ -853,6 +931,17 @@ impl FolderPlugin for LtoCatalog {
         if input.contains_key("theme") {
             *self.look.lock().unwrap() = input.clone();
         }
+        // long commands say what they do, and can be cancelled
+        let starting = match command {
+            "inventory" | "status" => Some(tr("reading the libraries' inventories…")),
+            "import_do" => Some(tr("importing tapes…")),
+            "format_do" => Some(tr("formatting…")),
+            "eject_do" => Some(tr("ejecting the tape…")),
+            "unload" => Some(tr("putting the tapes back…")),
+            "settings_do" => Some(tr("opening the catalog and the devices…")),
+            _ => None,
+        };
+        let _running = starting.map(|what| self.begin(what));
         match command {
             "open" => Ok(Self::mount()),
             "inventory" => self.cmd_inventory(),

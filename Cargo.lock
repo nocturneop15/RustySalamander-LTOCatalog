@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "ltfs"
-version = "0.3.1-alpha"
+version = "0.3.2-alpha"
 dependencies = [
  "lto-scsi",
  "lto-sim",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "lto-archive"
-version = "0.3.1-alpha"
+version = "0.3.2-alpha"
 dependencies = [
  "ltfs",
  "lto-catalog",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "lto-catalog"
-version = "0.3.1-alpha"
+version = "0.3.2-alpha"
 dependencies = [
  "ltfs",
  "rusqlite",
@@ -324,21 +324,21 @@ dependencies = [
 
 [[package]]
 name = "lto-scsi"
-version = "0.3.1-alpha"
+version = "0.3.2-alpha"
 dependencies = [
  "windows-sys",
 ]
 
 [[package]]
 name = "lto-sim"
-version = "0.3.1-alpha"
+version = "0.3.2-alpha"
 dependencies = [
  "lto-scsi",
 ]
 
 [[package]]
 name = "ltocat"
-version = "0.3.1-alpha"
+version = "0.3.2-alpha"
 dependencies = [
  "ltfs",
  "lto-archive",
@@ -458,7 +458,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "sal-core"
-version = "0.9.7-beta"
+version = "0.9.8-beta"
 dependencies = [
  "encoding_rs",
  "serde",
@@ -471,11 +471,11 @@ dependencies = [
 
 [[package]]
 name = "sal-plugin-api"
-version = "0.9.7-beta"
+version = "0.9.8-beta"
 
 [[package]]
 name = "sal-plugin-ltocatalog"
-version = "0.3.1-alpha"
+version = "0.3.2-alpha"
 dependencies = [
  "ltfs",
  "lto-archive",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "sal-ui"
-version = "0.9.7-beta"
+version = "0.9.8-beta"
 dependencies = [
  "ab_glyph",
  "egui",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "sal-window"
-version = "0.9.7-beta"
+version = "0.9.8-beta"
 dependencies = [
  "bincode",
  "egui",

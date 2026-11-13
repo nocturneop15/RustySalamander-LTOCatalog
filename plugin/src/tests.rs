@@ -347,3 +347,42 @@ fn hostile_input_in_every_form() {
     drop(p);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A long command says what it does (the program's status bar asks with
+/// the empty root) and Cancel stops it between tapes.
+#[test]
+fn a_command_reports_its_steps_and_cancels() {
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+    let (_sim, p, dir) = plugin(Some(Box::new(|_: &str, _, _: &Places| {
+        // the missing tape's question waits until the test has looked
+        while !RELEASE.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Answer::Skip
+    })));
+    let p = Arc::new(p);
+    assert!(!p.activity(Path::new("")).running, "nothing runs yet");
+    let p2 = p.clone();
+    let job = std::thread::spawn(move || {
+        let v: Values = [("which".to_string(), "list".to_string()), ("barcodes".to_string(), "MISS01L5 LTO001L5 LTO002L5".to_string())].into();
+        p2.run("import_do", &v)
+    });
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let seen = loop {
+        let a = p.activity(Path::new(""));
+        if a.running && a.text.contains("MISS01L5") {
+            break a.text;
+        }
+        assert!(std::time::Instant::now() < until, "no step shown: {a:?}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(seen.contains("getting it into a drive"), "{seen}");
+    p.stop(Path::new(""));
+    assert!(p.activity(Path::new("")).text.contains("cancelling"));
+    RELEASE.store(true, Ordering::Relaxed);
+    let Reply::Message(m) = job.join().unwrap().unwrap() else { panic!("no message") };
+    assert!(m.contains("Cancelled: 2 tapes weren't imported."), "{m}");
+    assert!(!p.activity(Path::new("")).running, "done");
+    drop(p);
+    let _ = fs::remove_dir_all(&dir);
+}

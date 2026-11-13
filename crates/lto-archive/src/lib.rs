@@ -40,8 +40,32 @@ pub enum Answer {
     Cancel,
 }
 
+/// What a job is doing now, for the person to follow it (the program's
+/// status bar, `ltocat`'s output).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step<'a> {
+    /// Looking for the libraries and drives.
+    Devices,
+    /// Getting the tape into a drive (a robot moving it, or waiting for one).
+    Loading(&'a str),
+    /// The tape is in this drive; its LTFS volume is being read.
+    Mounting(&'a str, &'a str),
+    /// Formatting the tape (minutes; can't be stopped halfway).
+    Formatting(&'a str),
+    /// Reading a file from the tape (tape, path).
+    Reading(&'a str, &'a str),
+    /// Writing a file onto the tape (tape, path).
+    Writing(&'a str, &'a str),
+    /// Writing the tape's index after a change.
+    WritingIndex(&'a str),
+}
+
 /// How a job talks to the person behind it.
 pub trait Ui: Sync {
+    /// What the job is doing now; the default says nothing.
+    fn step(&self, step: Step) {
+        let _ = step;
+    }
     /// Whether the person wants the job to stop.
     fn cancelled(&self) -> bool {
         false
@@ -287,9 +311,11 @@ impl Archive {
         let blank_as = blank.then_some(barcode);
         let identify = |d: &mut TapeDrive| self.identify(d, blank_as);
         loop {
+            ui.step(Step::Loading(barcode));
             match site.acquire(barcode, &identify, &|| ui.cancelled()) {
                 Ok(l) => {
                     let _ = self.record_locations(site);
+                    ui.step(Step::Mounting(barcode, &l.drive_name));
                     return Ok(Some(l));
                 }
                 Err(LoadError::Cancelled) => return Err(Error::Cancelled),
@@ -400,6 +426,9 @@ impl Archive {
             let mut dirs: Vec<(String, Time)> = Vec::new();
             let mut files: BTreeMap<String, File> = BTreeMap::new();
             for p in paths {
+                if ui.cancelled() {
+                    return Err(Error::Cancelled);
+                }
                 let node = if p.is_empty() { None } else { v.index.find(p).cloned() };
                 match (p.is_empty(), node) {
                     (true, _) => collect(&Node::Dir(v.index.root.clone()), "", &mut dirs, &mut files),
@@ -416,6 +445,7 @@ impl Archive {
                 if ui.cancelled() {
                     return Err(Error::Cancelled);
                 }
+                ui.step(Step::Reading(&barcode, &path));
                 if !sink.begin(&join(&barcode, &path), f.length, f.times.modify)? {
                     // not wanted, or the person stopped everything
                     if ui.cancelled() {
@@ -504,6 +534,7 @@ impl Archive {
                     first_error = Some(Error::Refused(format!("a folder named \"{name}\" is in the way")));
                     break;
                 }
+                ui.step(Step::Writing(barcode, dest));
                 let r = (|| -> Result<()> {
                     let meta = fs::metadata(disk)?;
                     let mut f = fs::File::open(disk)?;
@@ -533,6 +564,7 @@ impl Archive {
                 }
             }
             // what was written gets an index, whatever stopped it
+            ui.step(Step::WritingIndex(barcode));
             let committed = self.commit(v);
             match (first_error, committed) {
                 (Some(e), _) => Err(e),
@@ -599,6 +631,7 @@ impl Archive {
         let mut lease = self.acquire(&site, barcode, ui, false, true)?.expect("no skip");
         let drive_name = lease.drive_name.clone();
         let drive = lease.drive();
+        ui.step(Step::Formatting(barcode));
         let r = ltfs::format(drive, barcode, name, &self.creator);
         let f = match r {
             Ok(f) => f,

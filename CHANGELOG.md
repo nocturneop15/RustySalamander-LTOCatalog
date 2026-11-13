@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2-alpha (2026-11-13)
+
+- **What it is doing, and Cancel:** a command (Inventory, Import tapes, Format, Eject, Status, Unload, Library settings) tells RustySalamander's status bar each step: looking for the devices, getting a tape into a drive, reading its LTFS volume, formatting, writing the index, which tape of how many. **Cancel** stops it at the next point it can: between tapes, or between files (never in the middle of a format); the tapes done stay imported. Other plugins work meanwhile. Needs RustySalamander 0.9.8-beta or later; older versions show "working…".
+- `ltocat` prints the same steps as it goes.
+
 ## 0.3.1-alpha (2026-11-13)
 
 - **A disk is never used as a tape drive or a changer:** a device named in *Library settings…* (or found) gets tape commands only if it says it is a tape drive, and changer commands only if it says it is a medium changer. Before, `\\.\PhysicalDrive0` typed as a drive would have received FORMAT on *Format a tape*. A device that isn't one is left out, with a note in *Library status*.
