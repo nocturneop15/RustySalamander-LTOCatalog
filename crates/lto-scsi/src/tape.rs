@@ -250,7 +250,17 @@ impl TapeDrive {
     }
 
     /// MODE SELECT(10) with `params` (a mode parameter header and pages).
+    /// The header's device-specific byte always asks for buffered mode 1:
+    /// with 0 (unbuffered) the drive confirms each WRITE only once it is on
+    /// the tape, which stops the tape after every record and makes writing
+    /// hundreds of times slower (an LTO-5 wrote 0.2 MB/s instead of 140).
     pub fn mode_select(&mut self, params: &[u8]) -> Result<()> {
+        let mut params = params.to_vec();
+        if params.len() >= 4 {
+            // WP is reserved in MODE SELECT; BUFFERED MODE 1, speed as the drive likes
+            params[3] = BUFFERED_MODE;
+        }
+        let params = &params[..];
         let n = params.len();
         let cdb = [0x55, 0x10, 0, 0, 0, 0, 0, (n >> 8) as u8, n as u8, 0];
         self.cmd("MODE SELECT", &cdb, Data::Out(params), T_SHORT, |_| false).map(|_| ())
@@ -307,30 +317,30 @@ impl TapeDrive {
     /// bit of data on the tape is lost.
     pub fn format_two_partitions(&mut self, first_gb: u16) -> Result<()> {
         self.rewind()?;
-        let cur = self.mode_sense(0x11, true)?;
-        let at = 8 + be16(&cur[6..8]) as usize;
-        if cur.len() < at + 8 || cur[at] & 0x3f != 0x11 {
-            return Err(Error::Protocol("MODE SENSE: no medium partition page".into()));
+        // the partition page is set as IBM's LTFS sets it, else as SSC says
+        // with every field given; a drive that refuses both says which byte
+        let mut tried = Vec::new();
+        let mut first_sensed = String::new();
+        for (way, with_block_descriptor) in [("as LTFS sets it", true), ("with every field given", false)] {
+            let cur = self.mode_sense(0x11, !with_block_descriptor)?;
+            let params = partition_params(&cur, first_gb, with_block_descriptor)?;
+            if first_sensed.is_empty() {
+                first_sensed = hex(&cur);
+            }
+            match self.mode_select(&params) {
+                Ok(()) => {
+                    // FORMAT MEDIUM, format field 1: partition as the medium partition page says
+                    self.cmd("FORMAT MEDIUM", &[0x04, 0, 0x01, 0, 0, 0], Data::None, T_FORMAT, |_| false)?;
+                    return Ok(());
+                }
+                Err(Error::Check { sense, .. }) if sense.key == key::ILLEGAL_REQUEST => tried.push(format!("{way}: sent {} → {sense}", hex(&params))),
+                Err(e) => return Err(e),
+            }
         }
-        let page_len = cur[at + 1] as usize + 2;
-        let mut page = cur[at..(at + page_len).min(cur.len())].to_vec();
-        // room for two partition sizes
-        if page.len() < 12 {
-            page.resize(12, 0);
-        }
-        page[0] &= 0x3f;
-        page[1] = (page.len() - 2) as u8;
-        page[3] = 1; // additional partitions defined
-        page[4] = 0x20 | 0x18; // IDP, PSUM = units given by the partition units field
-        page[6] = 0x09; // partition units: 10^9 bytes
-        page[8..10].copy_from_slice(&first_gb.to_be_bytes());
-        page[10..12].copy_from_slice(&0xFFFFu16.to_be_bytes()); // the rest
-        let mut params = vec![0u8; 8];
-        params.extend_from_slice(&page);
-        self.mode_select(&params)?;
-        // FORMAT MEDIUM, format field 1: partition as the medium partition page says
-        self.cmd("FORMAT MEDIUM", &[0x04, 0, 0x01, 0, 0, 0], Data::None, T_FORMAT, |_| false)?;
-        Ok(())
+        Err(Error::Protocol(format!(
+            "the drive refused to divide the tape into two partitions (MODE SELECT of the medium partition page). The drive's page: {first_sensed}. Tried {}",
+            tried.join("; ")
+        )))
     }
 
     /// Read one attribute of the medium auxiliary memory of `partition`;
@@ -396,5 +406,114 @@ impl TapeDrive {
 
     pub fn prevent_removal(&mut self, prevent: bool) -> Result<()> {
         crate::prevent_removal(&mut *self.t, prevent)
+    }
+}
+
+/// The device-specific byte of the mode parameter header sent: BUFFERED
+/// MODE 1 (WRITE ends when the data is in the drive's buffer), default speed.
+pub const BUFFERED_MODE: u8 = 0x10;
+
+/// Bytes as hex, for messages a person passes on.
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02X}")).collect::<Vec<_>>().join(" ")
+}
+
+/// The MODE SELECT parameters that divide the tape into two partitions,
+/// from what MODE SENSE of the medium partition page answered (`cur`):
+///
+/// - with the block descriptor (`with_bd`): as IBM's LTFS does it. The
+///   answer is sent back with only the mode data length cleared; in the
+///   page, IDP is set over the drive's own PSUM, POFM, CLEAR and ADDP.
+/// - without: the header empty, IDP and PSUM = 11b set explicitly, the page
+///   cut to the two size descriptors.
+///
+/// Either way: one additional partition, partition units 10^9 bytes, the
+/// first partition `first_gb`, the second the rest (FFFFh).
+pub fn partition_params(cur: &[u8], first_gb: u16, with_bd: bool) -> Result<Vec<u8>> {
+    if cur.len() < 8 {
+        return Err(Error::Protocol("MODE SENSE: a short answer".into()));
+    }
+    let at = 8 + be16(&cur[6..8]) as usize;
+    if cur.len() < at + 8 || cur[at] & 0x3f != 0x11 {
+        return Err(Error::Protocol("MODE SENSE: no medium partition page".into()));
+    }
+    let page_len = cur[at + 1] as usize + 2;
+    let mut params = if with_bd { cur[..(at + page_len).min(cur.len())].to_vec() } else { [vec![0u8; 8], cur[at..(at + 12).min(at + page_len).min(cur.len())].to_vec()].concat() };
+    let at = if with_bd { at } else { 8 };
+    // the mode data length is reserved in MODE SELECT
+    params[0] = 0;
+    params[1] = 0;
+    // room for two partition sizes
+    if params.len() < at + 12 {
+        params.resize(at + 12, 0);
+    }
+    let page = &mut params[at..];
+    page[0] &= 0x3f; // PS is reserved in MODE SELECT
+    if !with_bd || page[1] < 0x0A {
+        page[1] = (page.len() - 2) as u8;
+    }
+    page[3] = 1; // additional partitions defined
+    page[4] = if with_bd { 0x20 | (page[4] & 0x1F) } else { 0x20 | 0x18 }; // IDP (and PSUM 11b)
+    page[6] = 0x09; // partition units: 10^9 bytes
+    page[8..10].copy_from_slice(&first_gb.to_be_bytes());
+    page[10..12].copy_from_slice(&0xFFFFu16.to_be_bytes()); // the rest
+    Ok(params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The partition page sent: as LTFS (the drive's answer back, IDP over
+    /// its PSUM) and with every field given.
+    #[test]
+    fn partition_page() {
+        // MODE SENSE(10) with a block descriptor: header, descriptor, page 11h
+        let mut cur = vec![0x00, 0x1A, 0x58, 0x10, 0, 0, 0, 8];
+        cur.extend_from_slice(&[0x58, 0, 0, 0, 0, 0, 0, 0]);
+        cur.extend_from_slice(&[0x91, 0x0A, 0x01, 0x00, 0x18, 0x03, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let p = partition_params(&cur, 1, true).unwrap();
+        assert_eq!(&p[..8], &[0, 0, 0x58, 0x10, 0, 0, 0, 8], "mode data length cleared, the rest kept");
+        assert_eq!(&p[8..16], &cur[8..16], "the block descriptor as the drive said");
+        assert_eq!(&p[16..], &[0x11, 0x0A, 0x01, 0x01, 0x38, 0x03, 0x09, 0x00, 0x00, 0x01, 0xFF, 0xFF]);
+        // without the block descriptor, a longer page cut to two sizes
+        let mut cur = vec![0x00, 0x20, 0, 0, 0, 0, 0, 0];
+        cur.extend_from_slice(&[0x11, 0x16, 0x03, 0x00, 0x04, 0x03, 0x00, 0x00]);
+        cur.extend_from_slice(&[0u8; 16]);
+        let p = partition_params(&cur, 1, false).unwrap();
+        assert_eq!(&p[..8], &[0u8; 8]);
+        assert_eq!(&p[8..], &[0x11, 0x0A, 0x03, 0x01, 0x38, 0x03, 0x09, 0x00, 0x00, 0x01, 0xFF, 0xFF]);
+        assert!(partition_params(&[0u8; 4], 1, true).is_err());
+    }
+
+    /// Records what is sent.
+    struct Sent(std::sync::Arc<std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>>>);
+
+    impl Transport for Sent {
+        fn exec(&mut self, cdb: &[u8], data: Data<'_>, _: u32) -> std::io::Result<crate::Reply> {
+            let out = if let Data::Out(b) = data { b.to_vec() } else { Vec::new() };
+            self.0.lock().unwrap().push((cdb.to_vec(), out));
+            Ok(crate::Reply { status: crate::GOOD, sense: None, transferred: 0 })
+        }
+        fn describe(&self) -> String {
+            "recorder".into()
+        }
+    }
+
+    /// Every MODE SELECT asks for buffered mode: unbuffered, an LTO-5 wrote
+    /// 0.2 MB/s.
+    #[test]
+    fn mode_select_is_buffered() {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut d = TapeDrive::new(Box::new(Sent(sent.clone())));
+        d.set_variable_blocks().unwrap();
+        d.mode_select(&[0, 0x10, 0, 0x80, 0, 0, 0, 0]).unwrap();
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        for (cdb, data) in sent.iter() {
+            assert_eq!(cdb[0], 0x55);
+            assert_eq!(data[3], BUFFERED_MODE, "buffered mode 1, WP not sent");
+        }
+        assert_eq!(&sent[0].1[8..], &[0u8; 8], "variable blocks: block length 0");
     }
 }

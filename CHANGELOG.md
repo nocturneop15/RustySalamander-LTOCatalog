@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3-alpha (2026-11-13)
+
+- **Formatting on an IBM LTO-5 drive:** the drive refused the partition page (MODE SELECT: illegal request, 26/00). The page is now set as IBM's LTFS sets it: the drive's own answer sent back with the block descriptor, only the partition fields changed; the earlier way is tried next. If the drive refuses both, the message shows the drive's page, what was sent and which byte the drive refused, to pass on.
+- A refused command now says which byte (and bit) the drive objected to.
+- **Writing at the drive's speed:** every mode setting sent to the drive asked for unbuffered writing by mistake, so the drive confirmed each record only once it was on the tape and stopped the tape after every one: an LTO-5 wrote 0.2 MB/s instead of about 140. Writing is buffered now.
+
 ## 0.3.2-alpha (2026-11-13)
 
 - **What it is doing, and Cancel:** a command (Inventory, Import tapes, Format, Eject, Status, Unload, Library settings) tells RustySalamander's status bar each step: looking for the devices, getting a tape into a drive, reading its LTFS volume, formatting, writing the index, which tape of how many. **Cancel** stops it at the next point it can: between tapes, or between files (never in the middle of a format); the tapes done stay imported. Other plugins work meanwhile. Needs RustySalamander 0.9.8-beta or later; older versions show "working…".

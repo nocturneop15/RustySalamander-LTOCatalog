@@ -32,6 +32,27 @@ pub struct Sense {
     /// The INFORMATION field, when valid: for READ with ILI, the requested
     /// length minus the record's length (negative when the record was longer).
     pub info: Option<i64>,
+    /// For an ILLEGAL REQUEST: which byte (and bit) the device refused.
+    pub field: Option<Field>,
+}
+
+/// Where an illegal request went wrong (sense-key specific field pointer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Field {
+    /// In the command (CDB); else in the data sent with it.
+    pub in_cdb: bool,
+    pub byte: u16,
+    pub bit: Option<u8>,
+}
+
+impl Field {
+    /// The three sense-key specific bytes, when they hold a valid pointer.
+    fn parse(b: &[u8]) -> Option<Field> {
+        if b.len() < 3 || b[0] & 0x80 == 0 {
+            return None;
+        }
+        Some(Field { in_cdb: b[0] & 0x40 != 0, byte: u16::from_be_bytes([b[1], b[2]]), bit: (b[0] & 0x08 != 0).then_some(b[0] & 0x07) })
+    }
 }
 
 impl Sense {
@@ -50,6 +71,7 @@ impl Sense {
                     info,
                     asc: b.get(12).copied().unwrap_or(0),
                     ascq: b.get(13).copied().unwrap_or(0),
+                    field: if b[2] & 0x0f == key::ILLEGAL_REQUEST { b.get(15..18).and_then(Field::parse) } else { None },
                 })
             }
             0x72 | 0x73 if b.len() >= 4 => {
@@ -63,6 +85,10 @@ impl Sense {
                         // information
                         0x00 if body.len() >= 12 && body[2] & 0x80 != 0 => {
                             s.info = Some(i64::from_be_bytes(body[4..12].try_into().unwrap()));
+                        }
+                        // sense-key specific: where an illegal request went wrong
+                        0x02 if body.len() >= 7 && s.key == key::ILLEGAL_REQUEST => {
+                            s.field = Field::parse(&body[4..7]);
                         }
                         // stream commands
                         0x04 if body.len() >= 4 => {
@@ -185,6 +211,12 @@ impl fmt::Display for Sense {
         if let Some(e) = self.explain() {
             write!(f, ": {e}")?;
         }
+        if let Some(p) = self.field {
+            write!(f, "; at byte {} of the {}", p.byte, if p.in_cdb { "command" } else { "data sent" })?;
+            if let Some(bit) = p.bit {
+                write!(f, ", bit {bit}")?;
+            }
+        }
         write!(f, ")")
     }
 }
@@ -193,9 +225,31 @@ impl fmt::Display for Sense {
 mod tests {
     use super::*;
 
+    /// The byte a drive refused is read and said.
+    #[test]
+    fn field_pointer() {
+        // fixed format: ILLEGAL REQUEST 26/00, SKSV, data (not CDB), byte 20, bit 5
+        let mut b = vec![0u8; 18];
+        b[0] = 0x70;
+        b[2] = key::ILLEGAL_REQUEST;
+        b[7] = 10;
+        b[12] = 0x26;
+        b[15] = 0x80 | 0x08 | 5;
+        b[16..18].copy_from_slice(&20u16.to_be_bytes());
+        let s = Sense::parse(&b).unwrap();
+        assert_eq!(s.field, Some(Field { in_cdb: false, byte: 20, bit: Some(5) }));
+        assert!(s.to_string().contains("at byte 20 of the data sent, bit 5"), "{s}");
+        // descriptor format
+        let d = [0x72, key::ILLEGAL_REQUEST, 0x26, 0x00, 0, 0, 0, 8, 0x02, 6, 0, 0, 0xC0, 0, 2, 0];
+        assert_eq!(Sense::parse(&d).unwrap().field, Some(Field { in_cdb: true, byte: 2, bit: None }));
+        // no pointer without SKSV
+        b[15] = 0;
+        assert_eq!(Sense::parse(&b).unwrap().field, None);
+    }
+
     #[test]
     fn fixed_round_trip() {
-        let s = Sense { key: key::NO_SENSE, filemark: true, ili: true, info: Some(-5), asc: 0, ascq: 1, eom: false };
+        let s = Sense { key: key::NO_SENSE, filemark: true, ili: true, info: Some(-5), asc: 0, ascq: 1, eom: false, field: None };
         assert_eq!(Sense::parse(&s.to_fixed()), Some(s));
     }
 
