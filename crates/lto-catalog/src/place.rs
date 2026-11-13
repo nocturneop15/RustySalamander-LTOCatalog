@@ -89,6 +89,54 @@ pub fn data_dir_of_program(program: &Path) -> PathBuf {
     }
 }
 
+/// Whether Windows keeps `name` for a device (`NUL`, `con.txt`, `COM1`…).
+fn device_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || (base.len() == 4 && (base.starts_with("COM") || base.starts_with("LPT")) && base.as_bytes()[3].is_ascii_digit())
+}
+
+/// A catalog file as typed (Library settings, `ltocat --catalog`): a whole
+/// path to a file in a folder that exists, never a device. SQLite writes to
+/// what it opens, so `\\.\PhysicalDrive0` or `NUL` must never get there.
+pub fn check_catalog_path(typed: &str) -> Result<PathBuf, String> {
+    let s = typed.trim().trim_matches('"').trim();
+    if s.is_empty() {
+        return Err("no catalog file was given".into());
+    }
+    if s.chars().any(|c| (c as u32) < 32 || c == '\u{7f}') {
+        return Err("the catalog's path must not contain control characters".into());
+    }
+    let b = s.as_bytes();
+    let ordinary = |rest: &[u8]| rest.len() >= 3 && rest[0].is_ascii_alphabetic() && rest[1..3] == *b":\\" || rest.len() >= 4 && rest[..4].eq_ignore_ascii_case(b"UNC\\");
+    if b.starts_with(br"\\.\") || b.starts_with(br"\??\") || b.starts_with(br"\\?\") && !ordinary(&b[4..]) {
+        return Err(format!("{s} is a device, not a file"));
+    }
+    let p = PathBuf::from(s);
+    if !p.is_absolute() {
+        return Err(format!("type the whole path of the catalog, such as D:\\Tapes\\catalog.sqlite (not {s})"));
+    }
+    for c in p.components() {
+        if let std::path::Component::Normal(n) = c {
+            let n = n.to_string_lossy();
+            if let Some(c) = n.chars().find(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')) {
+                return Err(format!("a name in the catalog's path must not contain {c}"));
+            }
+            if device_name(&n) {
+                return Err(format!("\"{n}\" is a name Windows keeps for a device"));
+            }
+        }
+    }
+    if p.is_dir() {
+        return Err(format!("{} is a folder: name the catalog file in it", p.display()));
+    }
+    match p.parent() {
+        Some(dir) if dir.is_dir() => Ok(p),
+        Some(dir) => Err(format!("the folder {} doesn't exist", dir.display())),
+        None => Err(format!("{s} has no folder")),
+    }
+}
+
 /// Whether `dir` holds RustySalamander.
 pub fn is_program_dir(dir: &Path) -> bool {
     dir.join(PROGRAM_EXE).is_file()
@@ -123,6 +171,29 @@ mod tests {
         assert_eq!(back, s);
         assert_eq!(back.catalog_path(&t), PathBuf::from(r"\\nas\tapes\catalog.sqlite"));
         assert_eq!(Settings::default().catalog_path(&t), t.join("catalog.sqlite"));
+        // a catalog is a file in a folder that exists, never a device
+        let ok = t.join("Pásky 🦎.sqlite");
+        assert_eq!(check_catalog_path(&format!("  \"{}\" ", ok.display())).unwrap(), ok);
+        for bad in [
+            String::new(),
+            "   ".into(),
+            r"\\.\PhysicalDrive0".into(),
+            r"\\.\C:".into(),
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\x".into(),
+            r"\??\C:\x".into(),
+            "NUL".into(),
+            r"C:\x\nul.sqlite".into(),
+            r"C:\x\COM1".into(),
+            "catalog.sqlite".into(),
+            "C:catalog.sqlite".into(),
+            format!("{}\\a|b", t.display()),
+            format!("{}\\x\r\ny", t.display()),
+            t.display().to_string(),
+            format!("{}\\missing\\c.sqlite", t.display()),
+            "a".repeat(100_000),
+        ] {
+            assert!(check_catalog_path(&bad).is_err(), "{bad:?}");
+        }
         let _ = fs::remove_dir_all(&t);
     }
 }

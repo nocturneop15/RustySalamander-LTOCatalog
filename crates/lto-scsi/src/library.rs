@@ -152,6 +152,10 @@ impl Library {
         let mut changer = Changer::new(changer);
         let identity = changer.inquiry()?;
         let changer_name = changer.describe();
+        // only a medium changer gets changer commands (MOVE MEDIUM…)
+        if identity.device_type != crate::TYPE_CHANGER {
+            return Err(Error::Protocol(format!("{changer_name} is not a medium changer (device type {:#04x}, {} {})", identity.device_type, identity.vendor, identity.product)));
+        }
         let inv = changer.inventory()?;
         let mut notes = Vec::new();
         let mut drives = Vec::new();

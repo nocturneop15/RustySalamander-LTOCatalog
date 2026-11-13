@@ -22,3 +22,7 @@ ltfs.workspace = true
 lto-catalog.workspace = true
 lto-archive.workspace = true
 lto-sim.workspace = true
+
+[dev-dependencies]
+# the hostile inputs every field is tested with
+sal-core = { path = "../../RustySalamander/crates/sal-core" }

@@ -302,3 +302,48 @@ fn standalone_drive_in_the_plugin() {
     assert!(m.contains(": 0."), "{m}");
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Hostile text in every form of the plugin: a message (or the error the
+/// program shows), never a panic; a barcode that can't be one, a volume
+/// name with control characters and a catalog that is a device are refused.
+#[test]
+fn hostile_input_in_every_form() {
+    let (_sim, p, dir) = plugin(None);
+    let v = |pairs: &[(&str, &str)]| -> Values { pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
+    for s in sal_core::hostile::inputs() {
+        let s = s.as_str();
+        for (cmd, values) in [
+            ("format_do", v(&[("barcode", s), ("confirm", s), ("name", "x")])),
+            ("format_do", v(&[("barcode", "LTO001L5"), ("confirm", "LTO002L5"), ("name", s)])),
+            ("eject_do", v(&[("barcode", s)])),
+            ("note_do", v(&[("barcode", s), ("note", "x")])),
+            ("note_do", v(&[("barcode", "LTO006L5"), ("note", s)])),
+            ("forget_do", v(&[("barcode", s), ("confirm", "X")])),
+            ("import_do", v(&[("which", "list"), ("barcodes", s)])),
+            ("settings_do", v(&[("changer", ""), ("drives", ""), ("catalog", s)])),
+            ("note", v(&[("selected", s)])),
+            ("eject", v(&[("selected", s)])),
+            ("format", v(&[("selected", s)])),
+        ] {
+            let _ = p.run(cmd, &values);
+        }
+        let bad = s.trim().to_uppercase();
+        if !bad.is_empty() && !barcode_ok(&bad) {
+            let e = p.run("eject_do", &v(&[("barcode", s)])).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{s:?}");
+            assert!(e.to_string().contains("isn't a barcode"), "{e}");
+        }
+    }
+    // a device is never the catalog
+    for device in [r"\\.\PhysicalDrive0", r"\\.\C:", "NUL", r"C:\x\con.sqlite"] {
+        let e = p.run("settings_do", &v(&[("catalog", device)])).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{device}: {e}");
+    }
+    // a volume name with a line break would make the index invalid XML
+    let e = p.run("format_do", &v(&[("barcode", "LTO005L5"), ("confirm", "LTO005L5"), ("name", "a\nb")])).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    // the catalog is still whole and usable
+    assert!(matches!(p.run("inventory", &Values::new()).unwrap(), Reply::Message(_)));
+    drop(p);
+    let _ = fs::remove_dir_all(&dir);
+}

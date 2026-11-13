@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1-alpha (2026-11-13)
+
+- **A disk is never used as a tape drive or a changer:** a device named in *Library settings…* (or found) gets tape commands only if it says it is a tape drive, and changer commands only if it says it is a medium changer. Before, `\\.\PhysicalDrive0` typed as a drive would have received FORMAT on *Format a tape*. A device that isn't one is left out, with a note in *Library status*.
+- **The catalog is never a device:** *Library settings…* and `ltocat --catalog` take only a whole path to a file in a folder that exists; `NUL`, `\\.\…`, `CON.sqlite` and folders are refused with the reason.
+- **Typed input checked:** a barcode is letters A–Z and digits (at most 16); a volume name has no control characters (they would make the tape's index invalid XML for other LTFS software); a note is one line; device names have no control characters. Every form was tried with RustySalamander's list of hostile input.
+- Built against RustySalamander 0.9.7-beta's plugin interface: a name that looks like a placeholder (`{error}`) shows as it is in messages.
+
 ## 0.3.0-alpha (2026-11-11)
 
 - **Standalone drives:** drives outside any library are used for tapes put in by hand. The tape in one is recognised by the barcode in its cartridge memory, else by its LTFS volume (its UUID in the catalog, or the volume serial of its VOL1 label), once per cartridge. A missing tape is asked for with where it can go: a library's mail slot or a standalone drive, and what each drive holds. When every standalone drive holds another tape, the least recently used one is ejected first. The eject button is locked while a job uses the drive. A new tape in a standalone drive can be formatted; it gets its barcode in the cartridge memory.

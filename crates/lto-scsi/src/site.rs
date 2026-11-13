@@ -150,12 +150,25 @@ pub struct Site {
     pub notes: Vec<String>,
 }
 
-/// Drives with their serial numbers (one that doesn't answer is noted
-/// and left out).
+/// Drives with their serial numbers. A device that doesn't say it is a
+/// tape drive (a disk named in the settings by mistake) is left out and
+/// noted: a tape command such as FORMAT means something else to a disk.
+/// One that doesn't answer is left out too.
 pub(crate) fn drives_with_serials(drives: Vec<Box<dyn Transport>>, notes: &mut Vec<String>) -> Vec<(String, TapeDrive)> {
     let mut found = Vec::new();
     for t in drives {
         let mut d = TapeDrive::new(t);
+        match d.inquiry() {
+            Ok(i) if i.device_type == crate::TYPE_TAPE => {}
+            Ok(i) => {
+                notes.push(format!("{} is not a tape drive (device type {:#04x}, {} {}); it isn't used", d.describe(), i.device_type, i.vendor, i.product));
+                continue;
+            }
+            Err(e) => {
+                notes.push(format!("{}: {e}", d.describe()));
+                continue;
+            }
+        }
         match d.serial_number() {
             Ok(s) => found.push((s, d)),
             Err(e) => notes.push(format!("{}: {e}", d.describe())),
@@ -404,5 +417,57 @@ impl Site {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Data, Reply};
+    use std::sync::{Arc, Mutex};
+
+    /// A disk: answers INQUIRY as one, records every command it gets.
+    struct Disk(Arc<Mutex<Vec<u8>>>);
+
+    impl Transport for Disk {
+        fn exec(&mut self, cdb: &[u8], data: Data<'_>, _: u32) -> std::io::Result<Reply> {
+            self.0.lock().unwrap().push(cdb[0]);
+            if let (0x12, Data::In(b)) = (cdb[0], data) {
+                b.fill(b' ');
+                b[0] = 0x00; // direct-access block device
+                b[4] = 31;
+                b[8..12].copy_from_slice(b"DISK");
+                return Ok(Reply { status: crate::GOOD, sense: None, transferred: 36 });
+            }
+            Ok(Reply { status: crate::GOOD, sense: None, transferred: 0 })
+        }
+        fn describe(&self) -> String {
+            r"\\.\PhysicalDrive0".into()
+        }
+    }
+
+    struct Named {
+        changers: Vec<Arc<Mutex<Vec<u8>>>>,
+        drives: Vec<Arc<Mutex<Vec<u8>>>>,
+    }
+
+    impl Devices for Named {
+        fn open_changers(&self) -> std::io::Result<Vec<Box<dyn Transport>>> {
+            Ok(self.changers.iter().map(|c| Box::new(Disk(c.clone())) as Box<dyn Transport>).collect())
+        }
+        fn open_drives(&self) -> std::io::Result<Vec<Box<dyn Transport>>> {
+            Ok(self.drives.iter().map(|c| Box::new(Disk(c.clone())) as Box<dyn Transport>).collect())
+        }
+    }
+
+    /// A disk named as a tape drive or as a changer (a typing mistake in
+    /// the settings) gets INQUIRY only, never a tape or changer command.
+    #[test]
+    fn a_disk_is_never_used_as_a_drive_or_changer() {
+        let (as_changer, as_drive) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+        let e = Site::open(&Named { changers: vec![as_changer.clone()], drives: vec![as_drive.clone()] }).err().expect("nothing to use");
+        assert!(e.to_string().contains("not a tape drive") || e.to_string().contains("not a medium changer"), "{e}");
+        assert_eq!(*as_changer.lock().unwrap(), vec![0x12], "the changer that is a disk: INQUIRY only");
+        assert_eq!(*as_drive.lock().unwrap(), vec![0x12], "the drive that is a disk: INQUIRY only");
     }
 }

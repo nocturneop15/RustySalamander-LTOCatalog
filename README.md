@@ -105,6 +105,12 @@ Wherever RustySalamander keeps its settings, so the plugin is as portable as the
 - **Tapes that are refused for writing:** write-protected tapes, locked volumes, and volumes where another program stored files in the index partition. Reading them works.
 - **Names** that Windows can't have (`:` `?` `*`, a trailing dot…) are shown with those characters in the Unicode private-use area, and written back unchanged.
 
+## Safety
+
+- Only a device that says it is a tape drive gets tape commands, and only a medium changer changer commands; a disk named by mistake in *Library settings…* is left out (*Library status* says so).
+- The catalog is always a file in a folder that exists, never a device (`NUL`, `\\.\PhysicalDrive0`) or a folder.
+- Barcodes are letters A–Z and digits; volume names and device names have no control characters.
+
 ## Not tested yet on real hardware
 
 Everything is tested against the simulator, which follows the SCSI standards (SSC-4, SMC-3). The parts most likely to need adjusting on the real TS3100 / LTO-5:

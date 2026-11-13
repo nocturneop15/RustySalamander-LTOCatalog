@@ -104,7 +104,7 @@ fn parse() -> Result<Opts, String> {
     while let Some(a) = it.next() {
         let mut val = |what: &str| it.next().ok_or_else(|| format!("{what} needs a value"));
         match a.as_str() {
-            "--catalog" => o.catalog = Some(PathBuf::from(val("--catalog")?)),
+            "--catalog" => o.catalog = Some(place::check_catalog_path(&val("--catalog")?).map_err(|e| format!("--catalog: {e}"))?),
             "--program" => program = Some(PathBuf::from(val("--program")?)),
             "--changer" => o.changers = list(&val("--changer")?),
             "--drives" => o.drives = list(&val("--drives")?),

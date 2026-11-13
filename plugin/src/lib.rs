@@ -384,6 +384,27 @@ fn barcodes_in(text: &str) -> Vec<String> {
     text.split([',', ';', ' ', '\t', '\n']).map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect()
 }
 
+/// Whether `b` can be a cartridge's barcode: letters A–Z and digits, at
+/// most 16 (LTO labels have 8, such as LTO001L5). Anything else would end
+/// up in the catalog, in tape paths and on the tape.
+fn barcode_ok(b: &str) -> bool {
+    b.len() <= 16 && b.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+fn bad_barcode(b: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, trf("\"{barcode}\" isn't a barcode: a barcode has letters A–Z and digits only, at most 16, such as LTO001L5.", &[("barcode", &b.chars().take(40).collect::<String>())]))
+}
+
+/// The barcode typed into the field `key`, upper case; empty if none.
+fn typed_barcode(values: &Values, key: &str) -> io::Result<String> {
+    let b = values.get(key).map(|b| b.trim().to_uppercase()).unwrap_or_default();
+    if barcode_ok(&b) {
+        Ok(b)
+    } else {
+        Err(bad_barcode(&b))
+    }
+}
+
 /// Cleaning cartridges have barcodes starting with CLN.
 fn is_cleaning(barcode: &str) -> bool {
     barcode.to_uppercase().starts_with("CLN")
@@ -438,7 +459,11 @@ impl LtoCatalog {
         let a = self.archive();
         let which = values.get("which").map(String::as_str).unwrap_or("new");
         let barcodes: Vec<String> = if which == "list" {
-            barcodes_in(values.get("barcodes").map(String::as_str).unwrap_or(""))
+            let list = barcodes_in(values.get("barcodes").map(String::as_str).unwrap_or(""));
+            if let Some(bad) = list.iter().find(|b| !barcode_ok(b)) {
+                return Err(bad_barcode(bad));
+            }
+            list
         } else {
             a.inventory(false).map_err(io_err)?;
             let tapes = a.catalog.lock().unwrap().tapes().map_err(|e| io::Error::other(e.to_string()))?;
@@ -482,13 +507,18 @@ impl LtoCatalog {
     }
 
     fn cmd_format(&self, values: &Values) -> io::Result<Reply> {
-        let barcode = values.get("barcode").map(|b| b.trim().to_uppercase()).unwrap_or_default();
+        let barcode = typed_barcode(values, "barcode")?;
         let confirm = values.get("confirm").map(|b| b.trim().to_uppercase()).unwrap_or_default();
         if barcode.is_empty() || barcode != confirm {
             return Ok(Reply::Message(tr("Nothing was done: the barcode typed again doesn't match.")));
         }
+        // the name goes into the tape's index (XML), which can't hold control characters
+        let name = values.get("name").map(|n| n.trim()).unwrap_or("");
+        if name.chars().any(char::is_control) || name.chars().count() > 256 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, tr("A volume name can have at most 256 characters, without line breaks or other control characters.")));
+        }
         let cancelled = AtomicBool::new(false);
-        let ix = self.archive().format(&barcode, values.get("name").map(|n| n.trim()).unwrap_or(""), &JobUi { plugin: self, cancelled: &cancelled }).map_err(io_err)?;
+        let ix = self.archive().format(&barcode, name, &JobUi { plugin: self, cancelled: &cancelled }).map_err(io_err)?;
         Ok(Reply::Message(trf("Tape {barcode} is now an empty LTFS volume ({uuid}).", &[("barcode", &barcode), ("uuid", &ix.volume_uuid)])))
     }
 
@@ -500,7 +530,7 @@ impl LtoCatalog {
     }
 
     fn cmd_eject(&self, values: &Values) -> io::Result<Reply> {
-        let b = values.get("barcode").map(|b| b.trim().to_uppercase()).unwrap_or_default();
+        let b = typed_barcode(values, "barcode")?;
         let a = self.archive();
         let site = a.inventory(false).map_err(io_err)?;
         let out = site.eject(&b).map_err(|e| match e {
@@ -515,16 +545,18 @@ impl LtoCatalog {
     }
 
     fn cmd_note(&self, values: &Values) -> io::Result<Reply> {
-        let b = values.get("barcode").map(|b| b.trim().to_uppercase()).unwrap_or_default();
+        let b = typed_barcode(values, "barcode")?;
         if b.is_empty() {
             return Ok(Reply::Done);
         }
-        self.archive().catalog.lock().unwrap().set_note(&b, values.get("note").map(|n| n.trim()).unwrap_or("")).map_err(|e| io::Error::other(e.to_string()))?;
+        // one line of text, as the status shows it
+        let note: String = values.get("note").map(|n| n.trim()).unwrap_or("").chars().map(|c| if c.is_control() { ' ' } else { c }).take(1000).collect();
+        self.archive().catalog.lock().unwrap().set_note(&b, &note).map_err(|e| io::Error::other(e.to_string()))?;
         Ok(Reply::Done)
     }
 
     fn cmd_forget(&self, values: &Values) -> io::Result<Reply> {
-        let b = values.get("barcode").map(|b| b.trim().to_uppercase()).unwrap_or_default();
+        let b = typed_barcode(values, "barcode")?;
         let confirm = values.get("confirm").map(|b| b.trim().to_uppercase()).unwrap_or_default();
         if b.is_empty() || b != confirm {
             return Ok(Reply::Message(tr("Nothing was done: the barcode typed again doesn't match.")));
@@ -596,6 +628,15 @@ impl LtoCatalog {
         };
         if Path::new(s.catalog.trim()) == place::default_catalog(&self.data) {
             s.catalog.clear();
+        }
+        // never a device or a folder: SQLite writes to what it opens
+        if !s.catalog.trim().is_empty() {
+            let p = place::check_catalog_path(&s.catalog).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, trf("The catalog file can't be used: {reason}", &[("reason", &e)])))?;
+            s.catalog = p.display().to_string();
+        }
+        // a line break or NUL in a device name is a mistake, never a device
+        if (s.changer.clone() + &s.drives).chars().any(char::is_control) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, tr("A device name can't contain line breaks or other control characters.")));
         }
         let archive = open_archive(&self.data, &s).map_err(io::Error::other)?;
         s.save(&place::settings_file(&self.data))?;
