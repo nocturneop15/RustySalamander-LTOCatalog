@@ -111,14 +111,14 @@ Wherever RustySalamander keeps its settings, so the plugin is as portable as the
 - The catalog is always a file in a folder that exists, never a device (`NUL`, `\\.\PhysicalDrive0`) or a folder.
 - Barcodes are letters A–Z and digits; volume names and device names have no control characters.
 
-## Not tested yet on real hardware
+## Tested hardware
 
-Everything is tested against the simulator, which follows the SCSI standards (SSC-4, SMC-3). The parts most likely to need adjusting on the real TS3100 / LTO-5:
+Tested with an **IBM TS3100** tape library (SAS) with LTO-5 drives. The automated tests run against the simulator, which follows the SCSI standards (SSC-4, SMC-3).
 
-- **Partitioning in `format`** (MODE SELECT of the medium partition page, then FORMAT MEDIUM). Drives differ in what they accept here.
-- **Reaching the changer through the adapter** when it has no driver.
-- **Matching drives to the changer's drive elements** by serial number. If the changer doesn't report serials, drives are matched in order (only with one changer and no other drives), and `selftest` says so.
+Not tested on real hardware yet:
+
 - **Standalone drives:** loading and ejecting by hand, the eject lock, and reading the cartridge serial number and barcode from the cartridge memory.
+- **Several libraries** connected at once.
 
 ## License
 
