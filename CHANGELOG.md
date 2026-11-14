@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.8-alpha (2026-11-14)
+
+- **"READ ELEMENT STATUS: unit attention (28/01)" no longer stops a command:** a library answers its next command so after a tape was taken out of or put into its mail slot, to say its contents changed; the command wasn't carried out. The robot's commands (inventory, moves) are now sent again after it (and after "becoming ready"), up to five times. Before, Eject right after taking a tape out of the mail slot failed with this message.
+- **Eject waits for the mail slot:** while the robot can't reach it (its door open, or the library still taking in what was done there), Eject waits for it, up to 3 minutes, and Cancel stops the wait. A mail slot that is full says so: take the tape out first.
+
 ## 0.3.7-alpha (2026-11-14)
 
 - **Retry pressed before the library has read its mail slot:** after its door is closed, a library needs a while before it reports the tape put there (an IBM TS3100 about a minute). Retry pressed meanwhile now waits for it, up to 3 minutes, with "waiting for the library to read its mail slot" as the step, and then loads the tape; the same before asking for a tape that was just put in. Before, the job went on with what the library said halfway through.

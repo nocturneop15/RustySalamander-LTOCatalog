@@ -291,7 +291,7 @@ fn the_wrong_tape_is_ejected_to_make_room() {
         drive.insert_drive(0, lto_sim::Cart::new(b, lto_sim::Config::default().capacity)).unwrap();
         a.format(b, "", &NoUi).unwrap();
         a.mkdir(b, "d", &NoUi).unwrap();
-        a.site().unwrap().eject(b).unwrap();
+        a.site().unwrap().eject(b, &|| false).unwrap();
         *SHELF.lock().unwrap() = Some(drive.take_drive(0).unwrap());
         if b == "AAA001L5" {
             KEPT.lock().unwrap().replace(SHELF.lock().unwrap().take().unwrap());
@@ -519,7 +519,7 @@ fn a_drive_seen_twice_is_one_drive() {
 fn retry_before_the_library_has_read_its_mail_slot() {
     let (sim, a) = archive();
     a.format("LTO001L5", "one", &NoUi).unwrap();
-    a.site().unwrap().eject("LTO001L5").unwrap();
+    a.site().unwrap().eject("LTO001L5", &|| false).unwrap();
     let cart = sim.take().expect("in the mail slot");
     let s2 = sim.clone();
     let ui = Answers::new(&[Answer::Retry]).then(move || {
@@ -538,4 +538,38 @@ fn retry_before_the_library_has_read_its_mail_slot() {
     assert!(a.label("LTO001L5", &ui).unwrap().is_some(), "the tape was loaded and read");
     assert_eq!(*ui.asked.lock().unwrap(), ["LTO001L5"], "asked once, not again after Retry");
     assert!(started.elapsed() >= std::time::Duration::from_secs(4), "it waited for the library");
+}
+
+/// A tape taken out of the mail slot just before an Eject: the library
+/// answers the inventory with UNIT ATTENTION 28/01 (its contents changed).
+/// That is news, not an error: the command is sent again. And while the
+/// robot can't reach the mail slot (the library still taking it in), Eject
+/// waits for it.
+#[test]
+fn a_unit_attention_or_a_busy_mail_slot_does_not_stop_eject() {
+    use lto_scsi::sense::{key, Sense};
+    let (sim, a) = archive();
+    a.format("LTO001L5", "one", &NoUi).unwrap();
+    a.format("LTO002L5", "two", &NoUi).unwrap();
+    let site = a.site().unwrap();
+    site.eject("LTO001L5", &|| false).unwrap();
+    // taken out of the mail slot: the next inventory meets the news
+    sim.take().unwrap();
+    sim.state.lock().unwrap().fail_next = Some((0xB8, Sense::new(key::UNIT_ATTENTION, 0x28, 0x01)));
+    site.refresh(false, &|_| None).unwrap();
+    // the door just closed: the robot reaches the mail slot two seconds later
+    sim.state.lock().unwrap().mail_accessible = false;
+    let s2 = sim.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        s2.state.lock().unwrap().mail_accessible = true;
+    });
+    site.refresh(false, &|_| None).unwrap();
+    site.eject("LTO002L5", &|| false).unwrap();
+    t.join().unwrap();
+    assert_eq!(sim.take().map(|c| c.barcode).as_deref(), Some("LTO002L5"));
+    // and a wait can be cancelled
+    sim.state.lock().unwrap().mail_accessible = false;
+    site.refresh(false, &|_| None).unwrap();
+    assert!(matches!(site.eject("LTO003L5", &|| true), Err(lto_scsi::library::LoadError::Cancelled)));
 }

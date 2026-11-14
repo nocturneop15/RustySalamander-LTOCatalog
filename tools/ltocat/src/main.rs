@@ -454,7 +454,7 @@ fn run(o: &Opts) -> Result<(), String> {
             let site = a.inventory(false).map_err(e)?;
             let b = o.args[1].to_uppercase();
             if cmd == "eject" {
-                match site.eject(&b).map_err(|e| e.to_string())? {
+                match site.eject(&b, &|| false).map_err(|e| e.to_string())? {
                     Ejected::MailSlot(lib) => println!("{b} is in the mail slot of {lib}."),
                     Ejected::Drive(d) => println!("{b} came out of {d}."),
                 }

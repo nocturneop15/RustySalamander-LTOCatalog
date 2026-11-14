@@ -764,7 +764,9 @@ impl LtoCatalog {
         let b = typed_barcode(values, "barcode")?;
         let a = self.archive();
         let site = a.inventory(false).map_err(io_err)?;
-        let out = site.eject(&b).map_err(|e| match e {
+        let ui = self.command_ui();
+        let out = site.eject(&b, &|| ui.cancelled()).map_err(|e| match e {
+            lto_scsi::library::LoadError::Cancelled => io_err(lto_archive::Error::Cancelled),
             lto_scsi::library::LoadError::NotInLibrary(b) => io_err(lto_archive::Error::NotInLibrary(b)),
             other => io::Error::other(other.to_string()),
         })?;

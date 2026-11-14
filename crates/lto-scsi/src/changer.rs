@@ -8,6 +8,34 @@ const T_SHORT: u32 = 60;
 const T_MOVE: u32 = 15 * 60;
 const T_INIT: u32 = 60 * 60;
 
+/// How many times a robot's command is sent again after UNIT ATTENTION.
+const ATTENTION_RETRIES: usize = 5;
+
+/// Run a command of the robot's. UNIT ATTENTION (a mail slot opened or
+/// closed, tapes taken out or put in: 28/01, a reset, changed settings)
+/// means the command wasn't carried out, only that the library has news:
+/// it is sent again. So is a command that met the library still becoming
+/// ready, a second later. (Not for tape drives: there, a unit attention can
+/// mean the position on the tape is lost.)
+fn run_robot(t: &mut dyn Transport, op: &'static str, cdb: &[u8], mut buf: Option<&mut [u8]>, timeout_s: u32) -> Result<crate::Reply> {
+    let mut tries = 0;
+    loop {
+        let data = match buf.as_deref_mut() {
+            Some(b) => Data::In(b),
+            None => Data::None,
+        };
+        match run(t, op, cdb, data, timeout_s, |_| false) {
+            Err(Error::Check { sense, .. }) if tries < ATTENTION_RETRIES && (sense.key == crate::sense::key::UNIT_ATTENTION || sense.becoming_ready()) => {
+                tries += 1;
+                if sense.becoming_ready() {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            r => return r,
+        }
+    }
+}
+
 /// The kinds of elements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
@@ -157,7 +185,7 @@ impl Changer {
 
     /// INITIALIZE ELEMENT STATUS: scan every slot's barcode again (slow).
     pub fn rescan(&mut self) -> Result<()> {
-        run(&mut *self.t, "INITIALIZE ELEMENT STATUS", &[0x07, 0, 0, 0, 0, 0], Data::None, T_INIT, |_| false).map(|_| ())
+        run_robot(&mut *self.t, "INITIALIZE ELEMENT STATUS", &[0x07, 0, 0, 0, 0, 0], None, T_INIT).map(|_| ())
     }
 
     /// READ ELEMENT STATUS of every element, kind by kind.
@@ -193,7 +221,7 @@ impl Changer {
         cdb[7] = (n >> 16) as u8;
         cdb[8] = (n >> 8) as u8;
         cdb[9] = n as u8;
-        let r = match run(&mut *self.t, "READ ELEMENT STATUS", &cdb, Data::In(&mut buf), T_SHORT, |_| false) {
+        let r = match run_robot(&mut *self.t, "READ ELEMENT STATUS", &cdb, Some(&mut buf), T_SHORT) {
             Err(Error::Check { sense, .. }) if dvcid && sense.key == crate::sense::key::ILLEGAL_REQUEST => return self.element_status(kind, false),
             r => r?,
         };
@@ -208,7 +236,7 @@ impl Changer {
         cdb[2..4].copy_from_slice(&transport.to_be_bytes());
         cdb[4..6].copy_from_slice(&from.to_be_bytes());
         cdb[6..8].copy_from_slice(&to.to_be_bytes());
-        run(&mut *self.t, "MOVE MEDIUM", &cdb, Data::None, T_MOVE, |_| false).map(|_| ())
+        run_robot(&mut *self.t, "MOVE MEDIUM", &cdb, None, T_MOVE).map(|_| ())
     }
 
     /// Lock or unlock the library's doors and mail slot.

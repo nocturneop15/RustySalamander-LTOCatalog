@@ -398,9 +398,9 @@ impl Site {
 
     /// Hand the tape to a person: a library moves it to its mail slot, a
     /// standalone drive ejects it.
-    pub fn eject(&self, barcode: &str) -> Result<Ejected, LoadError> {
+    pub fn eject(&self, barcode: &str, cancelled: &dyn Fn() -> bool) -> Result<Ejected, LoadError> {
         if let Some(lib) = self.libraries.iter().find(|l| l.has(barcode)) {
-            lib.export(barcode)?;
+            lib.export(barcode, cancelled)?;
             return Ok(Ejected::MailSlot(lib.name.clone()));
         }
         for sd in &self.standalone {

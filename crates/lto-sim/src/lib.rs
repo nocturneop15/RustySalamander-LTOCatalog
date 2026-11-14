@@ -1200,7 +1200,7 @@ mod tests {
         assert!(lib.has("NEW001L5"));
         let slot = lib.import("NEW001L5").unwrap();
         assert_eq!(lib.inventory().find("NEW001L5").unwrap().address, slot);
-        lib.export("LTO005L5").unwrap();
+        lib.export("LTO005L5", &|| false).unwrap();
         assert_eq!(sim.take().unwrap().barcode, "LTO005L5");
     }
 

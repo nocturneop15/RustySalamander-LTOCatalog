@@ -131,6 +131,8 @@ pub struct Library {
 }
 
 /// How long a tape may take to become ready after it is put into a drive.
+/// How long Eject waits for the robot to be able to reach the mail slot.
+pub const MAIL_WAIT: Duration = Duration::from_secs(180);
 pub(crate) const LOAD_LIMIT: Duration = Duration::from_secs(5 * 60);
 
 impl Library {
@@ -338,29 +340,49 @@ impl Library {
         Ok(())
     }
 
-    /// Move the tape to the mail slot, so it can be taken out.
-    pub fn export(&self, barcode: &str) -> Result<(), LoadError> {
+    /// Move the tape to the mail slot, so it can be taken out. While the
+    /// robot can't reach the mail slot (its door open, or the library still
+    /// taking in what was done there), wait for it, at most [`MAIL_WAIT`],
+    /// asking `cancelled` now and then.
+    pub fn export(&self, barcode: &str, cancelled: &dyn Fn() -> bool) -> Result<(), LoadError> {
         // out of a drive first
         if let Some(cell) = self.drives.iter().find(|d| d.tape().is_some_and(|t| t.eq_ignore_ascii_case(barcode))) {
             let mut g = cell.state.lock().unwrap();
             self.unload_locked(cell, &mut g)?;
         }
-        let mut c = self.changer.lock().unwrap();
-        let from = c.inv.find(barcode).map(|e| (e.address, e.kind)).ok_or_else(|| LoadError::NotInLibrary(barcode.to_owned()))?;
-        if from.1 == Kind::MailSlot {
-            return Ok(());
+        let start = Instant::now();
+        loop {
+            {
+                let mut c = self.changer.lock().unwrap();
+                let from = c.inv.find(barcode).map(|e| (e.address, e.kind)).ok_or_else(|| LoadError::NotInLibrary(barcode.to_owned()))?;
+                if from.1 == Kind::MailSlot {
+                    return Ok(());
+                }
+                if let Some(to) = c.inv.mail_slots.iter().find(|e| !e.full && e.accessible).map(|e| e.address) {
+                    let transport = c.inv.transports[0].address;
+                    c.changer.move_medium(transport, from.0, to)?;
+                    c.inv.moved(from.0, to);
+                    return Ok(());
+                }
+                let unreachable = c.inv.mail_slots.iter().any(|e| !e.accessible);
+                if !unreachable || start.elapsed() >= MAIL_WAIT {
+                    let why = if unreachable {
+                        "the robot can't reach the mail slot: close its door, and wait until the library has read it"
+                    } else {
+                        "the mail slot is full: take the tape out of it first"
+                    };
+                    return Err(LoadError::Scsi(Error::Protocol(why.into())));
+                }
+            }
+            let pause = Instant::now();
+            while pause.elapsed() < Duration::from_secs(3) {
+                if cancelled() {
+                    return Err(LoadError::Cancelled);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            self.refresh(false)?;
         }
-        let to = c
-            .inv
-            .mail_slots
-            .iter()
-            .find(|e| !e.full && e.accessible)
-            .map(|e| e.address)
-            .ok_or_else(|| LoadError::Scsi(Error::Protocol("the mail slot is full or not accessible; empty it and close it first".into())))?;
-        let transport = c.inv.transports[0].address;
-        c.changer.move_medium(transport, from.0, to)?;
-        c.inv.moved(from.0, to);
-        Ok(())
     }
 
     /// Move a tape from the mail slot into a free storage slot.
