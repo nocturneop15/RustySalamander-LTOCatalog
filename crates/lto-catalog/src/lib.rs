@@ -332,6 +332,52 @@ impl Catalog {
     }
 }
 
+/// What to look for in the catalog ([`Catalog::find`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Find<'a> {
+    /// Names containing the text (any case).
+    Contains(&'a str),
+    /// Names matching a mask: `*` any characters, `?` one (`*.mkv`).
+    Mask(&'a str),
+}
+
+impl Find<'_> {
+    /// As a LIKE pattern, `!` escaping.
+    fn like(&self) -> String {
+        let esc = |s: &str| s.replace('!', "!!").replace('%', "!%").replace('_', "!_");
+        match self {
+            Find::Contains(t) => format!("%{}%", esc(t)),
+            Find::Mask(m) => esc(m).replace('*', "%").replace('?', "_"),
+        }
+    }
+}
+
+/// A file or folder found in the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub tape: String,
+    /// Its path on the tape (LTFS names, `\`-separated).
+    pub path: String,
+    pub entry: Entry,
+}
+
+impl Catalog {
+    /// Files and folders whose name matches `what`, on every tape or only
+    /// on `tape`; at most `limit`, by tape and path.
+    pub fn find(&self, what: &Find, tape: Option<&str>, limit: usize) -> Result<Vec<Found>> {
+        let mut st = self.db.prepare(
+            "SELECT tape, parent, name, dir, size, mtime, mtime_ns, readonly FROM entries \
+             WHERE name LIKE ?1 ESCAPE '!' AND (?2 IS NULL OR tape = ?2) ORDER BY tape, parent, name LIMIT ?3",
+        )?;
+        let rows = st.query_map(params![what.like(), tape, limit as i64], |r| {
+            let (tape, parent, name): (String, String, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            let entry = Entry { name: name.clone(), dir: r.get::<_, i64>(3)? != 0, size: r.get::<_, i64>(4)? as u64, modified: Time { secs: r.get(5)?, nanos: r.get::<_, i64>(6)? as u32 }, readonly: r.get::<_, i64>(7)? != 0 };
+            Ok(Found { tape, path: if parent.is_empty() { name } else { format!("{parent}\\{name}") }, entry })
+        })?;
+        rows.collect()
+    }
+}
+
 fn entry_row(r: &rusqlite::Row) -> rusqlite::Result<Entry> {
     Ok(Entry {
         name: r.get(0)?,
@@ -346,6 +392,27 @@ fn entry_row(r: &rusqlite::Row) -> rusqlite::Result<Entry> {
 mod tests {
     use super::*;
     use ltfs::{File, Times};
+
+    /// Found by a part of the name or by a mask, any case, on one tape or all.
+    #[test]
+    fn find_by_name_or_mask() {
+        let mut c = Catalog::in_memory().unwrap();
+        let mut ix = Index::new("uuid-1", "test", "");
+        let now = Time::now();
+        ix.make_dirs("filmy\\1987", now).unwrap();
+        for name in ["Arabesky 1080p.mkv", "arabesky.srt", "100%_hotovo.txt"] {
+            let f = File { name: name.into(), length: 5, readonly: false, open_for_write: false, times: Times::all(now), uid: ix.next_uid(), xattrs: Vec::new(), extents: Vec::new(), symlink: None, extra: Vec::new() };
+            ix.put("filmy\\1987", Node::File(f), now).unwrap();
+        }
+        c.import("LTO001L5", &ix, None, None, false).unwrap();
+        let paths = |f: Vec<Found>| f.into_iter().map(|f| format!("{}\\{}", f.tape, f.path)).collect::<Vec<_>>();
+        assert_eq!(paths(c.find(&Find::Contains("ARABESK"), None, 100).unwrap()), ["LTO001L5\\filmy\\1987\\Arabesky 1080p.mkv", "LTO001L5\\filmy\\1987\\arabesky.srt"]);
+        assert_eq!(paths(c.find(&Find::Mask("*.mkv"), None, 100).unwrap()), ["LTO001L5\\filmy\\1987\\Arabesky 1080p.mkv"]);
+        assert_eq!(paths(c.find(&Find::Mask("19??"), None, 100).unwrap()), ["LTO001L5\\filmy\\1987"]);
+        assert_eq!(c.find(&Find::Contains("%_"), None, 100).unwrap().len(), 1, "% and _ are literal");
+        assert!(c.find(&Find::Contains("arabesky"), Some("LTO002L5"), 100).unwrap().is_empty());
+        assert_eq!(c.find(&Find::Contains("a"), None, 2).unwrap().len(), 2, "limited");
+    }
 
     fn file(name: &str, len: u64) -> Node {
         Node::File(File { name: name.into(), length: len, readonly: false, open_for_write: false, times: Times::all(Time { secs: 100, nanos: 5 }), uid: 0, xattrs: vec![], extents: vec![], symlink: None, extra: vec![] })

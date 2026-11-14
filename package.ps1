@@ -1,7 +1,8 @@
 # Builds the release and puts what to install into target\release\dist:
 #   dist\plugins\ltocatalog\ltocatalog.spl + lang\   (copy the plugins folder next to rustysalamander.exe)
 #   dist\ltocat.exe                                    (the command line, anywhere)
-#   dist\ltocatalog-<version>.zip                      (both, for the library machine)
+#   dist\ltocatalog-<version>.zip                      (both, for the library machine; README and CHANGELOG
+#                                                       renamed -ltocatalog so they don't overwrite the program's)
 # Usage: .\package.ps1
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
@@ -16,6 +17,8 @@ New-Item -ItemType Directory -Force "$plugin\lang" | Out-Null
 Copy-Item target\release\sal_plugin_ltocatalog.dll "$plugin\ltocatalog.spl"
 Copy-Item plugin\lang\*.toml "$plugin\lang\"
 Copy-Item target\release\ltocat.exe $dist
-Copy-Item README.md, CHANGELOG.md $dist
-Compress-Archive -Path "$dist\plugins", "$dist\ltocat.exe", "$dist\README.md", "$dist\CHANGELOG.md" -DestinationPath "$dist\ltocatalog-$version.zip"
+# renamed: unpacked into the program's folder, they mustn't overwrite its README and CHANGELOG
+Copy-Item README.md "$dist\README-ltocatalog.md"
+Copy-Item CHANGELOG.md "$dist\CHANGELOG-ltocatalog.md"
+Compress-Archive -Path "$dist\plugins", "$dist\ltocat.exe", "$dist\README-ltocatalog.md", "$dist\CHANGELOG-ltocatalog.md" -DestinationPath "$dist\ltocatalog-$version.zip"
 Get-ChildItem -Recurse $dist | Where-Object { -not $_.PSIsContainer } | ForEach-Object { "{0,10:N0}  {1}" -f $_.Length, $_.FullName.Substring((Resolve-Path $dist).Path.Length + 1) }

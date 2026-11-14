@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.4-alpha (2026-11-14)
+
+- **Search the catalog:** Plugins → *Search the catalog…* finds files and folders by a part of their name or by a mask (`*.mkv`), on every tape or one, without loading a tape. The results open in RustySalamander's results window; files found are copied out of it (or a panel showing them) like out of the tapes, and the library loads what it needs.
+- **Format several tapes in one job:** *Format tapes…* lists the tapes in the libraries and drives, with where each is and what it holds, to tick (those selected in the panel are ticked); another one can be given by its barcode. With no volume name given, each tape is named by its barcode. Typing ERASE confirms; the job formats them one after the other, with Cancel between tapes.
+- **Right-click on tapes:** Search the catalog, Import, Format, Eject, Note about and Forget the tape (needs RustySalamander 0.9.9-beta or later).
+- **The package's README and CHANGELOG are named `README-ltocatalog.md` and `CHANGELOG-ltocatalog.md`,** so unpacking it into the program's folder no longer overwrites RustySalamander's own.
+
 ## 0.3.3-alpha (2026-11-13)
 
 - **Formatting on an IBM LTO-5 drive:** the drive refused the partition page (MODE SELECT: illegal request, 26/00). The page is now set as IBM's LTFS sets it: the drive's own answer sent back with the block descriptor, only the partition fields changed; the earlier way is tried next. If the drive refuses both, the message shows the drive's page, what was sent and which byte the drive refused, to pass on.

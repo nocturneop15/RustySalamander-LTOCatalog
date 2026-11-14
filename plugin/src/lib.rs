@@ -26,8 +26,15 @@ use lto_catalog::place::{self, Settings};
 use lto_scsi::site::{Ejected, Holds, Places};
 use sal_plugin_api::ui::decode;
 use sal_plugin_api::{
-    export_plugin, join_inner, mount_of, n_, tr, trf, Command, Field, FieldKind, FolderPlugin, Form, Index, Item, Mount, Plugin, Progress, Reply, Sink, Values, ATTR_DIRECTORY,
+    export_plugin, join_inner, mount_of, n_, tr, trf, Command, Field, FieldKind, FolderPlugin, Form, Index, Item, Mount, Plugin, Progress, Reply, Results, Sink, Values, ATTR_DIRECTORY,
 };
+use lto_catalog::{Find, Found};
+
+/// The most a catalog search finds.
+const SEARCH_LIMIT: usize = 10_000;
+
+/// The word typed to confirm formatting tapes.
+const ERASE: &str = "ERASE";
 
 /// The connection's scheme and authority: `lto://library`.
 const SCHEME: &str = "lto";
@@ -49,6 +56,9 @@ pub struct LtoCatalog {
     asker: Option<Asker>,
     /// The command running now (the program shows its step, with Cancel).
     cmd: CommandState,
+    /// Catalog searches, by their connection's authority (`search-3`).
+    searches: Mutex<BTreeMap<String, Arc<Vec<Found>>>>,
+    next_search: std::sync::atomic::AtomicUsize,
 }
 
 /// The state of the command [`LtoCatalog::run`] is running.
@@ -146,7 +156,72 @@ impl LtoCatalog {
             look: Mutex::new(Values::new()),
             asker,
             cmd: CommandState::default(),
+            searches: Mutex::new(BTreeMap::new()),
+            next_search: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// The results of the catalog search `file` is in, if it is one.
+    fn search_of(&self, file: &Path) -> Option<Arc<Vec<Found>>> {
+        let (s, a, _) = mount_of(file)?;
+        if s != SCHEME {
+            return None;
+        }
+        self.searches.lock().unwrap().get(&a).cloned()
+    }
+
+    /// Whether files can be read from `file`: the catalog, or a search's results.
+    fn readable(&self, file: &Path) -> bool {
+        is_ours(file) || self.search_of(file).is_some()
+    }
+
+    fn search_form(&self, values: &Values) -> Reply {
+        let chosen = chosen_tapes(values);
+        let choice = |id: &str, label: String| (id.to_owned(), label);
+        Reply::Form(Form {
+            title: tr("Search the catalog"),
+            ok: tr("Search"),
+            command: "search_do".into(),
+            fields: vec![
+                field("text", tr("Name"), FieldKind::Text, values.get("text").map(String::as_str).unwrap_or("")),
+                field("match", tr("Look for"), FieldKind::Choice(vec![choice("contains", tr("names containing it")), choice("mask", tr("names matching a mask (*.mkv)"))]), "contains"),
+                field("tape", tr("Only on tape"), FieldKind::Text, if chosen.len() == 1 { &chosen[0] } else { "" }),
+                note(tr("A mask: * any characters, ? one. Only on tape: a barcode, or empty for every tape. The catalog is searched; no tape is loaded. Found files are copied out of the results like out of the tapes.")),
+            ],
+        })
+    }
+
+    /// A catalog search: its results in RustySalamander's results window.
+    fn cmd_search(&self, values: &Values) -> io::Result<Reply> {
+        let text = values.get("text").map(|t| t.trim()).unwrap_or("");
+        if text.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, tr("Type a name, or a part of one, to look for.")));
+        }
+        if text.chars().any(char::is_control) || text.chars().count() > 256 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, tr("A name to look for has at most 256 characters, without line breaks.")));
+        }
+        let tape = typed_barcode(values, "tape")?;
+        let what = if values.get("match").map(String::as_str) == Some("mask") { Find::Mask(text) } else { Find::Contains(text) };
+        let found = self.archive().catalog.lock().unwrap().find(&what, (!tape.is_empty()).then_some(tape.as_str()), SEARCH_LIMIT).map_err(|e| io::Error::other(e.to_string()))?;
+        if found.is_empty() {
+            return Ok(Reply::Message(trf("Nothing in the catalog is named like \"{text}\".", &[("text", &text)])));
+        }
+        let n = found.len();
+        let authority = format!("search-{}", self.next_search.fetch_add(1, Ordering::Relaxed) + 1);
+        self.searches.lock().unwrap().insert(authority.clone(), Arc::new(found));
+        let title = if n == SEARCH_LIMIT {
+            trf("Tape catalog: \"{text}\" (the first {n} found)", &[("text", &text), ("n", &n)])
+        } else {
+            trf("Tape catalog: \"{text}\" ({n} found)", &[("text", &text), ("n", &n)])
+        };
+        Ok(Reply::Results(Results {
+            title,
+            name: trf("tapes: {text}", &[("text", &text)]),
+            mount: Mount { scheme: SCHEME.into(), authority, folder: String::new() },
+            flat: String::new(),
+            again: "search".into(),
+            refresh: String::new(),
+        }))
     }
 
     /// A command starts: it runs until the returned guard is dropped,
@@ -552,34 +627,87 @@ impl LtoCatalog {
         Ok(Reply::Message(lines.join("\n")))
     }
 
-    fn cmd_format_form(&self, values: &Values) -> Reply {
+    /// The tapes in the libraries and drives, each to tick (those selected
+    /// in the panel ticked), a barcode for another, the volume name and the
+    /// confirmation.
+    fn cmd_format_form(&self, values: &Values) -> io::Result<Reply> {
         let chosen = chosen_tapes(values);
-        Reply::Form(Form {
-            title: tr("Format a tape"),
-            ok: tr("Format"),
-            command: "format_do".into(),
-            fields: vec![
-                note(tr("Formatting erases everything on the tape and makes it an empty LTFS volume.")),
-                field("barcode", tr("Barcode"), FieldKind::Text, chosen.first().map(String::as_str).unwrap_or("")),
-                field("name", tr("Volume name"), FieldKind::Text, ""),
-                field("confirm", tr("Type the barcode again"), FieldKind::Text, ""),
-            ],
-        })
+        let mut fields = vec![note(tr("Formatting erases everything on the tapes and makes each an empty LTFS volume."))];
+        let a = self.archive();
+        match a.inventory(false) {
+            Ok(_) => {
+                let tapes = a.catalog.lock().unwrap().tapes().map_err(|e| io::Error::other(e.to_string()))?;
+                let inside: Vec<&Tape> = tapes.iter().filter(|t| t.in_library() && !is_cleaning(&t.barcode)).collect();
+                if inside.is_empty() {
+                    fields.push(note(tr("No tape is in a library or drive now.")));
+                }
+                for t in inside {
+                    let what = if t.is_ltfs() {
+                        trf("LTFS, {files} files, {size}", &[("files", &t.files), ("size", &size_text(t.bytes))])
+                    } else if t.imported.is_some() {
+                        tr("no LTFS volume")
+                    } else {
+                        tr("not imported")
+                    };
+                    let ticked = if chosen.contains(&t.barcode.to_uppercase()) { "1" } else { "" };
+                    fields.push(field(&format!("tape:{}", t.barcode), format!("{}  ·  {}  ·  {what}", t.barcode, t.location), FieldKind::Check, ticked));
+                }
+            }
+            Err(e) => fields.push(note(io_err(e).to_string())),
+        }
+        let listed = |b: &String| fields.iter().any(|f| f.id == format!("tape:{b}"));
+        let other = chosen.iter().find(|b| !listed(b)).cloned().unwrap_or_default();
+        fields.push(field("barcode", tr("Another tape (barcode)"), FieldKind::Text, &other));
+        fields.push(field("name", tr("Volume name"), FieldKind::Text, ""));
+        fields.push(note(tr("Another tape: one that isn't listed, such as a new one in a standalone drive. Volume name: empty names each tape by its barcode.")));
+        fields.push(field("confirm", trf("Type {word} to confirm", &[("word", &ERASE)]), FieldKind::Text, ""));
+        Ok(Reply::Form(Form { title: tr("Format tapes"), ok: tr("Format"), command: "format_do".into(), fields }))
     }
 
     fn cmd_format(&self, values: &Values) -> io::Result<Reply> {
-        let barcode = typed_barcode(values, "barcode")?;
+        // the tapes ticked, and the one typed
+        let mut list: Vec<String> = values.iter().filter(|(k, v)| k.starts_with("tape:") && !v.is_empty()).map(|(k, _)| k[5..].to_uppercase()).collect();
+        if let Some(bad) = list.iter().find(|b| !barcode_ok(b)) {
+            return Err(bad_barcode(bad));
+        }
+        let typed = typed_barcode(values, "barcode")?;
+        if !typed.is_empty() && !list.contains(&typed) {
+            list.push(typed);
+        }
+        list.sort();
+        if list.is_empty() {
+            return Ok(Reply::Message(tr("Nothing was done: no tape was ticked or typed.")));
+        }
+        // ERASE, or for one tape its barcode again
         let confirm = values.get("confirm").map(|b| b.trim().to_uppercase()).unwrap_or_default();
-        if barcode.is_empty() || barcode != confirm {
-            return Ok(Reply::Message(tr("Nothing was done: the barcode typed again doesn't match.")));
+        if confirm != ERASE && !(list.len() == 1 && confirm == list[0]) {
+            return Ok(Reply::Message(trf("Nothing was done: type {word} to confirm.", &[("word", &ERASE)])));
         }
         // the name goes into the tape's index (XML), which can't hold control characters
         let name = values.get("name").map(|n| n.trim()).unwrap_or("");
         if name.chars().any(char::is_control) || name.chars().count() > 256 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, tr("A volume name can have at most 256 characters, without line breaks or other control characters.")));
         }
-        let ix = self.archive().format(&barcode, name, &self.command_ui()).map_err(io_err)?;
-        Ok(Reply::Message(trf("Tape {barcode} is now an empty LTFS volume ({uuid}).", &[("barcode", &barcode), ("uuid", &ix.volume_uuid)])))
+        // no name: each tape is named by its barcode
+        let name_of = |barcode: &str| if name.is_empty() { barcode.to_owned() } else { name.to_owned() };
+        let ui = self.command_ui();
+        if let [barcode] = &list[..] {
+            let ix = self.archive().format(barcode, &name_of(barcode), &ui).map_err(io_err)?;
+            return Ok(Reply::Message(trf("Tape {barcode} is now an empty LTFS volume ({uuid}).", &[("barcode", barcode), ("uuid", &ix.volume_uuid)])));
+        }
+        let (total, mut lines) = (list.len(), Vec::new());
+        for (n, b) in list.iter().enumerate() {
+            if ui.cancelled() {
+                lines.push(trf("Cancelled: {n} tapes weren't formatted.", &[("n", &(total - n))]));
+                break;
+            }
+            self.say(trf("tape {n} of {total}: {barcode}", &[("n", &(n + 1)), ("total", &total), ("barcode", b)]));
+            lines.push(match self.archive().format(b, &name_of(b), &ui) {
+                Ok(_) => trf("{barcode}: an empty LTFS volume", &[("barcode", b)]),
+                Err(e) => format!("{b}: {}", io_err(e)),
+            });
+        }
+        Ok(Reply::Message(lines.join("\n")))
     }
 
     fn one_tape_form(&self, values: &Values, title: String, ok: String, command: &str, extra: Vec<Field>) -> Reply {
@@ -732,6 +860,22 @@ impl FolderPlugin for LtoCatalog {
     }
 
     fn list(&self, file: &Path, folder: &str) -> io::Result<Index> {
+        // a search's results: all at once, the program browses their folders
+        if let Some(found) = self.search_of(file) {
+            let items = found
+                .iter()
+                .enumerate()
+                .map(|(i, f)| Item {
+                    path: to_inner(&format!("{}\\{}", f.tape, f.path)),
+                    dir: f.entry.dir,
+                    size: f.entry.size,
+                    modified: Some(f.entry.modified.to_system()),
+                    attrs: if f.entry.dir { ATTR_DIRECTORY } else { 0 } | if f.entry.readonly { ATTR_READONLY } else { 0 },
+                    index: Some(i as u32),
+                })
+                .collect();
+            return Ok(Index { items, complete: true });
+        }
         if !is_ours(file) {
             return Err(not_ours());
         }
@@ -783,7 +927,7 @@ impl FolderPlugin for LtoCatalog {
     }
 
     fn extract(&self, file: &Path, items: &[String], out: &Path, progress: &mut Progress) -> io::Result<()> {
-        if !is_ours(file) {
+        if !self.readable(file) {
             return Err(not_ours());
         }
         let a = self.archive();
@@ -807,7 +951,7 @@ impl FolderPlugin for LtoCatalog {
     }
 
     fn stream(&self, file: &Path, items: &[String], sink: &mut dyn Sink) -> io::Result<()> {
-        if !is_ours(file) {
+        if !self.readable(file) {
             return Err(not_ours());
         }
         let paths: Vec<String> = items.iter().map(|i| to_ltfs(i)).collect();
@@ -910,20 +1054,42 @@ impl FolderPlugin for LtoCatalog {
         }
     }
 
+    /// A search's results window or panel closed: they are forgotten.
+    fn close(&self, root: &Path) {
+        if let Some((_, a, _)) = mount_of(root) {
+            self.searches.lock().unwrap().remove(&a);
+        }
+    }
+
     fn commands(&self) -> Vec<Command> {
         let c = |id: &str, label: String| Command { id: id.into(), label };
         vec![
             c("open", tr("Open tape catalog")),
+            c("search", tr("Search the catalog…")),
             c("inventory", tr("Inventory the libraries and drives")),
             c("import", tr("Import tapes…")),
             c("status", tr("Library status")),
-            c("format", tr("Format a tape…")),
+            c("format", tr("Format tapes…")),
             c("eject", tr("Eject a tape…")),
             c("unload", tr("Put the tapes in the drives back")),
             c("note", tr("Note about a tape…")),
             c("forget", tr("Forget a tape…")),
             c("settings", tr("Library settings…")),
         ]
+    }
+
+    /// A right-click on tapes: what is done to a tape (on the clicked or
+    /// selected ones).
+    fn item_commands(&self) -> Option<Vec<Command>> {
+        let c = |id: &str, label: String| Command { id: id.into(), label };
+        Some(vec![
+            c("search", tr("Search the catalog…")),
+            c("import", tr("Import tape…")),
+            c("format", tr("Format tape…")),
+            c("eject", tr("Eject tape…")),
+            c("note", tr("Note about tape…")),
+            c("forget", tr("Forget tape…")),
+        ])
     }
 
     fn run(&self, command: &str, input: &Values) -> io::Result<Reply> {
@@ -936,6 +1102,8 @@ impl FolderPlugin for LtoCatalog {
             "inventory" | "status" => Some(tr("reading the libraries' inventories…")),
             "import_do" => Some(tr("importing tapes…")),
             "format_do" => Some(tr("formatting…")),
+            "format" => Some(tr("reading the libraries' inventories…")),
+            "search_do" => Some(tr("searching the catalog…")),
             "eject_do" => Some(tr("ejecting the tape…")),
             "unload" => Some(tr("putting the tapes back…")),
             "settings_do" => Some(tr("opening the catalog and the devices…")),
@@ -948,7 +1116,9 @@ impl FolderPlugin for LtoCatalog {
             "import" => Ok(self.cmd_import_form(input)),
             "import_do" => self.cmd_import(input),
             "status" => self.cmd_status(),
-            "format" => Ok(self.cmd_format_form(input)),
+            "format" => self.cmd_format_form(input),
+            "search" => Ok(self.search_form(input)),
+            "search_do" => self.cmd_search(input),
             "format_do" => self.cmd_format(input),
             "eject" => Ok(self.one_tape_form(
                 input,

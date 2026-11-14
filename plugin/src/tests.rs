@@ -191,7 +191,7 @@ fn starts_through_the_program() {
     let desc = unsafe { &*rustysalamander_plugin() };
     let p = unsafe { sal_plugin_api::host::start(desc, &HOST, &dir) }.unwrap();
     assert_eq!(p.id(), "ltocatalog");
-    assert_eq!(p.commands().len(), 10);
+    assert_eq!(p.commands().len(), 11);
     p.run("inventory", &Values::new()).unwrap();
     assert_eq!(p.list(&root(), "").unwrap().items.len(), 6);
     assert!(dir.join("cat.sqlite").exists() && dir.join("sim.bin").exists());
@@ -383,6 +383,95 @@ fn a_command_reports_its_steps_and_cancels() {
     let Reply::Message(m) = job.join().unwrap().unwrap() else { panic!("no message") };
     assert!(m.contains("Cancelled: 2 tapes weren't imported."), "{m}");
     assert!(!p.activity(Path::new("")).running, "done");
+    drop(p);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Values from pairs.
+fn vals(pairs: &[(&str, &str)]) -> Values {
+    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+/// The catalog is searched by a part of a name or a mask; the results open
+/// in the program's results window, and a file found is copied out of them.
+#[test]
+fn search_the_catalog_and_copy_from_the_results() {
+    let (_sim, p, dir) = plugin(None);
+    let r = root();
+    p.run("format_do", &vals(&[("barcode", "LTO001L5"), ("confirm", "LTO001L5")])).unwrap();
+    let src = dir.join("src");
+    fs::create_dir_all(src.join("filmy")).unwrap();
+    fs::write(src.join("filmy").join("Arabesky 1080p.mkv"), vec![3u8; 300_000]).unwrap();
+    fs::write(src.join("filmy").join("arabesky.srt"), b"titulky").unwrap();
+    p.add(&r, &[(src.join("filmy"), "LTO001L5\\filmy".into())], &mut |_, _| true).unwrap();
+
+    // the form, and a mistake: nothing typed
+    assert!(matches!(p.run("search", &Values::new()).unwrap(), Reply::Form(f) if f.command == "search_do"));
+    assert_eq!(p.run("search_do", &vals(&[("text", "  ")])).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    assert!(matches!(p.run("search_do", &vals(&[("text", "nowhere")])).unwrap(), Reply::Message(m) if m.contains("Nothing in the catalog")));
+
+    // by a part of the name, any case
+    let Reply::Results(res) = p.run("search_do", &vals(&[("text", "ARABESK")])).unwrap() else { panic!("no results") };
+    assert!(res.title.contains("2 found"), "{}", res.title);
+    let found = res.mount.root();
+    let ix = p.list(&found, "").unwrap();
+    assert!(ix.complete);
+    let mut paths: Vec<&str> = ix.items.iter().map(|i| i.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(paths, ["LTO001L5\\filmy\\Arabesky 1080p.mkv", "LTO001L5\\filmy\\arabesky.srt"]);
+    // results can only be read
+    assert!(!p.can_write(&found));
+    // a file found, copied out (the library loads its tape)
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    p.extract(&found, &["LTO001L5\\filmy\\arabesky.srt".into()], &out, &mut |_, _| true).unwrap();
+    assert_eq!(fs::read(out.join("LTO001L5").join("filmy").join("arabesky.srt")).unwrap(), b"titulky");
+
+    // by a mask, on one tape
+    let Reply::Results(res) = p.run("search_do", &vals(&[("text", "*.mkv"), ("match", "mask"), ("tape", "lto001l5")])).unwrap() else { panic!() };
+    assert_eq!(p.list(&res.mount.root(), "").unwrap().items.len(), 1);
+    // closed: forgotten
+    p.close(&res.mount.root());
+    assert!(p.list(&res.mount.root(), "").is_err());
+    drop(p);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Several tapes formatted in one job: the form lists the tapes in the
+/// library (those selected ticked); ERASE confirms.
+#[test]
+fn format_several_tapes_at_once() {
+    let (_sim, p, dir) = plugin(None);
+    let r = root();
+    p.run("inventory", &Values::new()).unwrap();
+    // LTO002L5 selected in the panel: ticked in the form
+    let selected = sal_plugin_api::ui::encode(&[sal_plugin_api::ui::path_value(&r.join("LTO002L5"))]);
+    let Reply::Form(f) = p.run("format", &vals(&[("selected", &selected)])).unwrap() else { panic!("no form") };
+    let ticks: Vec<(&str, &str)> = f.fields.iter().filter(|f| f.id.starts_with("tape:")).map(|f| (f.id.as_str(), f.value.as_str())).collect();
+    assert_eq!(ticks.len(), 6, "every tape in the library: {ticks:?}");
+    assert_eq!(ticks.iter().filter(|(_, v)| !v.is_empty()).map(|(id, _)| *id).collect::<Vec<_>>(), ["tape:LTO002L5"]);
+    assert!(f.fields.iter().any(|f| f.label.contains("LTO003L5") && f.label.contains("slot")), "where each tape is");
+
+    // not confirmed: nothing happens
+    let two = [("tape:LTO002L5", "1"), ("tape:LTO003L5", "1"), ("confirm", "LTO002L5")];
+    assert!(matches!(p.run("format_do", &vals(&two)).unwrap(), Reply::Message(m) if m.contains("Nothing was done")));
+    // ERASE: both formatted in one job
+    let two = [("tape:LTO002L5", "1"), ("tape:LTO003L5", "1"), ("confirm", "erase"), ("name", "zálohy")];
+    let Reply::Message(m) = p.run("format_do", &vals(&two)).unwrap() else { panic!() };
+    assert_eq!(m.lines().count(), 2, "{m}");
+    assert!(m.contains("LTO002L5: an empty LTFS volume") && m.contains("LTO003L5: an empty LTFS volume"), "{m}");
+    assert!(p.list(&r, "LTO002L5").unwrap().items.is_empty() && p.list(&r, "LTO003L5").unwrap().items.is_empty());
+    // the name given, on each
+    assert_eq!(p.archive().catalog.lock().unwrap().tape("LTO003L5").unwrap().unwrap().name, "zálohy");
+    // no name: each tape's barcode
+    p.run("format_do", &vals(&[("tape:LTO004L5", "1"), ("confirm", "ERASE")])).unwrap();
+    assert_eq!(p.archive().catalog.lock().unwrap().tape("LTO004L5").unwrap().unwrap().name, "LTO004L5");
+    // the context menu on tapes: what is done to a tape, all run by the plugin
+    let items: Vec<String> = p.item_commands().unwrap().into_iter().map(|c| c.id).collect();
+    assert_eq!(items, ["search", "import", "format", "eject", "note", "forget"]);
+    assert!(items.iter().all(|id| p.commands().iter().any(|c| &c.id == id)));
+    // a barcode that can't be one, ticked by a crafted form
+    assert_eq!(p.run("format_do", &vals(&[("tape:A\\B", "1"), ("confirm", "ERASE")])).unwrap_err().kind(), io::ErrorKind::InvalidInput);
     drop(p);
     let _ = fs::remove_dir_all(&dir);
 }

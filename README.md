@@ -5,6 +5,9 @@ A RustySalamander plugin for LTFS tapes in LTO tape libraries and standalone LTO
 - **Browse every tape offline.** A catalog (SQLite) keeps what each tape's LTFS volume holds. Plugins → *Open tape catalog* shows the tapes by barcode, and you can browse them without loading any.
 - **The robot loads tapes by itself.** Copying from a tape (F5, F3, dragging out) or onto one has the library load it into a free drive. With two drives, two tapes are used at once. Files are read in the order they lie on the tape.
 - **Standalone drives too.** A drive outside any library is used for tapes you put in by hand; the plugin recognises which tape it is. See [Libraries and standalone drives](#libraries-and-standalone-drives).
+- **Search the catalog** by a part of a name or a mask (`*.mkv`), on every tape or one; copy what is found straight out of the results.
+- **Format several tapes in one job,** ticked from the tapes in the libraries and drives.
+- **Right-click on tapes** for the plugin's commands (RustySalamander 0.9.9-beta or later).
 - **Missing tapes are asked for.** When a job needs a tape that no library or drive has, a window says where it can go (a library's mail slot, a standalone drive) and what the drives hold: *Retry*, *Skip this tape* or *Cancel*.
 - **Native LTFS, no driver.** The plugin reads and writes LTFS 2.4 itself through Windows' SCSI pass-through: labels, indexes, appending files, formatting. IBM's or HPE's LTFS software isn't needed.
 
