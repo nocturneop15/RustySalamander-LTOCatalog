@@ -108,6 +108,10 @@ pub enum Error {
     NoSpace(u64, u64),
     /// Not possible (writing at the top level, a name in use…).
     Refused(String),
+    /// The drive that was to hold `wanted` holds a cartridge that says it is
+    /// `found` (the library's drives matched to the wrong tape devices, or
+    /// tapes moved outside this program); nothing was done to it.
+    WrongTape { wanted: String, found: String, drive: String },
     Cancelled,
     Library(lto_scsi::Error),
     Ltfs(ltfs::Error),
@@ -127,6 +131,10 @@ impl std::fmt::Display for Error {
             Error::Skipped(b) => write!(f, "tapes skipped: {}", b.join(", ")),
             Error::NoSpace(need, free) => write!(f, "not enough space on the tape: {need} bytes needed, {free} free"),
             Error::Refused(m) => write!(f, "{m}"),
+            Error::WrongTape { wanted, found, drive } => write!(
+                f,
+                "drive {drive} was to hold tape {wanted}, but the cartridge in it says it is {found}; nothing was done to it. The library's drives may be matched to the wrong tape devices, or tapes were moved outside this program: run an inventory, and check `ltocat selftest`"
+            ),
             Error::Cancelled => write!(f, "cancelled"),
             Error::Library(e) => write!(f, "{e}"),
             Error::Ltfs(e) => write!(f, "{e}"),
@@ -194,6 +202,59 @@ pub fn split_tape(path: &str) -> (String, String) {
     match parts.split_first() {
         Some((b, rest)) => ((*b).to_owned(), rest.join("\\")),
         None => (String::new(), String::new()),
+    }
+}
+
+/// What a cartridge says it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Said {
+    /// The barcode in its cartridge memory (written by a library, by
+    /// Format, or by other LTFS software).
+    Barcode(String),
+    /// The volume serial of its LTFS VOL1 label: the barcode's first six
+    /// characters.
+    Serial(String),
+}
+
+impl Said {
+    /// Whether it is the tape `barcode`. A barcode in the memory may be
+    /// written whole or cut to six characters.
+    fn is(&self, barcode: &str) -> bool {
+        let want: String = barcode.trim().to_uppercase();
+        match self {
+            Said::Barcode(b) => {
+                let b = b.trim().to_uppercase();
+                let (short, long) = if b.len() <= want.len() { (&b, &want) } else { (&want, &b) };
+                b == want || (short.len() >= 6 && long.starts_with(short.as_str()))
+            }
+            Said::Serial(s) => {
+                let alnum: String = want.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+                alnum.starts_with(&s.to_uppercase())
+            }
+        }
+    }
+
+    fn text(&self) -> String {
+        match self {
+            Said::Barcode(b) => b.trim().to_owned(),
+            Said::Serial(s) => format!("{s}…"),
+        }
+    }
+}
+
+/// What the cartridge in `drive` says it is, `None` when it says nothing
+/// (a new tape, or one that can't be read): the barcode in its memory, else
+/// the volume serial of its LTFS label.
+fn cartridge_says(drive: &mut TapeDrive) -> Option<Said> {
+    if let Ok(Some(v)) = drive.read_attribute(0, attr::BARCODE) {
+        let b = lto_scsi::ascii(&v);
+        if !b.trim().is_empty() {
+            return Some(Said::Barcode(b.trim().to_owned()));
+        }
+    }
+    match ltfs::volume::identify(drive) {
+        Ok(Some((volser, _))) if !volser.trim().is_empty() => Some(Said::Serial(volser.trim().to_owned())),
+        _ => None,
     }
 }
 
@@ -305,7 +366,9 @@ impl Archive {
     }
 
     /// Get `barcode` into a drive, asking for it while no library or drive
-    /// has it. `blank`: a tape without LTFS or barcode in a standalone drive
+    /// has it. In a library, the cartridge put into the drive is checked to
+    /// be that tape ([`cartridge_says`]); if it says it is another one,
+    /// [`Error::WrongTape`]. `blank`: a tape without LTFS or barcode in a standalone drive
     /// is taken as this one (for Format).
     fn acquire<'s>(&self, site: &'s Site, barcode: &str, ui: &dyn Ui, skip: bool, blank: bool) -> Result<Option<Lease<'s>>> {
         let blank_as = blank.then_some(barcode);
@@ -313,7 +376,19 @@ impl Archive {
         loop {
             ui.step(Step::Loading(barcode));
             match site.acquire(barcode, &identify, &|| ui.cancelled()) {
-                Ok(l) => {
+                Ok(mut l) => {
+                    // a library's drive: the cartridge in it must agree that it is
+                    // the tape, before anything is read or written (a format of
+                    // the wrong tape destroys it)
+                    if !l.standalone() {
+                        if let Some(found) = cartridge_says(l.drive()).filter(|s| !s.is(barcode)) {
+                            let drive = l.drive_name.clone();
+                            drop(l);
+                            let _ = site.refresh(false, &identify);
+                            let _ = self.record_locations(site);
+                            return Err(Error::WrongTape { wanted: barcode.to_owned(), found: found.text(), drive });
+                        }
+                    }
                     let _ = self.record_locations(site);
                     ui.step(Step::Mounting(barcode, &l.drive_name));
                     return Ok(Some(l));

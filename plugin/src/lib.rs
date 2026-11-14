@@ -377,6 +377,10 @@ fn io_err(e: lto_archive::Error) -> io::Error {
         E::Skipped(list) => (K::Other, trf("These tapes were skipped, their files weren't copied: {tapes}", &[("tapes", &list.join(", "))])),
         E::NoSpace(need, free) => (K::StorageFull, trf("Not enough space on the tape: {need} bytes needed, {free} bytes free.", &[("need", &need), ("free", &free)])),
         E::NoLibrary(m) => (K::NotFound, trf("No tape library or drive can be used: {reason}", &[("reason", &m)])),
+        E::WrongTape { wanted, found, drive } => {
+            let text = trf("Drive {drive} was to hold tape {wanted}, but the cartridge in it says it is {found}. Nothing was done to it. The library's drives may be matched to the wrong tape devices, or tapes were moved at the library's panel: run Inventory and try again; if it happens again, send the output of \"ltocat selftest\".", &[("drive", &drive), ("wanted", &wanted), ("found", &found)]);
+            (K::InvalidData, text)
+        }
         E::Io(e) => return e,
         E::Ltfs(ltfs::Error::Full) => (K::StorageFull, tr("The tape is full. The files copied before it filled up are on it.")),
         E::Ltfs(ltfs::Error::ReadOnly(m)) => (K::PermissionDenied, trf("The tape can't be written: {reason}", &[("reason", &m)])),

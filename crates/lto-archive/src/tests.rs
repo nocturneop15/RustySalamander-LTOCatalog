@@ -426,3 +426,88 @@ fn two_libraries_and_a_standalone_drive() {
     drop(a);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A library's drive that holds another tape than the program thinks
+/// (tapes moved at the library's panel, or drives matched to the wrong tape
+/// devices): the cartridge says so, and nothing is done to it; the
+/// inventory is read again, and then the right tape is used.
+#[test]
+fn the_wrong_tape_in_a_drive_is_left_alone() {
+    let (sim, a) = archive();
+    a.format("LTO001L5", "one", &NoUi).unwrap();
+    a.format("LTO002L5", "two", &NoUi).unwrap();
+    let d1 = (0..2).find(|&i| sim.drive_tape(i).as_deref() == Some("LTO001L5")).expect("in a drive");
+    let d2 = 1 - d1;
+    assert_eq!(sim.drive_tape(d2).as_deref(), Some("LTO002L5"));
+    // swapped behind the program's back
+    let (c1, c2) = (sim.take_drive(d1).unwrap(), sim.take_drive(d2).unwrap());
+    sim.insert_drive(d1, c2).unwrap();
+    sim.insert_drive(d2, c1).unwrap();
+    // formatting "LTO001L5" would hit LTO002L5: refused
+    let e = a.format("LTO001L5", "again", &NoUi).unwrap_err();
+    assert!(matches!(&e, Error::WrongTape { wanted, found, .. } if wanted == "LTO001L5" && found.starts_with("LTO002L5")), "{e}");
+    // LTO002L5 is untouched
+    a.import("LTO002L5", &NoUi).unwrap();
+    assert_eq!(a.catalog.lock().unwrap().tape("LTO002L5").unwrap().unwrap().name, "two");
+    // the inventory was read again: now the right tape is formatted
+    a.format("LTO001L5", "again", &NoUi).unwrap();
+    assert_eq!(a.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap().name, "again");
+    a.import("LTO002L5", &NoUi).unwrap();
+    assert_eq!(a.catalog.lock().unwrap().tape("LTO002L5").unwrap().unwrap().name, "two");
+}
+
+/// What a cartridge says it is, against the barcode asked for.
+#[test]
+fn a_cartridge_is_the_tape_it_says() {
+    assert!(Said::Barcode("300AFGL5".into()).is("300afgl5"));
+    assert!(Said::Barcode("300AFG".into()).is("300AFGL5"), "cut to six characters");
+    assert!(!Said::Barcode("301AFGL5".into()).is("300AFGL5"));
+    assert!(!Said::Barcode("300AF".into()).is("300AFGL5"), "too short to tell");
+    assert!(Said::Serial("300AFG".into()).is("300AFGL5"));
+    assert!(!Said::Serial("301AFG".into()).is("300AFGL5"));
+}
+
+/// The library's devices as a computer sees them: `drives` are which of
+/// the simulated drives appear as tape devices, in that order (one twice:
+/// a SAS drive's two ports).
+struct Seen {
+    sim: SimLibrary,
+    drives: Vec<usize>,
+}
+
+impl lto_scsi::library::Devices for Seen {
+    fn open_changers(&self) -> io::Result<Vec<Box<dyn lto_scsi::Transport>>> {
+        Ok(vec![self.sim.changer()])
+    }
+    fn open_drives(&self) -> io::Result<Vec<Box<dyn lto_scsi::Transport>>> {
+        Ok(self.drives.iter().map(|&i| self.sim.drive(i)).collect())
+    }
+}
+
+/// The TS3100 case: library drive 2 seen twice (both devices say the same
+/// serial number), drive 1 not at all. Drive 2 is used once, drive 1 not:
+/// before, drive 1 got the second device by order, so a job for the tape
+/// in drive 1 was done to the tape in drive 2.
+#[test]
+fn a_drive_seen_twice_is_one_drive() {
+    let sim = SimLibrary::new(&Config::default());
+    let site = lto_scsi::site::Site::open(&Seen { sim: sim.clone(), drives: vec![1, 1] }).unwrap();
+    let lib = &site.libraries[0];
+    assert_eq!(lib.drives.len(), 1, "{:?}", site.all_notes());
+    let inv = lib.inventory();
+    assert_eq!(lib.drives[0].element, inv.drives[1].address, "the device is library drive 2");
+    let notes = site.all_notes().join("\n");
+    assert!(notes.contains("seen a second time"), "{notes}");
+    assert!(notes.contains("isn't among this computer's tape devices"), "{notes}");
+    assert!(!notes.contains("matched in order"), "{notes}");
+    drop(site);
+    // jobs go to drive 2, and to the tape asked for
+    let a = Archive::new(Box::new(Seen { sim: sim.clone(), drives: vec![1, 1] }), Catalog::in_memory().unwrap(), "test");
+    a.format("LTO001L5", "one", &NoUi).unwrap();
+    assert_eq!(sim.drive_tape(1).as_deref(), Some("LTO001L5"));
+    assert_eq!(sim.drive_tape(0), None, "drive 1 isn't used");
+    a.format("LTO002L5", "two", &NoUi).unwrap();
+    assert_eq!(sim.drive_tape(1).as_deref(), Some("LTO002L5"));
+    a.import("LTO001L5", &NoUi).unwrap();
+    assert_eq!(a.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap().name, "one");
+}

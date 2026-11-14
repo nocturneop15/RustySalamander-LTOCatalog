@@ -370,7 +370,8 @@ fn a_command_reports_its_steps_and_cancels() {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let seen = loop {
         let a = p.activity(Path::new(""));
-        if a.running && a.text.contains("MISS01L5") {
+        // "tape 1 of 3" comes first, then the step on it
+        if a.running && a.text.contains("MISS01L5") && a.text.contains("getting it into a drive") {
             break a.text;
         }
         assert!(std::time::Instant::now() < until, "no step shown: {a:?}");

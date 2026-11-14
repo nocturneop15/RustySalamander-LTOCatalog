@@ -153,9 +153,13 @@ pub struct Site {
 /// Drives with their serial numbers. A device that doesn't say it is a
 /// tape drive (a disk named in the settings by mistake) is left out and
 /// noted: a tape command such as FORMAT means something else to a disk.
-/// One that doesn't answer is left out too.
+/// One that doesn't answer is left out too. A device with the serial number
+/// of one already found is the same drive seen a second time (a SAS
+/// drive's second port, a second path): it is left out and noted, or two
+/// "drives" would be one, and a job for the tape in one library drive would
+/// be done to the tape in the other.
 pub(crate) fn drives_with_serials(drives: Vec<Box<dyn Transport>>, notes: &mut Vec<String>) -> Vec<(String, TapeDrive)> {
-    let mut found = Vec::new();
+    let mut found: Vec<(String, TapeDrive)> = Vec::new();
     for t in drives {
         let mut d = TapeDrive::new(t);
         match d.inquiry() {
@@ -170,7 +174,13 @@ pub(crate) fn drives_with_serials(drives: Vec<Box<dyn Transport>>, notes: &mut V
             }
         }
         match d.serial_number() {
-            Ok(s) => found.push((s, d)),
+            Ok(s) => {
+                if let Some((_, first)) = found.iter().find(|(f, _)| !s.trim().is_empty() && f.trim() == s.trim()) {
+                    notes.push(format!("{} is the same drive as {} (serial number {}), seen a second time (a second port or path); it is used once", d.describe(), first.describe(), s.trim()));
+                    continue;
+                }
+                found.push((s, d))
+            }
             Err(e) => notes.push(format!("{}: {e}", d.describe())),
         }
     }

@@ -386,10 +386,16 @@ fn run(o: &Opts) -> Result<(), String> {
             let site = a.inventory(false).map_err(e)?;
             for lib in &site.libraries {
                 println!("changer {}: {} {} {} at {}", lib.name, lib.identity.vendor, lib.identity.product, lib.identity.revision, lib.changer_name);
-                for (i, d) in lib.drives.iter().enumerate() {
-                    println!("  drive {}: element {:#06x}, {} serial {}, holds {}", i + 1, d.element, d.name, d.serial, d.tape().unwrap_or_else(|| "nothing".into()));
-                }
+                // the library's drives by element, as the changer names them,
+                // and the tape device each one is used through (if any)
                 let inv = lib.inventory();
+                for el in &inv.drives {
+                    let says = el.device_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("(not identified)");
+                    match lib.drives.iter().find(|d| d.element == el.address) {
+                        Some(d) => println!("  drive {:#06x} ({says}): used at {} serial {}, holds {}", el.address, d.name, d.serial.trim(), d.tape().unwrap_or_else(|| "nothing".into())),
+                        None => println!("  drive {:#06x} ({says}): not used, no tape device on this computer", el.address),
+                    }
+                }
                 let full = inv.slots.iter().filter(|s| s.full).count();
                 println!("  slots: {} ({} with a tape), mail slots: {}, drives: {}", inv.slots.len(), full, inv.mail_slots.len(), inv.drives.len());
                 let no_label = inv.all().filter(|e| e.full && e.barcode.is_none()).count();

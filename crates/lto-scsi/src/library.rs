@@ -98,6 +98,12 @@ impl Lease<'_> {
     pub fn drive(&mut self) -> &mut TapeDrive {
         &mut self.guard.drive
     }
+
+    /// A standalone drive (its tape was identified from the cartridge); else
+    /// a library's, whose tape is the one the library says it put there.
+    pub fn standalone(&self) -> bool {
+        self.standalone
+    }
 }
 
 impl Drop for Lease<'_> {
@@ -170,17 +176,29 @@ impl Library {
                 None => unmatched.push(el),
             }
         }
-        // a changer that doesn't report drive serial numbers: match by order,
-        // when that leaves no doubt
-        if !unmatched.is_empty() {
-            if by_order && unmatched.len() == found.len() {
+        // a drive the changer identifies, but no device matches, isn't
+        // connected to this computer (or is seen under another serial
+        // number): it isn't used. Matching it to a device by order would make
+        // a job for its tape go to another drive's tape.
+        let (named, anonymous): (Vec<_>, Vec<_>) = unmatched.into_iter().partition(|el| el.device_id.as_deref().is_some_and(|id| !id.trim().is_empty()));
+        for el in named {
+            notes.push(format!(
+                "drive element {:#06x} is the drive {}, which isn't among this computer's tape devices; it isn't used",
+                el.address,
+                el.device_id.as_deref().unwrap_or("").trim()
+            ));
+        }
+        // a changer that doesn't identify its drives: match by order, when
+        // that leaves no doubt (no drive identified, as many devices as drives)
+        if !anonymous.is_empty() {
+            if by_order && drives.is_empty() && anonymous.len() == found.len() {
                 notes.push("the changer doesn't identify its drives; they are matched in order".into());
-                for (el, (serial, drive)) in unmatched.into_iter().zip(found.drain(..)) {
+                for (el, (serial, drive)) in anonymous.into_iter().zip(found.drain(..)) {
                     drives.push(cell(el.address, serial, drive, el.barcode.clone().filter(|_| el.full)));
                 }
             } else {
-                for el in unmatched {
-                    notes.push(format!("drive element {:#06x} ({}) has no tape device", el.address, el.device_id.as_deref().unwrap_or("?")));
+                for el in anonymous {
+                    notes.push(format!("drive element {:#06x} has no tape device", el.address));
                 }
             }
         }
