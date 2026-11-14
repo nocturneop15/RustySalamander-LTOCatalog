@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.9-alpha (2026-11-14)
+
+- The command *Put the tapes in the drives back* is now called *Unload tapes from drives*.
+- **Retry looks for the tape for up to 30 seconds:** a tape put into the mail slot shows up only once the library has read it. After Retry, the libraries and drives are now looked at every few seconds, and the tape is used as soon as it is there; the question comes again only if it hasn't shown up in 30 seconds (longer while a library says it is still reading its mail slot, at most 3 minutes). Cancel stops the wait.
+
 ## 0.3.8-alpha (2026-11-14)
 
 - **"READ ELEMENT STATUS: unit attention (28/01)" no longer stops a command:** a library answers its next command so after a tape was taken out of or put into its mail slot, to say its contents changed; the command wasn't carried out. The robot's commands (inventory, moves) are now sent again after it (and after "becoming ready"), up to five times. Before, Eject right after taking a tape out of the mail slot failed with this message.

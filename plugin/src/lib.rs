@@ -1129,7 +1129,7 @@ impl FolderPlugin for LtoCatalog {
             c("status", tr("Library status")),
             c("format", tr("Format tapes…")),
             c("eject", tr("Eject a tape…")),
-            c("unload", tr("Put the tapes in the drives back")),
+            c("unload", tr("Unload tapes from drives")),
             c("note", tr("Note about a tape…")),
             c("forget", tr("Forget a tape…")),
             c("settings", tr("Library settings…")),

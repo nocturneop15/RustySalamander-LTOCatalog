@@ -573,3 +573,25 @@ fn a_unit_attention_or_a_busy_mail_slot_does_not_stop_eject() {
     site.refresh(false, &|_| None).unwrap();
     assert!(matches!(site.eject("LTO003L5", &|| true), Err(lto_scsi::library::LoadError::Cancelled)));
 }
+
+/// Retry pressed, and the tape shows up in the mail slot a few seconds
+/// later (the library reports it only once it has read it): it is looked
+/// for for up to RETRY_WAIT before the question comes again.
+#[test]
+fn after_retry_the_tape_is_looked_for_a_while() {
+    let (sim, a) = archive();
+    a.format("LTO001L5", "one", &NoUi).unwrap();
+    a.site().unwrap().eject("LTO001L5", &|| false).unwrap();
+    let cart = sim.take().expect("in the mail slot");
+    let s2 = sim.clone();
+    let ui = Answers::new(&[Answer::Retry]).then(move || {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            s2.insert(cart).unwrap();
+        });
+    });
+    let started = std::time::Instant::now();
+    assert!(a.label("LTO001L5", &ui).unwrap().is_some(), "the tape was loaded and read");
+    assert_eq!(*ui.asked.lock().unwrap(), ["LTO001L5"], "asked once");
+    assert!(started.elapsed() < RETRY_WAIT, "taken as soon as it showed up");
+}

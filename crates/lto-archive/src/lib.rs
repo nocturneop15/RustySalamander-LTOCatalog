@@ -202,6 +202,9 @@ pub struct Archive {
 /// How long to wait for a library to read what was put into its mail slot
 /// (an IBM TS3100 takes about a minute after its door is closed).
 pub const SETTLE_LIMIT: Duration = Duration::from_secs(180);
+/// After Retry, how long to look for the tape before asking again (a tape
+/// put into a mail slot takes a while to show up).
+pub const RETRY_WAIT: Duration = Duration::from_secs(30);
 /// Between two looks at a library that is still reading its mail slot.
 const SETTLE_PAUSE: Duration = Duration::from_secs(3);
 
@@ -413,7 +416,7 @@ impl Archive {
                     // before asking
                     if !waited && site.settling() {
                         waited = true;
-                        self.settle(site, barcode, &identify, ui)?;
+                        self.settle(site, barcode, &identify, ui, Duration::ZERO)?;
                         continue;
                     }
                     let tape = self.catalog.lock().unwrap().tape(barcode)?;
@@ -424,7 +427,7 @@ impl Archive {
                         Answer::Retry => {
                             // pressed before the library read its mail slot: wait for that
                             waited = true;
-                            self.settle(site, barcode, &identify, ui)?;
+                            self.settle(site, barcode, &identify, ui, RETRY_WAIT)?;
                             self.record_locations(site)?;
                         }
                         Answer::Skip if skip => return Ok(None),
@@ -435,11 +438,14 @@ impl Archive {
         }
     }
 
-    /// Read the libraries again; while one is still taking in its mail slot
-    /// (it hasn't read the barcode of a tape put there, or answers "not
-    /// ready" meanwhile), and `barcode` isn't where the robot can reach it, read them again every
-    /// few seconds, for at most [`SETTLE_LIMIT`]. Cancel stops the wait.
-    fn settle(&self, site: &Site, barcode: &str, identify: lto_scsi::site::Identify, ui: &dyn Ui) -> Result<()> {
+    /// Read the libraries and drives again, until `barcode` is where it can
+    /// be used (a library's robot can reach it, or a standalone drive holds
+    /// it), every few seconds: for `patience` (after Retry, the tape may take
+    /// a while to show up), and longer while a library is still taking in
+    /// its mail slot (it hasn't read the barcode of a tape put there, or
+    /// answers "not ready" meanwhile), for at most [`SETTLE_LIMIT`]. Cancel
+    /// stops the wait.
+    fn settle(&self, site: &Site, barcode: &str, identify: lto_scsi::site::Identify, ui: &dyn Ui, patience: Duration) -> Result<()> {
         let start = Instant::now();
         loop {
             let busy = match site.refresh(false, identify) {
@@ -447,7 +453,8 @@ impl Archive {
                 Err(e) if e.sense().is_some_and(|s| s.key == lto_scsi::sense::key::NOT_READY) => Some(e),
                 Err(e) => return Err(e.into()),
             };
-            if busy.is_none() && (site.reachable(barcode) || !site.settling()) {
+            let here = site.reachable(barcode) || site.loaded().iter().any(|b| b.eq_ignore_ascii_case(barcode));
+            if busy.is_none() && (here || (!site.settling() && start.elapsed() >= patience)) {
                 return Ok(());
             }
             if start.elapsed() >= SETTLE_LIMIT {
