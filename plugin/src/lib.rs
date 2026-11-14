@@ -136,6 +136,10 @@ impl Plugin for LtoCatalog {
     // windows drawn by the program (interface 9); with older programs the
     // insert-tape question can't be shown
     const PROGRAM_MIN: &'static str = "0.9.4-beta";
+    // the program's update check: releases `ltocatalog-v<version>` of this
+    // repository, with `ltocatalog-<version>-api<n>.zip`
+    const UPDATES: sal_plugin_api::Updates =
+        sal_plugin_api::Updates { repo: "nocturneop15/RustySalamander-LTOCatalog", tag: "ltocatalog-v", changelog: "CHANGELOG.md" };
 
     fn start(dir: &Path) -> Result<Self, String> {
         // its own folder, or %APPDATA% in multi-user mode (lto_catalog::place)

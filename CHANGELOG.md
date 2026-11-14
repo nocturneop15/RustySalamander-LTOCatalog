@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.6-alpha (2026-11-14)
+
+- **Updates through RustySalamander:** Help → Check for updates (and the check at start) now offers newer LTO Catalog releases and installs the plugin folder. Earlier versions didn't say where their releases are, so they were never offered; this one has to be installed by hand once. `ltocat.exe` isn't part of a plugin update: take it from the release's full zip.
+
 ## 0.3.5-alpha (2026-11-14)
 
 - **A drive Windows sees twice is one drive:** on an IBM TS3100, one LTO-5 SAS drive appeared as both `\\.\Tape0` and `\\.\Tape1` (the same serial number), while the library's other drive (Fibre Channel) wasn't connected to the computer. The plugin took them for the library's two drives, so a job for the tape in library drive 1 (a format, a copy) was done to the tape in drive 2. A device with the serial number of one already found is now left out, and a library drive that the changer identifies but no device matches is no longer matched by order: it isn't used, and Library status and `ltocat selftest` say so. `ltocat selftest` lists the library's drives by element, with what the changer says each one is and the tape device it is used through, or that it isn't used.

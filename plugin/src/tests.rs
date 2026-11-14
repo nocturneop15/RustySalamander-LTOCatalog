@@ -476,3 +476,16 @@ fn format_several_tapes_at_once() {
     drop(p);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The program's update check finds the plugin's releases: tags
+/// `ltocatalog-v<version>` in this repository, the changelog at its root
+/// (package.ps1 and the release make `ltocatalog-<version>-api<n>.zip`).
+#[test]
+fn updates_are_published_where_the_releases_are() {
+    let u = <LtoCatalog as Plugin>::UPDATES;
+    assert_eq!(u.repo, "nocturneop15/RustySalamander-LTOCatalog");
+    assert_eq!(u.tag, format!("{}-v", <LtoCatalog as Plugin>::ID));
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let log = fs::read_to_string(root.join(u.changelog)).unwrap();
+    assert!(log.contains(&format!("\n## {} ", <LtoCatalog as Plugin>::VERSION)), "the changelog has this version");
+}

@@ -21,4 +21,7 @@ Copy-Item target\release\ltocat.exe $dist
 Copy-Item README.md "$dist\README-ltocatalog.md"
 Copy-Item CHANGELOG.md "$dist\CHANGELOG-ltocatalog.md"
 Compress-Archive -Path "$dist\plugins", "$dist\ltocat.exe", "$dist\README-ltocatalog.md", "$dist\CHANGELOG-ltocatalog.md" -DestinationPath "$dist\ltocatalog-$version.zip"
+# the plugin folder alone, for RustySalamander's update check (Plugin::UPDATES): <id>-<version>-api<interface>.zip
+$api = (Select-String -Path ..\RustySalamander\crates\sal-plugin-api\src\abi.rs -Pattern 'pub const VERSION: u32 = (\d+)').Matches[0].Groups[1].Value
+Compress-Archive -Path $plugin -DestinationPath "$dist\ltocatalog-$version-api$api.zip"
 Get-ChildItem -Recurse $dist | Where-Object { -not $_.PSIsContainer } | ForEach-Object { "{0,10:N0}  {1}" -f $_.Length, $_.FullName.Substring((Resolve-Path $dist).Path.Length + 1) }
