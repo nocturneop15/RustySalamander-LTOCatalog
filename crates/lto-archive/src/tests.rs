@@ -511,3 +511,31 @@ fn a_drive_seen_twice_is_one_drive() {
     a.import("LTO001L5", &NoUi).unwrap();
     assert_eq!(a.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap().name, "one");
 }
+
+/// Retry pressed before the library has taken in what was put into its
+/// mail slot (the door just closed, the robot can't reach it yet): the job
+/// waits for the library and then loads the tape, without asking again.
+#[test]
+fn retry_before_the_library_has_read_its_mail_slot() {
+    let (sim, a) = archive();
+    a.format("LTO001L5", "one", &NoUi).unwrap();
+    a.site().unwrap().eject("LTO001L5").unwrap();
+    let cart = sim.take().expect("in the mail slot");
+    let s2 = sim.clone();
+    let ui = Answers::new(&[Answer::Retry]).then(move || {
+        {
+            let mut st = s2.state.lock().unwrap();
+            st.mail[0] = Some(cart);
+            st.mail_accessible = false;
+        }
+        let s3 = s2.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            s3.state.lock().unwrap().mail_accessible = true;
+        });
+    });
+    let started = std::time::Instant::now();
+    assert!(a.label("LTO001L5", &ui).unwrap().is_some(), "the tape was loaded and read");
+    assert_eq!(*ui.asked.lock().unwrap(), ["LTO001L5"], "asked once, not again after Retry");
+    assert!(started.elapsed() >= std::time::Duration::from_secs(4), "it waited for the library");
+}

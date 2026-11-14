@@ -235,6 +235,18 @@ impl Library {
         Ok(c.inv.clone())
     }
 
+    /// Whether the library is still taking in what was put into its mail
+    /// slot (as last read): a mail slot holds a tape whose barcode it hasn't
+    /// read yet, or one the robot can't reach yet (the door just closed).
+    pub fn settling(&self) -> bool {
+        self.changer.lock().unwrap().inv.mail_slots.iter().any(|e| e.full && (e.barcode.is_none() || !e.accessible))
+    }
+
+    /// Whether the tape is in the library where the robot can reach it.
+    pub fn reachable(&self, barcode: &str) -> bool {
+        self.changer.lock().unwrap().inv.find(barcode).is_some_and(|e| e.accessible)
+    }
+
     /// Whether the tape is in the library (slot, drive or mail slot).
     pub fn has(&self, barcode: &str) -> bool {
         self.changer.lock().unwrap().inv.find(barcode).is_some()

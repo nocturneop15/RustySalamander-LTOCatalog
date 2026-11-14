@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.7-alpha (2026-11-14)
+
+- **Retry pressed before the library has read its mail slot:** after its door is closed, a library needs a while before it reports the tape put there (an IBM TS3100 about a minute). Retry pressed meanwhile now waits for it, up to 3 minutes, with "waiting for the library to read its mail slot" as the step, and then loads the tape; the same before asking for a tape that was just put in. Before, the job went on with what the library said halfway through.
+- **Cancel of a copy works while a tape is being fetched:** a copy from or to a tape asks the copy's progress now and then while no data flows yet (the tape being found, loaded, or the library reading its mail slot), so Cancel in its window stops it. Before, Cancel took effect only once data flowed.
+- **The Insert tape question is a dialog like the program's:** as tall as its text and buttons (no empty space under them), the margins and gaps of RustySalamander's dialogs, not resizable, and without minimize and maximize buttons.
+
 ## 0.3.6-alpha (2026-11-14)
 
 - **Updates through RustySalamander:** Help → Check for updates (and the check at start) now offers newer LTO Catalog releases and installs the plugin folder. Earlier versions didn't say where their releases are, so they were never offered; this one has to be installed by hand once. `ltocat.exe` isn't part of a plugin update: take it from the release's full zip.

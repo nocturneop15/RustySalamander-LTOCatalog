@@ -489,3 +489,36 @@ fn updates_are_published_where_the_releases_are() {
     let log = fs::read_to_string(root.join(u.changelog)).unwrap();
     assert!(log.contains(&format!("\n## {} ", <LtoCatalog as Plugin>::VERSION)), "the changelog has this version");
 }
+
+/// The program's Cancel of a copy stops it while the plugin still waits
+/// for a tape (here: for the library to take in its mail slot, which it
+/// never does): the copy's progress is asked meanwhile.
+#[test]
+fn a_copy_waiting_for_a_tape_can_be_cancelled() {
+    let sim_slot: Arc<Mutex<Option<SimLibrary>>> = Arc::new(Mutex::new(None));
+    let s2 = sim_slot.clone();
+    let (sim, p, dir) = plugin(Some(Box::new(move |_: &str, _, _: &Places| {
+        // put in, its door "just closed": the robot can't reach it
+        let sim = s2.lock().unwrap().clone().unwrap();
+        let cart = lto_sim::Cart::new("LTO003L5", Config::default().capacity);
+        let mut st = sim.state.lock().unwrap();
+        st.mail[0] = Some(cart);
+        st.mail_accessible = false;
+        Answer::Retry
+    })));
+    *sim_slot.lock().unwrap() = Some(sim.clone());
+    let r = root();
+    let mut v = Values::new();
+    v.insert("barcode".into(), "LTO003L5".into());
+    v.insert("confirm".into(), "LTO003L5".into());
+    p.run("format_do", &v).unwrap();
+    p.mkdir(&r, "LTO003L5\\d", &mut |_, _| true).unwrap();
+    p.run("unload", &Values::new()).unwrap();
+    sim.remove("LTO003L5").unwrap();
+    // the person presses Cancel in the copy's window two seconds in
+    let start = Instant::now();
+    let e = p.extract(&r, &["LTO003L5\\d".into()], &dir.join("out"), &mut |_, _| start.elapsed() < Duration::from_secs(2)).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::Interrupted, "{e}");
+    assert!(start.elapsed() < Duration::from_secs(10), "stopped soon: {:?}", start.elapsed());
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -10,12 +10,14 @@
 
 mod ask;
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use lto_archive::{Answer, Archive, ReadSink, Step, Ui};
 use lto_catalog::{Catalog, Tape};
@@ -86,6 +88,7 @@ fn step_text(step: Step) -> String {
     match step {
         Step::Devices => tr("looking for tape libraries and drives…"),
         Step::Loading(b) => trf("{barcode}: getting it into a drive…", &[("barcode", &b)]),
+        Step::Settling(b) => trf("{barcode}: waiting for the library to read its mail slot…", &[("barcode", &b)]),
         Step::Mounting(b, d) => trf("{barcode} is in {drive}: reading its LTFS volume…", &[("barcode", &b), ("drive", &d)]),
         Step::Formatting(b) => trf("{barcode}: formatting (a few minutes; it can't be stopped halfway)…", &[("barcode", &b)]),
         Step::Reading(b, p) => trf("{barcode}: reading {path}", &[("barcode", &b), ("path", &to_inner(p))]),
@@ -156,7 +159,7 @@ impl LtoCatalog {
             data,
             settings: Mutex::new(settings),
             archive: Mutex::new(Arc::new(archive)),
-            asks: sal_window::Windows::new(sal_ui::icon::program, [480.0, 210.0]),
+            asks: sal_window::Windows::new(sal_ui::icon::program, [ask::WIDTH, 160.0]),
             look: Mutex::new(Values::new()),
             asker,
             cmd: CommandState::default(),
@@ -245,7 +248,7 @@ impl LtoCatalog {
     /// The job interface of the running command (Cancel in the program
     /// stops it).
     fn command_ui(&self) -> JobUi<'_> {
-        JobUi { plugin: self, cancelled: &self.cmd.cancel }
+        JobUi::new(self, &self.cmd.cancel)
     }
 
     fn archive(&self) -> Arc<Archive> {
@@ -323,11 +326,42 @@ fn ask_text(barcode: &str, places: &Places) -> (String, Vec<String>) {
 struct JobUi<'a> {
     plugin: &'a LtoCatalog,
     cancelled: &'a AtomicBool,
+    /// An operation of the program's (a copy): its progress, asked now and
+    /// then while no data flows (a tape being fetched, a question
+    /// answered), so that its Cancel stops the job then too. False: cancel.
+    poll: Option<&'a dyn Fn() -> bool>,
+    polled: Cell<Instant>,
+}
+
+/// How often the program's progress is asked while no data flows.
+const POLL_EVERY: Duration = Duration::from_millis(250);
+
+impl<'a> JobUi<'a> {
+    fn new(plugin: &'a LtoCatalog, cancelled: &'a AtomicBool) -> JobUi<'a> {
+        JobUi { plugin, cancelled, poll: None, polled: Cell::new(Instant::now()) }
+    }
+
+    /// Cancelled when `poll` (the operation's progress) says so.
+    fn polling(plugin: &'a LtoCatalog, cancelled: &'a AtomicBool, poll: &'a dyn Fn() -> bool) -> JobUi<'a> {
+        JobUi { poll: Some(poll), ..JobUi::new(plugin, cancelled) }
+    }
 }
 
 impl Ui for JobUi<'_> {
     fn cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        if self.cancelled.load(Ordering::Relaxed) {
+            return true;
+        }
+        if let Some(poll) = self.poll {
+            if self.polled.get().elapsed() >= POLL_EVERY {
+                self.polled.set(Instant::now());
+                if !poll() {
+                    self.cancelled.store(true, Ordering::Relaxed);
+                    return true;
+                }
+            }
+        }
+        false
     }
     fn step(&self, step: Step) {
         self.plugin.say(step_text(step));
@@ -398,16 +432,17 @@ fn refused(msg: &str) -> io::Error {
 }
 
 /// Writes files read from tapes into a folder on disk.
-struct ToDisk<'a, 'p> {
+struct ToDisk<'a> {
     out: &'a Path,
     file: Option<(fs::File, Time)>,
-    done: u64,
+    done: &'a Cell<u64>,
     total: u64,
-    progress: &'a mut Progress<'p>,
+    /// The operation's progress (done, total); false: cancel.
+    progress: &'a dyn Fn(u64, u64) -> bool,
     cancelled: &'a AtomicBool,
 }
 
-impl ToDisk<'_, '_> {
+impl ToDisk<'_> {
     fn target(&self, path: &str) -> io::Result<PathBuf> {
         let inner = to_inner(path);
         if !safe_relative(&inner) {
@@ -417,7 +452,7 @@ impl ToDisk<'_, '_> {
     }
 
     fn report(&mut self) -> bool {
-        let go = (self.progress)(self.done, self.total);
+        let go = (self.progress)(self.done.get(), self.total);
         if !go {
             self.cancelled.store(true, Ordering::Relaxed);
         }
@@ -425,7 +460,7 @@ impl ToDisk<'_, '_> {
     }
 }
 
-impl ReadSink for ToDisk<'_, '_> {
+impl ReadSink for ToDisk<'_> {
     fn dir(&mut self, path: &str, _: Time) -> io::Result<()> {
         fs::create_dir_all(self.target(path)?)
     }
@@ -439,7 +474,7 @@ impl ReadSink for ToDisk<'_, '_> {
     }
     fn write(&mut self, data: &[u8]) -> io::Result<bool> {
         self.file.as_mut().expect("begun").0.write_all(data)?;
-        self.done += data.len() as u64;
+        self.done.set(self.done.get() + data.len() as u64);
         Ok(self.report())
     }
     fn end(&mut self) -> io::Result<()> {
@@ -952,9 +987,14 @@ impl FolderPlugin for LtoCatalog {
             }
         }
         let cancelled = AtomicBool::new(false);
-        let mut sink = ToDisk { out, file: None, done: 0, total, progress, cancelled: &cancelled };
-        let r = a.read(&paths, &mut sink, &JobUi { plugin: self, cancelled: &cancelled });
-        (sink.progress)(sink.done.max(total), total.max(sink.done));
+        let done = Cell::new(0);
+        let progress = RefCell::new(progress);
+        let report = |d, t| (progress.borrow_mut())(d, t);
+        // while a tape is fetched, the copy's Cancel is asked through its progress
+        let poll = || report(done.get(), total);
+        let mut sink = ToDisk { out, file: None, done: &done, total, progress: &report, cancelled: &cancelled };
+        let r = a.read(&paths, &mut sink, &JobUi::polling(self, &cancelled, &poll));
+        report(done.get().max(total), total.max(done.get()));
         r.map_err(io_err)
     }
 
@@ -965,7 +1005,7 @@ impl FolderPlugin for LtoCatalog {
         let paths: Vec<String> = items.iter().map(|i| to_ltfs(i)).collect();
         let cancelled = AtomicBool::new(false);
         let mut s = ToSink { sink, cancelled: &cancelled };
-        self.archive().read(&paths, &mut s, &JobUi { plugin: self, cancelled: &cancelled }).map_err(io_err)
+        self.archive().read(&paths, &mut s, &JobUi::new(self, &cancelled)).map_err(io_err)
     }
 
     fn add(&self, file: &Path, items: &[(PathBuf, String)], progress: &mut Progress) -> io::Result<()> {
@@ -982,10 +1022,18 @@ impl FolderPlugin for LtoCatalog {
         }
         let a = self.archive();
         let cancelled = AtomicBool::new(false);
-        let ui = JobUi { plugin: self, cancelled: &cancelled };
+        let at = Cell::new((0, 0));
+        let progress = RefCell::new(progress);
+        // while a tape is fetched, the copy's Cancel is asked through its progress
+        let poll = || {
+            let (d, t) = at.get();
+            (progress.borrow_mut())(d, t)
+        };
+        let ui = JobUi::polling(self, &cancelled, &poll);
         for (b, list) in by_tape {
             a.write(&b, &list, &ui, &mut |d, t| {
-                let go = progress(d, t);
+                at.set((d, t));
+                let go = (progress.borrow_mut())(d, t);
                 if !go {
                     cancelled.store(true, Ordering::Relaxed);
                 }
@@ -1011,7 +1059,7 @@ impl FolderPlugin for LtoCatalog {
         let a = self.archive();
         let cancelled = AtomicBool::new(false);
         for (b, list) in by_tape {
-            a.delete(&b, &list, &JobUi { plugin: self, cancelled: &cancelled }).map_err(io_err)?;
+            a.delete(&b, &list, &JobUi::new(self, &cancelled)).map_err(io_err)?;
         }
         Ok(())
     }
@@ -1029,7 +1077,7 @@ impl FolderPlugin for LtoCatalog {
             return Err(refused(n_("Items can't be moved from one tape to another by renaming; copy them instead.")));
         }
         let cancelled = AtomicBool::new(false);
-        self.archive().rename(&b1, &p1, &p2, &JobUi { plugin: self, cancelled: &cancelled }).map_err(io_err)
+        self.archive().rename(&b1, &p1, &p2, &JobUi::new(self, &cancelled)).map_err(io_err)
     }
 
     fn mkdir(&self, file: &Path, inner: &str, _progress: &mut Progress) -> io::Result<()> {
@@ -1041,7 +1089,7 @@ impl FolderPlugin for LtoCatalog {
             return Err(refused(n_("Tapes can't be made as folders. Put a tape into the library and use Plugins → Format a tape….")));
         }
         let cancelled = AtomicBool::new(false);
-        self.archive().mkdir(&b, &p, &JobUi { plugin: self, cancelled: &cancelled }).map_err(io_err)
+        self.archive().mkdir(&b, &p, &JobUi::new(self, &cancelled)).map_err(io_err)
     }
 
     /// The empty root is the command running now: what it does, for the

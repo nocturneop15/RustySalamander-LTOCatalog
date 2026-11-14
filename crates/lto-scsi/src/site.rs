@@ -281,6 +281,16 @@ impl Site {
         Ok(())
     }
 
+    /// Whether a library is still taking in its mail slot ([`Library::settling`]).
+    pub fn settling(&self) -> bool {
+        self.libraries.iter().any(|l| l.settling())
+    }
+
+    /// Whether a library has the tape where its robot can reach it, as last read.
+    pub fn reachable(&self, barcode: &str) -> bool {
+        self.libraries.iter().any(|l| l.reachable(barcode))
+    }
+
     /// Where every tape is, for people: (barcode, place). With several
     /// libraries, the place says which.
     pub fn locations(&self) -> Vec<(String, String)> {

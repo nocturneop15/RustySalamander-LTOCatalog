@@ -216,6 +216,7 @@ impl Ui for Console {
         let text = match step {
             S::Devices => "looking for tape libraries and drives".to_owned(),
             S::Loading(b) => format!("{b}: getting it into a drive"),
+            S::Settling(b) => format!("{b}: waiting for the library to read its mail slot"),
             S::Mounting(b, d) => format!("{b} is in {d}: reading its LTFS volume"),
             S::Formatting(b) => format!("{b}: formatting (a few minutes)"),
             S::Reading(b, p) => format!("{b}: reading {p}"),

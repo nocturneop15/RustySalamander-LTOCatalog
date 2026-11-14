@@ -22,6 +22,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use lto_catalog::{Catalog, Tape};
 use lto_scsi::library::{Lease, LoadError};
@@ -48,6 +49,8 @@ pub enum Step<'a> {
     Devices,
     /// Getting the tape into a drive (a robot moving it, or waiting for one).
     Loading(&'a str),
+    /// Waiting for a library to read what was put into its mail slot.
+    Settling(&'a str),
     /// The tape is in this drive; its LTFS volume is being read.
     Mounting(&'a str, &'a str),
     /// Formatting the tape (minutes; can't be stopped halfway).
@@ -61,7 +64,7 @@ pub enum Step<'a> {
 }
 
 /// How a job talks to the person behind it.
-pub trait Ui: Sync {
+pub trait Ui {
     /// What the job is doing now; the default says nothing.
     fn step(&self, step: Step) {
         let _ = step;
@@ -195,6 +198,12 @@ pub struct Archive {
     pub catalog: Mutex<Catalog>,
     creator: String,
 }
+
+/// How long to wait for a library to read what was put into its mail slot
+/// (an IBM TS3100 takes about a minute after its door is closed).
+pub const SETTLE_LIMIT: Duration = Duration::from_secs(180);
+/// Between two looks at a library that is still reading its mail slot.
+const SETTLE_PAUSE: Duration = Duration::from_secs(3);
 
 /// Split `BARCODE\path` into the barcode and the path inside the tape.
 pub fn split_tape(path: &str) -> (String, String) {
@@ -373,6 +382,8 @@ impl Archive {
     fn acquire<'s>(&self, site: &'s Site, barcode: &str, ui: &dyn Ui, skip: bool, blank: bool) -> Result<Option<Lease<'s>>> {
         let blank_as = blank.then_some(barcode);
         let identify = |d: &mut TapeDrive| self.identify(d, blank_as);
+        // a library still reading its mail slot was waited for
+        let mut waited = false;
         loop {
             ui.step(Step::Loading(barcode));
             match site.acquire(barcode, &identify, &|| ui.cancelled()) {
@@ -398,19 +409,60 @@ impl Archive {
                 Err(LoadError::NotInLibrary(_)) => {
                     // everything was looked at again: record where things are
                     let _ = self.record_locations(site);
+                    // a tape just put into a mail slot, not read yet: wait for it
+                    // before asking
+                    if !waited && site.settling() {
+                        waited = true;
+                        self.settle(site, barcode, &identify, ui)?;
+                        continue;
+                    }
                     let tape = self.catalog.lock().unwrap().tape(barcode)?;
                     // no empty standalone drive: eject the idle one's tape
                     let ejected = site.make_room();
                     let places = Places { ejected, ..site.places() };
                     match ui.missing_tape(barcode, tape.as_ref(), skip, &places) {
                         Answer::Retry => {
-                            site.refresh(false, &identify)?;
+                            // pressed before the library read its mail slot: wait for that
+                            waited = true;
+                            self.settle(site, barcode, &identify, ui)?;
                             self.record_locations(site)?;
                         }
                         Answer::Skip if skip => return Ok(None),
                         Answer::Skip | Answer::Cancel => return Err(if ui.cancelled() { Error::Cancelled } else { Error::NotInLibrary(barcode.to_owned()) }),
                     }
                 }
+            }
+        }
+    }
+
+    /// Read the libraries again; while one is still taking in its mail slot
+    /// (it hasn't read the barcode of a tape put there, or answers "not
+    /// ready" meanwhile), and `barcode` isn't where the robot can reach it, read them again every
+    /// few seconds, for at most [`SETTLE_LIMIT`]. Cancel stops the wait.
+    fn settle(&self, site: &Site, barcode: &str, identify: lto_scsi::site::Identify, ui: &dyn Ui) -> Result<()> {
+        let start = Instant::now();
+        loop {
+            let busy = match site.refresh(false, identify) {
+                Ok(()) => None,
+                Err(e) if e.sense().is_some_and(|s| s.key == lto_scsi::sense::key::NOT_READY) => Some(e),
+                Err(e) => return Err(e.into()),
+            };
+            if busy.is_none() && (site.reachable(barcode) || !site.settling()) {
+                return Ok(());
+            }
+            if start.elapsed() >= SETTLE_LIMIT {
+                return match busy {
+                    Some(e) => Err(e.into()),
+                    None => Ok(()),
+                };
+            }
+            ui.step(Step::Settling(barcode));
+            let pause = Instant::now();
+            while pause.elapsed() < SETTLE_PAUSE {
+                if ui.cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
     }
