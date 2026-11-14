@@ -30,6 +30,9 @@ use lto_scsi::site::{Devices, Places, Site};
 use lto_scsi::tape::{attr, TapeDrive};
 use ltfs::{File, Index, Node, Time, Times, Volume};
 
+mod backup;
+pub use backup::{archive_set, backup_set_name, clear_archive, set_archive, BackupOptions, BackupReport, NewTapeProblem, TapeDone};
+
 /// What to do about a tape that no library or drive has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
@@ -61,6 +64,10 @@ pub enum Step<'a> {
     Writing(&'a str, &'a str),
     /// Writing the tape's index after a change.
     WritingIndex(&'a str),
+    /// Backing up a folder onto this tape: (done, of) files and bytes.
+    Backup { tape: &'a str, files: (u64, u64), bytes: (u64, u64) },
+    /// Waiting for a new tape for a backup to show up in a mail slot.
+    NewTape,
 }
 
 /// How a job talks to the person behind it.
@@ -78,6 +85,21 @@ pub trait Ui {
     /// they hold). `skip` says whether skipping it is possible (a read of
     /// several tapes).
     fn missing_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool, places: &Places) -> Answer;
+    /// A backup's tapes are full and `left` bytes are still to go: ask for
+    /// a new tape (Retry: it was put in; anything else stops the backup).
+    /// `problem` says why the last one put in wasn't taken. The default
+    /// stops.
+    fn new_tape(&self, left: u64, places: &Places, problem: Option<NewTapeProblem>) -> Answer {
+        let _ = (left, places, problem);
+        Answer::Cancel
+    }
+    /// The new tape put in for a backup isn't an LTFS volume (blank, or
+    /// another format): Retry formats it and uses it, Skip asks for another
+    /// tape, Cancel stops the backup. The default stops.
+    fn confirm_format(&self, barcode: &str) -> Answer {
+        let _ = barcode;
+        Answer::Cancel
+    }
 }
 
 /// A Ui that asks nothing: missing tapes stop the job.

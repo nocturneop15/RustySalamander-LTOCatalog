@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0-alpha (2026-11-14)
+
+- **Back up a folder:** *Plugins → Back up a folder…* copies a folder onto tapes, everything or only the files with the Archive attribute set, into `Backup <date> <time>\<folder name>` on each tape used. The attribute is cleared after a file is on tape (a tick box, on by default: incremental; off: differential).
+  - The form lists the LTFS tapes in the libraries and drives with their free space and notes; the ticked ones are filled in barcode order.
+  - A file goes onto a tape whole: one that doesn't fit on the rest of a tape goes onto the next. When the tapes are full, a new one is asked for in the mail slot: an empty LTFS tape is used, a tape with files refused, and a blank one formatted only after you confirm.
+  - A file larger than a whole tape, or one that can't be read, is left out and listed in the report. Cancel keeps what was written, with its index; the index is also written every 100 GB.
+  - `ltocat backup <folder> [<barcode>...] [--archive-only] [--keep-archive]` does the same from the command line.
+- **Notes in the tape lists:** *Format tapes…* (and the backup form) show each tape's note and free space.
+
 ## 0.3.9-alpha (2026-11-14)
 
 - The command *Put the tapes in the drives back* is now called *Unload tapes from drives*.

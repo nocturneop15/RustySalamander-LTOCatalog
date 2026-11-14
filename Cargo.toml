@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/lto-scsi", "crates/lto-sim", "crates/ltfs", "crates/lto-catalog", "crates/lto-archive", "plugin", "tools/ltocat"]
 
 [workspace.package]
-version = "0.3.9-alpha"
+version = "0.4.0-alpha"
 edition = "2021"
 rust-version = "1.88"
 license = "GPL-2.0-or-later"

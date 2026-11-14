@@ -595,3 +595,226 @@ fn after_retry_the_tape_is_looked_for_a_while() {
     assert_eq!(*ui.asked.lock().unwrap(), ["LTO001L5"], "asked once");
     assert!(started.elapsed() < RETRY_WAIT, "taken as soon as it showed up");
 }
+
+// ------------------------------------------------------------- backups
+
+/// A library whose tapes hold about 10 MB of data each, with LTO001L5 and LTO002L5
+/// formatted.
+fn small_library() -> (SimLibrary, Archive) {
+    let sim = SimLibrary::new(&Config { capacity: 24 * 1024 * 1024, ..Config::default() });
+    let a = Archive::new(Box::new(sim.clone()), Catalog::in_memory().unwrap(), "test");
+    a.format("LTO001L5", "one", &NoUi).unwrap();
+    a.format("LTO002L5", "two", &NoUi).unwrap();
+    (sim, a)
+}
+
+/// A folder of `n` files of `size` bytes in `sub`, each different, and an
+/// empty folder.
+fn backup_source(name: &str, n: usize, size: usize) -> PathBuf {
+    let src = std::env::temp_dir().join(format!("lto-backup-{}-{name}", std::process::id()));
+    let _ = fs::remove_dir_all(&src);
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::create_dir_all(src.join("empty")).unwrap();
+    for i in 0..n {
+        let data: Vec<u8> = (0..size).map(|j| (j * 7 + i * 13) as u8).collect();
+        fs::write(src.join("sub").join(format!("f{i:02}.bin")), data).unwrap();
+    }
+    src
+}
+
+/// Every file of a backup set on the tapes: (path under the set, tape).
+fn backed_up(a: &Archive, tapes: &[&str], set: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for t in tapes {
+        for (p, _) in a.catalog.lock().unwrap().files_under(t, set).unwrap() {
+            out.push((p[set.len() + 1..].to_owned(), t.to_string()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Answers a backup's questions: new tapes are put into the mail slot from
+/// `carts` (a refused one taken out first), a blank one is formatted or not
+/// as `format` says; Cancel once `cancel_after` files are done.
+struct BackupUi {
+    sim: SimLibrary,
+    carts: Mutex<Vec<lto_sim::Cart>>,
+    problems: Mutex<Vec<String>>,
+    format: Answer,
+    formatted: Mutex<Vec<String>>,
+    cancel_after: Option<u64>,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl BackupUi {
+    fn new(sim: &SimLibrary, carts: Vec<lto_sim::Cart>) -> BackupUi {
+        BackupUi {
+            sim: sim.clone(),
+            carts: Mutex::new(carts.into_iter().rev().collect()),
+            problems: Mutex::new(Vec::new()),
+            format: Answer::Retry,
+            formatted: Mutex::new(Vec::new()),
+            cancel_after: None,
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl Ui for BackupUi {
+    fn step(&self, step: Step) {
+        if let (Step::Backup { files, .. }, Some(n)) = (step, self.cancel_after) {
+            if files.0 >= n {
+                self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool, _: &Places) -> Answer {
+        Answer::Cancel
+    }
+    fn new_tape(&self, _: u64, _: &Places, problem: Option<NewTapeProblem>) -> Answer {
+        self.problems.lock().unwrap().push(format!("{problem:?}"));
+        // a tape refused: taken out of the mail slot again
+        if let Some(NewTapeProblem::HasData(b)) = problem {
+            self.sim.remove(b).unwrap();
+        }
+        let mut carts = self.carts.lock().unwrap();
+        match carts.pop() {
+            Some(c) => {
+                // the mail slot still holds a tape: Retry with that one
+                if let Err(c) = self.sim.insert(c) {
+                    carts.push(c);
+                }
+                Answer::Retry
+            }
+            None => Answer::Cancel,
+        }
+    }
+    fn confirm_format(&self, barcode: &str) -> Answer {
+        self.formatted.lock().unwrap().push(barcode.to_owned());
+        self.format
+    }
+}
+
+/// 12 files of 2 MB onto tapes of about 10 MB of data: the two ticked tapes, then new
+/// ones asked for, formatted after the question. Every file is whole on
+/// exactly one tape (one cut by the end of a tape goes onto the next),
+/// under the same set folder, and reads back; the Archive attributes are
+/// cleared.
+#[test]
+fn a_backup_spans_tapes_and_asks_for_new_ones() {
+    let (sim, a) = small_library();
+    let src = backup_source("span", 12, 2 * 1024 * 1024);
+    let cap = 24 * 1024 * 1024;
+    let ui = BackupUi::new(&sim, vec![lto_sim::Cart::new("NEW001L5", cap), lto_sim::Cart::new("NEW002L5", cap)]);
+    let set = "Backup T\\span";
+    let r = a.backup(&src, set, &["LTO002L5".into(), "lto001l5".into()], BackupOptions { archive_only: false, clear_archive: true }, &ui).unwrap();
+    assert!(!r.cancelled && r.too_big.is_empty() && r.unreadable.is_empty(), "{r:?}");
+    assert_eq!(r.written(), (12, 12 * 2 * 1024 * 1024));
+    let order: Vec<&str> = r.tapes.iter().map(|t| t.barcode.as_str()).collect();
+    assert_eq!(&order[..2], ["LTO001L5", "LTO002L5"], "ticked tapes in barcode order first");
+    assert!(order.len() >= 3, "{order:?}");
+    assert_eq!(*ui.formatted.lock().unwrap(), ["NEW001L5"]);
+    let got = backed_up(&a, &order, set);
+    let names: Vec<&str> = got.iter().map(|(p, _)| p.as_str()).collect();
+    let want: Vec<String> = (0..12).map(|i| format!("sub\\f{i:02}.bin")).collect();
+    assert_eq!(names, want, "each file once");
+    // the empty folder is on the first tape
+    assert!(a.catalog.lock().unwrap().entry("LTO001L5", &format!("{set}\\empty")).unwrap().is_some());
+    // one from the last tape reads back whole
+    let (last_name, last_tape) = got.iter().find(|(_, t)| t == order.last().unwrap()).unwrap().clone();
+    let mut g = Got::default();
+    a.read(&[format!("{last_tape}\\{set}\\{last_name}")], &mut g, &NoUi).unwrap();
+    assert_eq!(g.files[0].1, fs::read(src.join(&last_name)).unwrap());
+    for i in 0..12 {
+        assert!(!archive_set(&src.join(format!("sub\\f{i:02}.bin"))).unwrap(), "cleared");
+    }
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// Archive-only takes the files with the attribute set; clearing it is a
+/// choice; a run with nothing changed writes nothing.
+#[test]
+fn an_archive_only_backup_takes_what_changed() {
+    let (_sim, a) = small_library();
+    let src = backup_source("arch", 3, 1000);
+    for i in 0..3 {
+        clear_archive(&src.join(format!("sub\\f{i:02}.bin"))).unwrap();
+    }
+    let b = src.join("sub\\f01.bin");
+    set_archive(&b).unwrap();
+    let only = |clear| BackupOptions { archive_only: true, clear_archive: clear };
+    // differential: the attribute stays
+    let r = a.backup(&src, "Backup 1\\arch", &["LTO001L5".into()], only(false), &NoUi).unwrap();
+    assert_eq!(r.written().0, 1);
+    assert_eq!(backed_up(&a, &["LTO001L5"], "Backup 1\\arch"), [("sub\\f01.bin".to_string(), "LTO001L5".to_string())]);
+    assert!(archive_set(&b).unwrap());
+    // incremental: cleared
+    let r = a.backup(&src, "Backup 2\\arch", &["LTO001L5".into()], only(true), &NoUi).unwrap();
+    assert_eq!(r.written().0, 1);
+    assert!(!archive_set(&b).unwrap());
+    // nothing changed: nothing written, no empty set folder
+    let r = a.backup(&src, "Backup 3\\arch", &["LTO001L5".into()], only(true), &NoUi).unwrap();
+    assert_eq!((r.total_files, r.tapes.len()), (0, 0));
+    assert!(a.catalog.lock().unwrap().entry("LTO001L5", "Backup 3").unwrap().is_none());
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// A file larger than a whole tape is left out and reported, its
+/// attribute left set; the rest is backed up.
+#[test]
+fn a_file_larger_than_a_tape_is_left_out() {
+    let (_sim, a) = small_library();
+    let src = backup_source("big", 1, 1000);
+    let big = src.join("big.bin");
+    fs::write(&big, vec![1u8; 30 * 1024 * 1024]).unwrap();
+    let r = a.backup(&src, "Backup B\\big", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: true }, &NoUi).unwrap();
+    assert_eq!(r.too_big, [big.clone()]);
+    assert_eq!(r.written().0, 1);
+    assert!(archive_set(&big).unwrap(), "left set");
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// A new tape that holds files is refused (and the question says so); a
+/// blank one is formatted only after the question.
+#[test]
+fn a_new_tape_with_data_is_refused() {
+    let (sim, a) = small_library();
+    // LTO003L5 holds a file and lies in the mail slot
+    a.format("LTO003L5", "three", &NoUi).unwrap();
+    let t = std::env::temp_dir().join(format!("lto-backup-{}-data.txt", std::process::id()));
+    fs::write(&t, b"keep me").unwrap();
+    a.write("LTO003L5", &[(t.clone(), "keep.txt".into())], &NoUi, &mut |_, _| true).unwrap();
+    a.site().unwrap().eject("LTO003L5", &|| false).unwrap();
+    let src = backup_source("refuse", 6, 2 * 1024 * 1024);
+    let ui = BackupUi::new(&sim, vec![lto_sim::Cart::new("NEW009L5", 24 * 1024 * 1024)]);
+    // only LTO001L5 ticked: full after four files; the mail slot offers LTO003L5 first
+    let r = a.backup(&src, "Backup R\\refuse", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: false }, &ui).unwrap();
+    assert_eq!(r.written().0, 6, "{r:?}");
+    let problems = ui.problems.lock().unwrap().clone();
+    assert!(problems.iter().any(|p| p.contains("HasData(\"LTO003L5\")")), "{problems:?}");
+    assert_eq!(*ui.formatted.lock().unwrap(), ["NEW009L5"]);
+    assert!(!r.tapes.iter().any(|t| t.barcode == "LTO003L5"), "the tape with data wasn't written");
+    assert_eq!(a.catalog.lock().unwrap().tape("LTO003L5").unwrap().unwrap().files, 1);
+    let _ = (fs::remove_dir_all(&src), fs::remove_file(&t));
+}
+
+/// Cancel in the middle: the index of what was written is on the tape, and
+/// only those files have their attribute cleared.
+#[test]
+fn a_cancelled_backup_keeps_what_it_wrote() {
+    let (sim, a) = small_library();
+    let src = backup_source("cancel", 6, 100_000);
+    let mut ui = BackupUi::new(&sim, Vec::new());
+    ui.cancel_after = Some(2);
+    let r = a.backup(&src, "Backup C\\cancel", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: true }, &ui).unwrap();
+    assert!(r.cancelled);
+    assert_eq!(r.written().0, 2);
+    assert_eq!(backed_up(&a, &["LTO001L5"], "Backup C\\cancel").len(), 2);
+    let set: Vec<bool> = (0..6).map(|i| archive_set(&src.join(format!("sub\\f{i:02}.bin"))).unwrap()).collect();
+    assert_eq!(set, [false, false, true, true, true, true]);
+    let _ = fs::remove_dir_all(&src);
+}

@@ -108,6 +108,21 @@ Wherever RustySalamander keeps its settings, so the plugin is as portable as the
 - **Tapes that are refused for writing:** write-protected tapes, locked volumes, and volumes where another program stored files in the index partition. Reading them works.
 - **Names** that Windows can't have (`:` `?` `*`, a trailing dot…) are shown with those characters in the Unicode private-use area, and written back unchanged.
 
+## Backing up a folder
+
+*Plugins → Back up a folder…* copies a folder onto tapes:
+
+- **What:** everything in it, or only the files whose Archive attribute is set (changed since the last backup that cleared it). With *Clear the Archive attribute of the files backed up* ticked (the default), each file's attribute is cleared once it is on a tape, so the next "only Archive" backup takes only what changed since (incremental). Unticked, the attribute stays (differential). A file that changed while it was written keeps its attribute.
+- **Where:** into the folder `Backup <date> <time>\<folder name>` on each tape used, so backups never overwrite each other.
+- **Tapes:** the form lists the LTFS tapes in the libraries and drives, with their free space and notes. The ones ticked are filled in barcode order. A file goes onto a tape whole; one that doesn't fit on the rest of a tape goes onto the next. When the ticked tapes are full, a new tape is asked for in the mail slot:
+  - an empty LTFS tape is used;
+  - a tape with files is refused;
+  - a blank tape, or one in another format, is formatted (named by its barcode) only after you confirm.
+- **Afterwards:** a report lists the files and size on each tape, plus anything left out: files larger than a whole tape, and files that couldn't be read.
+- **Cancel:** what was written stays on the tapes, with its index; the index is also written every 100 GB.
+
+From the command line: `ltocat backup <folder> [<barcode>...] [--archive-only] [--keep-archive]`.
+
 ## Safety
 
 - Only a device that says it is a tape drive gets tape commands, and only a medium changer changer commands; a disk named by mistake in *Library settings…* is left out (*Library status* says so).

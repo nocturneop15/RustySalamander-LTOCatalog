@@ -191,7 +191,7 @@ fn starts_through_the_program() {
     let desc = unsafe { &*rustysalamander_plugin() };
     let p = unsafe { sal_plugin_api::host::start(desc, &HOST, &dir) }.unwrap();
     assert_eq!(p.id(), "ltocatalog");
-    assert_eq!(p.commands().len(), 11);
+    assert_eq!(p.commands().len(), 12);
     p.run("inventory", &Values::new()).unwrap();
     assert_eq!(p.list(&root(), "").unwrap().items.len(), 6);
     assert!(dir.join("cat.sqlite").exists() && dir.join("sim.bin").exists());
@@ -228,7 +228,8 @@ fn language_files_match_the_code() {
             if !before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
                 used.insert(out);
             }
-            rest = &s[1..];
+            // past the first character (which can be wider than a byte: …)
+            rest = &s[s.chars().next().map_or(0, char::len_utf8)..];
         }
     }
     let keys = |text: &str| -> std::collections::BTreeSet<String> {
@@ -324,6 +325,9 @@ fn hostile_input_in_every_form() {
             ("note", v(&[("selected", s)])),
             ("eject", v(&[("selected", s)])),
             ("format", v(&[("selected", s)])),
+            // LTO001L5 isn't formatted here: refused before a real folder named by `s` would be read
+            ("backup_do", v(&[("folder", s), ("what", s), ("clear", s), ("tape:LTO001L5", "1")])),
+            ("backup", v(&[("selected", s), ("other", s)])),
         ] {
             let _ = p.run(cmd, &values);
         }
@@ -520,5 +524,40 @@ fn a_copy_waiting_for_a_tape_can_be_cancelled() {
     let e = p.extract(&r, &["LTO003L5\\d".into()], &dir.join("out"), &mut |_, _| start.elapsed() < Duration::from_secs(2)).unwrap_err();
     assert_eq!(e.kind(), io::ErrorKind::Interrupted, "{e}");
     assert!(start.elapsed() < Duration::from_secs(10), "stopped soon: {:?}", start.elapsed());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Back up a folder: the form offers the other panel's folder and the LTFS
+/// tapes with their notes; the backup lands in a dated folder on the tape
+/// ticked, and the report says so.
+#[test]
+fn a_folder_is_backed_up_through_the_form() {
+    let (_sim, p, dir) = plugin(None);
+    p.run("inventory", &Values::new()).unwrap();
+    p.run("format_do", &vals(&[("tape:LTO001L5", "1"), ("tape:LTO002L5", "1"), ("confirm", "ERASE")])).unwrap();
+    p.run("note_do", &vals(&[("barcode", "LTO002L5"), ("note", "shelf 3")])).unwrap();
+    let src = dir.join("dokumenty");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::write(src.join("a.txt"), b"alpha").unwrap();
+    fs::write(src.join("sub\\b.txt"), b"beta").unwrap();
+    let other = sal_plugin_api::ui::path_value(&src);
+    let Reply::Form(f) = p.run("backup", &vals(&[("other", &other)])).unwrap() else { panic!("no form") };
+    assert_eq!(f.command, "backup_do");
+    assert_eq!(f.fields.iter().find(|f| f.id == "folder").unwrap().value, src.display().to_string(), "the other panel's folder");
+    let tapes: Vec<&str> = f.fields.iter().filter(|f| f.id.starts_with("tape:")).map(|f| f.label.as_str()).collect();
+    assert_eq!(tapes.len(), 2, "only LTFS tapes: {tapes:?}");
+    assert!(tapes.iter().any(|l| l.contains("LTO002L5") && l.contains("Note: shelf 3") && l.contains("free")), "{tapes:?}");
+    // nothing typed: refused
+    assert_eq!(p.run("backup_do", &vals(&[("tape:LTO002L5", "1")])).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    let folder = src.display().to_string();
+    let Reply::Message(m) = p.run("backup_do", &vals(&[("folder", &folder), ("what", "all"), ("clear", "1"), ("tape:LTO002L5", "1")])).unwrap() else { panic!() };
+    assert!(m.contains("2 files") && m.contains("LTO002L5: 2 files"), "{m}");
+    let set = p.archive().catalog.lock().unwrap().files_under("LTO002L5", "").unwrap();
+    let names: Vec<&str> = set.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.iter().all(|n| n.starts_with("Backup ") && n.contains("\\dokumenty\\")), "{names:?}");
+    // archive-only, attributes cleared: nothing left
+    let Reply::Message(m) = p.run("backup_do", &vals(&[("folder", &folder), ("what", "archive"), ("clear", "1"), ("tape:LTO002L5", "1")])).unwrap() else { panic!() };
+    assert!(m.contains("Nothing to back up"), "{m}");
     let _ = fs::remove_dir_all(&dir);
 }

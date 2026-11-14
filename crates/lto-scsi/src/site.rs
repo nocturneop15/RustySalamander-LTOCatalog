@@ -286,6 +286,14 @@ impl Site {
         self.libraries.iter().any(|l| l.settling())
     }
 
+    /// Tapes a person just put in, as last read: in the libraries' mail
+    /// slots (where the robot can reach them), and in the standalone drives.
+    pub fn offered(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.libraries.iter().flat_map(|l| l.in_mail_slots()).collect();
+        out.extend(self.standalone.iter().filter_map(|s| if let Holds::Tape(b) = s.holds() { Some(b) } else { None }));
+        out
+    }
+
     /// Whether a library has the tape where its robot can reach it, as last read.
     pub fn reachable(&self, barcode: &str) -> bool {
         self.libraries.iter().any(|l| l.reachable(barcode))

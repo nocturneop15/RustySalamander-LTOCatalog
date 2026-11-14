@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "ltfs"
-version = "0.3.9-alpha"
+version = "0.4.0-alpha"
 dependencies = [
  "lto-scsi",
  "lto-sim",
@@ -305,17 +305,18 @@ dependencies = [
 
 [[package]]
 name = "lto-archive"
-version = "0.3.9-alpha"
+version = "0.4.0-alpha"
 dependencies = [
  "ltfs",
  "lto-catalog",
  "lto-scsi",
  "lto-sim",
+ "windows-sys",
 ]
 
 [[package]]
 name = "lto-catalog"
-version = "0.3.9-alpha"
+version = "0.4.0-alpha"
 dependencies = [
  "ltfs",
  "rusqlite",
@@ -324,21 +325,21 @@ dependencies = [
 
 [[package]]
 name = "lto-scsi"
-version = "0.3.9-alpha"
+version = "0.4.0-alpha"
 dependencies = [
  "windows-sys",
 ]
 
 [[package]]
 name = "lto-sim"
-version = "0.3.9-alpha"
+version = "0.4.0-alpha"
 dependencies = [
  "lto-scsi",
 ]
 
 [[package]]
 name = "ltocat"
-version = "0.3.9-alpha"
+version = "0.4.0-alpha"
 dependencies = [
  "ltfs",
  "lto-archive",
@@ -475,7 +476,7 @@ version = "0.9.9-beta"
 
 [[package]]
 name = "sal-plugin-ltocatalog"
-version = "0.3.9-alpha"
+version = "0.4.0-alpha"
 dependencies = [
  "ltfs",
  "lto-archive",

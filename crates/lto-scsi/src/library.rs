@@ -244,6 +244,11 @@ impl Library {
         self.changer.lock().unwrap().inv.mail_slots.iter().any(|e| e.full && (e.barcode.is_none() || !e.accessible))
     }
 
+    /// The barcodes of the tapes in the mail slots that the robot can reach.
+    pub fn in_mail_slots(&self) -> Vec<String> {
+        self.changer.lock().unwrap().inv.mail_slots.iter().filter(|e| e.full && e.accessible).filter_map(|e| e.barcode.clone()).collect()
+    }
+
     /// Whether the tape is in the library where the robot can reach it.
     pub fn reachable(&self, barcode: &str) -> bool {
         self.changer.lock().unwrap().inv.find(barcode).is_some_and(|e| e.accessible)

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lto_archive::{Answer, Archive, ReadSink, Step, Ui};
+use lto_archive::{Answer, Archive, BackupOptions, BackupReport, NewTapeProblem, ReadSink, Step, Ui};
 use lto_catalog::{Catalog, Tape};
 use lto_scsi::library::Devices;
 use ltfs::names::{from_windows, safe_relative, to_windows};
@@ -94,6 +94,8 @@ fn step_text(step: Step) -> String {
         Step::Reading(b, p) => trf("{barcode}: reading {path}", &[("barcode", &b), ("path", &to_inner(p))]),
         Step::Writing(b, p) => trf("{barcode}: writing {path}", &[("barcode", &b), ("path", &to_inner(p))]),
         Step::WritingIndex(b) => trf("{barcode}: writing its index…", &[("barcode", &b)]),
+        Step::Backup { tape, files, bytes } => trf("{barcode}: backing up, {n} of {total} files, {done} of {all}…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1))]),
+        Step::NewTape => tr("waiting for a new tape in the mail slot…"),
     }
 }
 
@@ -282,6 +284,40 @@ impl LtoCatalog {
             _ => Answer::Cancel,
         }
     }
+
+    /// A backup's tapes are full: ask for a new one.
+    fn ask_new_tape(&self, left: u64, places: &Places, problem: Option<NewTapeProblem>) -> Answer {
+        let left = size_text(left);
+        let text = if places.libraries.is_empty() {
+            trf("The tapes are full; {size} is still to back up. Insert a new tape into a drive, then press Continue.", &[("size", &left)])
+        } else {
+            trf("The tapes are full; {size} is still to back up. Put a new tape into the mail slot ({libraries}), then press Continue.", &[("size", &left), ("libraries", &places.libraries.join(", "))])
+        };
+        let mut detail = Vec::new();
+        match problem {
+            Some(NewTapeProblem::NothingNew) => detail.push(tr("No new tape showed up.")),
+            Some(NewTapeProblem::HasData(b)) => detail.push(trf("Tape {barcode} has files on it, so it isn't used. Take it out and put in another one.", &[("barcode", &b)])),
+            None => {}
+        }
+        detail.push(tr("A blank tape is formatted after you confirm."));
+        let look = self.look.lock().unwrap().clone();
+        match ask::ask(&self.asks, look, tr("Back up a folder"), text, detail.join("\n"), vec![tr("Continue"), tr("Stop the backup")], 0, 1) {
+            Some(0) => Answer::Retry,
+            _ => Answer::Cancel,
+        }
+    }
+
+    /// The new tape for a backup isn't an LTFS volume: format it? Enter
+    /// takes the safe answer, another tape.
+    fn ask_format(&self, barcode: &str) -> Answer {
+        let text = trf("Tape {barcode} isn't an LTFS volume: it is blank, or in another format. Format it for this backup? Anything on it is erased.", &[("barcode", &barcode)]);
+        let look = self.look.lock().unwrap().clone();
+        match ask::ask(&self.asks, look, tr("Back up a folder"), text, String::new(), vec![tr("Format and use it"), tr("Use another tape"), tr("Stop the backup")], 1, 2) {
+            Some(0) => Answer::Retry,
+            Some(1) => Answer::Skip,
+            _ => Answer::Cancel,
+        }
+    }
 }
 
 /// What a standalone drive holds, for people.
@@ -365,6 +401,12 @@ impl Ui for JobUi<'_> {
     }
     fn step(&self, step: Step) {
         self.plugin.say(step_text(step));
+    }
+    fn new_tape(&self, left: u64, places: &Places, problem: Option<NewTapeProblem>) -> Answer {
+        self.plugin.ask_new_tape(left, places, problem)
+    }
+    fn confirm_format(&self, barcode: &str) -> Answer {
+        self.plugin.ask_format(barcode)
     }
     fn missing_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool, places: &Places) -> Answer {
         let a = self.plugin.ask_tape(barcode, tape, skip, places);
@@ -533,6 +575,63 @@ fn chosen_tapes(values: &Values) -> Vec<String> {
     out
 }
 
+/// What a backup did, for people: the first lines of each kind of problem.
+fn backup_report(r: &BackupReport, opts: BackupOptions) -> String {
+    if r.total_files == 0 && opts.archive_only {
+        return tr("Nothing to back up: no file in the folder has the Archive attribute set.");
+    }
+    let (files, bytes) = r.written();
+    let mut lines = vec![if r.cancelled {
+        trf("Cancelled. {files} of {total} files ({size}) were backed up into \"{set}\" before; they are on the tapes.", &[("files", &files), ("total", &r.total_files), ("size", &size_text(bytes)), ("set", &r.set)])
+    } else {
+        trf("{files} files ({size}) backed up into \"{set}\".", &[("files", &files), ("size", &size_text(bytes)), ("set", &r.set)])
+    }];
+    for t in &r.tapes {
+        lines.push(trf("{barcode}: {files} files, {size}", &[("barcode", &t.barcode), ("files", &t.files), ("size", &size_text(t.bytes))]));
+    }
+    let mut list = |title: String, items: Vec<String>| {
+        if items.is_empty() {
+            return;
+        }
+        lines.push(String::new());
+        lines.push(title);
+        lines.extend(items.iter().take(20).cloned());
+        if items.len() > 20 {
+            lines.push(trf("… and {n} more", &[("n", &(items.len() - 20))]));
+        }
+    };
+    list(trf("Left out, larger than a whole tape ({n}):", &[("n", &r.too_big.len())]), r.too_big.iter().map(|p| p.display().to_string()).collect());
+    list(trf("Couldn't be read ({n}):", &[("n", &r.unreadable.len())]), r.unreadable.iter().map(|(p, why)| format!("{}: {why}", p.display())).collect());
+    list(trf("Archive attribute left set: changed while backed up, or it can't be changed ({n}):", &[("n", &r.not_cleared.len())]), r.not_cleared.iter().map(|p| p.display().to_string()).collect());
+    lines.join("\n")
+}
+
+/// A tape in a list to tick: barcode, where it is, what it holds, its free
+/// space and its note.
+fn tape_label(t: &Tape) -> String {
+    let what = if t.is_ltfs() {
+        let mut w = trf("LTFS, {files} files, {size}", &[("files", &t.files), ("size", &size_text(t.bytes))]);
+        if let Some(r) = t.remaining {
+            w.push_str(&trf(", {size} free", &[("size", &size_text(r))]));
+        }
+        w
+    } else if t.imported.is_some() {
+        tr("no LTFS volume")
+    } else {
+        tr("not imported")
+    };
+    let mut label = format!("{}  ·  {}  ·  {what}", t.barcode, t.location);
+    if !t.note.is_empty() {
+        let mut n: String = t.note.chars().take(60).collect();
+        if t.note.chars().count() > 60 {
+            n.push('…');
+        }
+        label.push_str("  ·  ");
+        label.push_str(&trf("Note: {note}", &[("note", &n)]));
+    }
+    label
+}
+
 fn field(id: &str, label: String, kind: FieldKind, value: &str) -> Field {
     Field { id: id.into(), label, kind, value: value.into(), enabled_if: None }
 }
@@ -685,15 +784,8 @@ impl LtoCatalog {
                     fields.push(note(tr("No tape is in a library or drive now.")));
                 }
                 for t in inside {
-                    let what = if t.is_ltfs() {
-                        trf("LTFS, {files} files, {size}", &[("files", &t.files), ("size", &size_text(t.bytes))])
-                    } else if t.imported.is_some() {
-                        tr("no LTFS volume")
-                    } else {
-                        tr("not imported")
-                    };
                     let ticked = if chosen.contains(&t.barcode.to_uppercase()) { "1" } else { "" };
-                    fields.push(field(&format!("tape:{}", t.barcode), format!("{}  ·  {}  ·  {what}", t.barcode, t.location), FieldKind::Check, ticked));
+                    fields.push(field(&format!("tape:{}", t.barcode), tape_label(t), FieldKind::Check, ticked));
                 }
             }
             Err(e) => fields.push(note(io_err(e).to_string())),
@@ -705,6 +797,59 @@ impl LtoCatalog {
         fields.push(note(tr("Another tape: one that isn't listed, such as a new one in a standalone drive. Volume name: empty names each tape by its barcode.")));
         fields.push(field("confirm", trf("Type {word} to confirm", &[("word", &ERASE)]), FieldKind::Text, ""));
         Ok(Reply::Form(Form { title: tr("Format tapes"), ok: tr("Format"), command: "format_do".into(), fields }))
+    }
+
+    /// The folder to back up (the other panel's, when it shows a folder on
+    /// disk), what to take, the Archive attribute, and the LTFS tapes in
+    /// the libraries and drives to tick (those selected in the panel ticked).
+    fn cmd_backup_form(&self, values: &Values) -> io::Result<Reply> {
+        let chosen = chosen_tapes(values);
+        let choice = |id: &str, label: String| (id.to_owned(), label);
+        let folder = values.get("other").map(PathBuf::from).filter(|p| !is_ours(p) && p.is_dir()).map(|p| p.display().to_string()).unwrap_or_default();
+        let mut fields = vec![
+            field("folder", tr("Folder to back up"), FieldKind::Folder, &folder),
+            field("what", tr("Back up"), FieldKind::Choice(vec![choice("all", tr("everything")), choice("archive", tr("only files with the Archive attribute"))]), "all"),
+            field("clear", tr("Clear the Archive attribute of the files backed up"), FieldKind::Check, "1"),
+            note(tr("Tapes to use, filled in barcode order:")),
+        ];
+        let a = self.archive();
+        match a.inventory(false) {
+            Ok(_) => {
+                let tapes = a.catalog.lock().unwrap().tapes().map_err(|e| io::Error::other(e.to_string()))?;
+                let usable: Vec<&Tape> = tapes.iter().filter(|t| t.in_library() && t.is_ltfs() && !is_cleaning(&t.barcode)).collect();
+                if usable.is_empty() {
+                    fields.push(note(tr("No LTFS tape is in a library or drive now: new tapes are asked for.")));
+                }
+                for t in usable {
+                    let ticked = if chosen.contains(&t.barcode.to_uppercase()) { "1" } else { "" };
+                    fields.push(field(&format!("tape:{}", t.barcode), tape_label(t), FieldKind::Check, ticked));
+                }
+            }
+            Err(e) => fields.push(note(io_err(e).to_string())),
+        }
+        fields.push(note(tr("The backup goes into a folder \"Backup <date> <time>\" on each tape. When the tapes are full, a new tape is asked for; a blank one is formatted after you confirm. A file larger than a whole tape is left out.")));
+        Ok(Reply::Form(Form { title: tr("Back up a folder"), ok: tr("Back up"), command: "backup_do".into(), fields }))
+    }
+
+    fn cmd_backup(&self, values: &Values) -> io::Result<Reply> {
+        let folder = values.get("folder").map(|f| f.trim()).unwrap_or("");
+        if folder.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, tr("Choose the folder to back up.")));
+        }
+        let src = PathBuf::from(folder);
+        if folder.chars().any(char::is_control) || is_ours(&src) || !src.is_dir() {
+            let shown: String = folder.chars().filter(|c| !c.is_control()).take(200).collect();
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, trf("\"{folder}\" isn't a folder on disk.", &[("folder", &shown)])));
+        }
+        let list: Vec<String> = values.iter().filter(|(k, v)| k.starts_with("tape:") && !v.is_empty()).map(|(k, _)| k[5..].to_uppercase()).collect();
+        if let Some(bad) = list.iter().find(|b| !barcode_ok(b)) {
+            return Err(bad_barcode(bad));
+        }
+        let opts = BackupOptions { archive_only: values.get("what").is_some_and(|w| w == "archive"), clear_archive: values.get("clear").is_some_and(|c| !c.is_empty()) };
+        let set = lto_archive::backup_set_name(&src);
+        let ui = self.command_ui();
+        let r = self.archive().backup(&src, &set, &list, opts, &ui).map_err(io_err)?;
+        Ok(Reply::Message(backup_report(&r, opts)))
     }
 
     fn cmd_format(&self, values: &Values) -> io::Result<Reply> {
@@ -1128,6 +1273,7 @@ impl FolderPlugin for LtoCatalog {
             c("import", tr("Import tapes…")),
             c("status", tr("Library status")),
             c("format", tr("Format tapes…")),
+            c("backup", tr("Back up a folder…")),
             c("eject", tr("Eject a tape…")),
             c("unload", tr("Unload tapes from drives")),
             c("note", tr("Note about a tape…")),
@@ -1160,7 +1306,8 @@ impl FolderPlugin for LtoCatalog {
             "inventory" | "status" => Some(tr("reading the libraries' inventories…")),
             "import_do" => Some(tr("importing tapes…")),
             "format_do" => Some(tr("formatting…")),
-            "format" => Some(tr("reading the libraries' inventories…")),
+            "format" | "backup" => Some(tr("reading the libraries' inventories…")),
+            "backup_do" => Some(tr("backing up…")),
             "search_do" => Some(tr("searching the catalog…")),
             "eject_do" => Some(tr("ejecting the tape…")),
             "unload" => Some(tr("putting the tapes back…")),
@@ -1178,6 +1325,8 @@ impl FolderPlugin for LtoCatalog {
             "search" => Ok(self.search_form(input)),
             "search_do" => self.cmd_search(input),
             "format_do" => self.cmd_format(input),
+            "backup" => self.cmd_backup_form(input),
+            "backup_do" => self.cmd_backup(input),
             "eject" => Ok(self.one_tape_form(
                 input,
                 tr("Eject a tape"),

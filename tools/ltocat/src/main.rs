@@ -46,6 +46,10 @@ files:
   mv <barcode>\\<path> <new path>
   rm <barcode>\\<path>
   format <barcode> [--name <volume name>]  ERASES the tape, makes it an empty LTFS volume
+  backup <folder> [<barcode>...] [--archive-only] [--keep-archive]
+                             back up a folder into \"Backup <date> <time>\\<folder>\" on the tapes
+                             (in barcode order, then new ones asked for); --archive-only: only
+                             files with the Archive attribute; --keep-archive: don't clear it
 
 options:
   --program <folder> the RustySalamander folder (with rustysalamander.exe): use the plugin's
@@ -78,6 +82,8 @@ struct Opts {
     yes: bool,
     rescan: bool,
     name: String,
+    archive_only: bool,
+    keep_archive: bool,
     args: Vec<String>,
 }
 
@@ -97,6 +103,8 @@ fn parse() -> Result<Opts, String> {
         yes: false,
         rescan: false,
         name: String::new(),
+        archive_only: false,
+        keep_archive: false,
         args: Vec::new(),
     };
     let mut program: Option<PathBuf> = None;
@@ -114,6 +122,8 @@ fn parse() -> Result<Opts, String> {
             "--name" => o.name = val("--name")?,
             "--yes" | "-y" => o.yes = true,
             "--rescan" => o.rescan = true,
+            "--archive-only" => o.archive_only = true,
+            "--keep-archive" => o.keep_archive = true,
             "-h" | "--help" | "help" => {
                 print!("{HELP}");
                 std::process::exit(0);
@@ -222,6 +232,8 @@ impl Ui for Console {
             S::Reading(b, p) => format!("{b}: reading {p}"),
             S::Writing(b, p) => format!("{b}: writing {p}"),
             S::WritingIndex(b) => format!("{b}: writing its index"),
+            S::Backup { tape, files, bytes } => format!("{tape}: backing up, {} of {} files, {} of {}", files.0, files.1, size(bytes.0), size(bytes.1)),
+            S::NewTape => "waiting for a new tape in the mail slot".to_owned(),
         };
         eprintln!("... {text}");
     }
@@ -249,6 +261,30 @@ impl Ui for Console {
             "q" => Answer::Cancel,
             "s" if skip => Answer::Skip,
             _ => Answer::Retry,
+        }
+    }
+    fn new_tape(&self, left: u64, places: &Places, problem: Option<lto_archive::NewTapeProblem>) -> Answer {
+        match problem {
+            Some(lto_archive::NewTapeProblem::NothingNew) => println!("No new tape showed up."),
+            Some(lto_archive::NewTapeProblem::HasData(b)) => println!("Tape {b} has files on it, so it isn't used. Take it out."),
+            None => {}
+        }
+        let wher = if places.libraries.is_empty() { "into a drive".to_owned() } else { format!("into the mail slot of {}", places.libraries.join(" or ")) };
+        let a = ask(&format!("The tapes are full; {} is still to back up. Put a new tape {wher} (a blank one is formatted after asking), then press Enter (q to stop):", size(left)));
+        if a.eq_ignore_ascii_case("q") {
+            Answer::Cancel
+        } else {
+            Answer::Retry
+        }
+    }
+    fn confirm_format(&self, barcode: &str) -> Answer {
+        let a = ask(&format!("Tape {barcode} isn't an LTFS volume. Type its barcode to format it (ERASES it) and use it, s for another tape, q to stop:"));
+        if a.eq_ignore_ascii_case(barcode) {
+            Answer::Retry
+        } else if a.eq_ignore_ascii_case("q") {
+            Answer::Cancel
+        } else {
+            Answer::Skip
         }
     }
 }
@@ -605,6 +641,33 @@ fn run(o: &Opts) -> Result<(), String> {
             let a = archive(o)?;
             let ix = a.format(b, &o.name, &Console).map_err(e)?;
             println!("{b} is an empty LTFS volume {}.", ix.volume_uuid);
+            Ok(())
+        }
+        "backup" => {
+            need(o, 1, "backup <folder> [<barcode>...] [--archive-only] [--keep-archive]")?;
+            let src = PathBuf::from(&o.args[1]);
+            let tapes: Vec<String> = o.args[2..].iter().map(|b| b.to_uppercase()).collect();
+            let set = lto_archive::backup_set_name(&src);
+            let opts = lto_archive::BackupOptions { archive_only: o.archive_only, clear_archive: !o.keep_archive };
+            let r = archive(o)?.backup(&src, &set, &tapes, opts, &Console).map_err(e)?;
+            if r.total_files == 0 && opts.archive_only {
+                println!("Nothing to back up: no file in {} has the Archive attribute set.", src.display());
+                return Ok(());
+            }
+            let (files, bytes) = r.written();
+            println!("{}{files} of {} files ({}) backed up into \"{set}\".", if r.cancelled { "Cancelled. " } else { "" }, r.total_files, size(bytes));
+            for t in &r.tapes {
+                println!("  {}: {} files, {}", t.barcode, t.files, size(t.bytes));
+            }
+            for p in &r.too_big {
+                println!("left out, larger than a tape: {}", p.display());
+            }
+            for (p, why) in &r.unreadable {
+                println!("couldn't be read: {}: {why}", p.display());
+            }
+            for p in &r.not_cleared {
+                println!("Archive attribute left set: {}", p.display());
+            }
             Ok(())
         }
         "sim-move" => {
