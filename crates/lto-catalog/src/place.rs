@@ -28,6 +28,12 @@ pub struct Settings {
     pub drives: String,
     /// The catalog file; empty: [`default_catalog`].
     pub catalog: String,
+    /// Where a backup writes its index along the way: `data` (the data
+    /// partition only; also when empty) or `both` (the index partition too).
+    pub backup_index: String,
+    /// The detailed log (`ltocatalog.log` in the data folder): `off`, or
+    /// on (anything else, also empty).
+    pub log: String,
 }
 
 impl Settings {
@@ -42,6 +48,8 @@ impl Settings {
                     "changer" => s.changer = v.clone(),
                     "drives" => s.drives = v.clone(),
                     "catalog" => s.catalog = v.clone(),
+                    "backup_index" => s.backup_index = v.clone(),
+                    "log" => s.log = v.clone(),
                     _ => {}
                 }
             }
@@ -50,11 +58,16 @@ impl Settings {
     }
 
     pub fn save(&self, file: &Path) -> io::Result<()> {
-        let parts = ["changer", &self.changer, "drives", &self.drives, "catalog", &self.catalog];
+        let parts = ["changer", &self.changer, "drives", &self.drives, "catalog", &self.catalog, "backup_index", &self.backup_index, "log", &self.log];
         if let Some(d) = file.parent() {
             fs::create_dir_all(d)?;
         }
         fs::write(file, encode(&parts))
+    }
+
+    /// Whether the detailed log is written.
+    pub fn log_on(&self) -> bool {
+        !self.log.trim().eq_ignore_ascii_case("off")
     }
 
     /// The catalog: the one chosen, or the default in the data folder `data`.
@@ -65,6 +78,16 @@ impl Settings {
             PathBuf::from(self.catalog.trim())
         }
     }
+}
+
+/// The plugin's detailed log in the data folder `data`.
+pub fn log_file(data: &Path) -> PathBuf {
+    data.join("ltocatalog.log")
+}
+
+/// `ltocat`'s detailed log in the data folder `data`.
+pub fn ltocat_log_file(data: &Path) -> PathBuf {
+    data.join("ltocat.log")
 }
 
 /// The settings file in the data folder `data`.
@@ -142,6 +165,20 @@ pub fn is_program_dir(dir: &Path) -> bool {
     dir.join(PROGRAM_EXE).is_file()
 }
 
+/// The RustySalamander folder `ltocat` belongs to when it is in `own` (its
+/// own folder): the plugin's folder `<program>\plugins\ltocatalog`, where
+/// the plugin's updates keep it, or the program's folder itself, where
+/// releases before 0.4.1 put it.
+pub fn program_of_ltocat(own: &Path) -> Option<PathBuf> {
+    if is_program_dir(own) {
+        return Some(own.to_path_buf());
+    }
+    let named = |p: &Path, name: &str| p.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name));
+    let plugins = own.parent().filter(|_| named(own, PLUGIN_FOLDER))?;
+    let program = plugins.parent().filter(|_| named(plugins, "plugins"))?;
+    is_program_dir(program).then(|| program.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +191,15 @@ mod tests {
         assert!(!is_program_dir(&program));
         fs::write(program.join(PROGRAM_EXE), b"").unwrap();
         assert!(is_program_dir(&program));
+        // ltocat finds the program from the plugin's folder or the program's
+        let plugin = program.join("Plugins").join("LtoCatalog");
+        fs::create_dir_all(&plugin).unwrap();
+        assert_eq!(program_of_ltocat(&plugin), Some(plugin.parent().unwrap().parent().unwrap().to_path_buf()));
+        assert_eq!(program_of_ltocat(&program), Some(program.clone()));
+        let elsewhere = program.join("plugins").join("other");
+        fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(program_of_ltocat(&elsewhere), None);
+        assert_eq!(program_of_ltocat(&t), None);
         // portable: the plugin's own folder
         let data = data_dir_of_program(&program);
         assert_eq!(data, program.join("plugins").join("ltocatalog"));
@@ -164,7 +210,7 @@ mod tests {
         assert!(data.ends_with(Path::new("RustySalamander").join("plugins").join("ltocatalog")), "{}", data.display());
         assert!(!data.starts_with(&program));
         // settings saved by the plugin are read back, a chosen catalog wins
-        let s = Settings { changer: "scsi:1:0:3:1".into(), drives: String::new(), catalog: r"\\nas\tapes\catalog.sqlite".into() };
+        let s = Settings { changer: "scsi:1:0:3:1".into(), drives: String::new(), catalog: r"\\nas\tapes\catalog.sqlite".into(), backup_index: "both".into(), log: "off".into() };
         let file = settings_file(&t.join("data"));
         s.save(&file).unwrap();
         let back = Settings::load(&file);

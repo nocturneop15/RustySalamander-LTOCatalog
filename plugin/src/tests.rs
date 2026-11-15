@@ -7,6 +7,9 @@ use sal_plugin_api::mount_root;
 
 use super::*;
 
+/// Held by the tests that set `LTOCATALOG_SIM`, which the process shares.
+static SIM_ENV: Mutex<()> = Mutex::new(());
+
 fn plugin(asker: Option<Asker>) -> (SimLibrary, LtoCatalog, PathBuf) {
     let sim = SimLibrary::new(&Config::default());
     let archive = Archive::new(Box::new(sim.clone()), Catalog::in_memory().unwrap(), "test");
@@ -185,17 +188,19 @@ fn starts_through_the_program() {
     static HOST: HostApi = HostApi { version: VERSION, ctx: std::ptr::null_mut(), translate, open_window, repaint };
     let dir = std::env::temp_dir().join(format!("ltocatalog-start-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    Settings { catalog: dir.join("cat.sqlite").display().to_string(), ..Settings::default() }.save(&dir.join("settings")).unwrap();
-    // SAFETY: only this test reads the variable
+    Settings { catalog: dir.join("cat.sqlite").display().to_string(), log: "off".into(), ..Settings::default() }.save(&dir.join("settings")).unwrap();
+    let _env = SIM_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: the tests that read the variable hold SIM_ENV
     unsafe { std::env::set_var("LTOCATALOG_SIM", dir.join("sim.bin")) };
     let desc = unsafe { &*rustysalamander_plugin() };
     let p = unsafe { sal_plugin_api::host::start(desc, &HOST, &dir) }.unwrap();
     assert_eq!(p.id(), "ltocatalog");
-    assert_eq!(p.commands().len(), 12);
+    assert_eq!(p.commands().len(), 13);
     p.run("inventory", &Values::new()).unwrap();
     assert_eq!(p.list(&root(), "").unwrap().items.len(), 6);
     assert!(dir.join("cat.sqlite").exists() && dir.join("sim.bin").exists());
     drop(p);
+    unsafe { std::env::remove_var("LTOCATALOG_SIM") };
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -309,7 +314,11 @@ fn standalone_drive_in_the_plugin() {
 /// name with control characters and a catalog that is a device are refused.
 #[test]
 fn hostile_input_in_every_form() {
+    // Save opens the devices again, as LTOCATALOG_SIM says
+    let _env = SIM_ENV.lock().unwrap_or_else(|e| e.into_inner());
     let (_sim, p, dir) = plugin(None);
+    // SAFETY: the tests that read the variable hold SIM_ENV
+    unsafe { std::env::set_var("LTOCATALOG_SIM", dir.join("sim.bin")) };
     let v = |pairs: &[(&str, &str)]| -> Values { pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
     for s in sal_core::hostile::inputs() {
         let s = s.as_str();
@@ -349,6 +358,7 @@ fn hostile_input_in_every_form() {
     // the catalog is still whole and usable
     assert!(matches!(p.run("inventory", &Values::new()).unwrap(), Reply::Message(_)));
     drop(p);
+    unsafe { std::env::remove_var("LTOCATALOG_SIM") };
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -473,7 +483,7 @@ fn format_several_tapes_at_once() {
     assert_eq!(p.archive().catalog.lock().unwrap().tape("LTO004L5").unwrap().unwrap().name, "LTO004L5");
     // the context menu on tapes: what is done to a tape, all run by the plugin
     let items: Vec<String> = p.item_commands().unwrap().into_iter().map(|c| c.id).collect();
-    assert_eq!(items, ["search", "import", "format", "eject", "note", "forget"]);
+    assert_eq!(items, ["search", "import", "format", "verify", "eject", "note", "forget"]);
     assert!(items.iter().all(|id| p.commands().iter().any(|c| &c.id == id)));
     // a barcode that can't be one, ticked by a crafted form
     assert_eq!(p.run("format_do", &vals(&[("tape:A\\B", "1"), ("confirm", "ERASE")])).unwrap_err().kind(), io::ErrorKind::InvalidInput);
@@ -559,5 +569,76 @@ fn a_folder_is_backed_up_through_the_form() {
     // archive-only, attributes cleared: nothing left
     let Reply::Message(m) = p.run("backup_do", &vals(&[("folder", &folder), ("what", "archive"), ("clear", "1"), ("tape:LTO002L5", "1")])).unwrap() else { panic!() };
     assert!(m.contains("Nothing to back up"), "{m}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Library settings choose where a backup writes its interim index: the
+/// data partition by default, both partitions when chosen; kept in the
+/// settings file.
+#[test]
+fn the_interim_index_is_a_library_setting() {
+    let (_sim, p, dir) = plugin(None);
+    // Save opens the devices again: a simulated library of its own
+    let _env = SIM_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: the tests that read the variable hold SIM_ENV
+    unsafe { std::env::set_var("LTOCATALOG_SIM", dir.join("sim.bin")) };
+    let shown = |p: &LtoCatalog| {
+        let Reply::Form(f) = p.run("settings", &Values::new()).unwrap() else { panic!("no form") };
+        f.fields.iter().find(|f| f.id == "backup_index").unwrap().value.clone()
+    };
+    assert_eq!(shown(&p), "data");
+    let cat = dir.join("cat.sqlite").display().to_string();
+    p.run("settings_do", &vals(&[("changer", ""), ("drives", ""), ("catalog", &cat), ("backup_index", "both")])).unwrap();
+    assert_eq!(shown(&p), "both");
+    assert_eq!(Settings::load(&dir.join("settings")).backup_index, "both");
+    // anything else is the default
+    p.run("settings_do", &vals(&[("changer", ""), ("drives", ""), ("catalog", &cat), ("backup_index", "nonsense")])).unwrap();
+    assert_eq!(Settings::load(&dir.join("settings")).backup_index, "data");
+    drop(p);
+    unsafe { std::env::remove_var("LTOCATALOG_SIM") };
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A damaged tape: the warning is shown before the job goes on, the tape
+/// is marked in the lists, a check says which files can't be read, the
+/// drives' reports come with the command's message, and a backup onto it
+/// ends with its report.
+#[test]
+fn a_damaged_tape_is_warned_about_checked_and_reported() {
+    let (sim, p, dir) = plugin(None);
+    p.run("inventory", &Values::new()).unwrap();
+    p.run("format_do", &vals(&[("tape:LTO001L5", "1"), ("confirm", "ERASE")])).unwrap();
+    let src = dir.join("data");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.bin"), vec![1u8; 600_000]).unwrap();
+    fs::write(src.join("b.bin"), vec![2u8; 600_000]).unwrap();
+    p.add(&root(), &[(src.clone(), r"LTO001L5\data".into())], &mut |_, _| true).unwrap();
+    // the data partition's index, and a block of a.bin
+    sim.damage_last_index("LTO001L5", 1).unwrap();
+    let ix = p.archive().import("LTO001L5", &lto_archive::NoUi).unwrap().unwrap();
+    let Some(ltfs::Node::File(a)) = ix.find(r"data\a.bin").cloned() else { panic!("a.bin") };
+    sim.damage("LTO001L5", 1, a.extents[0].start_block as usize);
+    p.archive().take_notices();
+    p.warned.lock().unwrap().clear();
+
+    // the form lists the tape as damaged; the check reads past a.bin
+    let Reply::Form(f) = p.run("verify", &vals(&[("selected", &sal_plugin_api::ui::encode(&["LTO001L5"]))])).unwrap() else { panic!("no form") };
+    assert_eq!(f.command, "verify_do");
+    let label = &f.fields.iter().find(|f| f.id == "tape:LTO001L5").unwrap().label;
+    assert!(label.contains("Damaged: its index in partition b can't be read"), "{label}");
+    let Reply::Message(m) = p.run("verify_do", &vals(&[("tape:LTO001L5", "1")])).unwrap() else { panic!() };
+    assert!(m.contains("1 of 2 files can't be read") && m.contains(r"data\a.bin"), "{m}");
+    assert!(m.contains("one copy of its index can't be read"), "{m}");
+    assert!(m.contains("The tape drives reported:") && m.contains("read failure"), "{m}");
+    let warned = p.warned.lock().unwrap().clone();
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(warned[0].contains("Part of tape LTO001L5 can't be read") && warned[0].contains("partition a"), "{warned:?}");
+
+    // a backup onto it: refused (read-only), and its report says so
+    let Reply::Message(m) = p.run("backup_do", &vals(&[("folder", &src.display().to_string()), ("what", "all"), ("tape:LTO001L5", "1")])).unwrap() else { panic!() };
+    assert!(m.contains("The backup stopped:") && m.contains("LTO001L5"), "{m}");
+    // one that can't start says why, as a message too
+    let Reply::Message(m) = p.run("backup_do", &vals(&[("folder", &src.display().to_string()), ("what", "all"), ("tape:LTO005L5", "1")])).unwrap() else { panic!() };
+    assert!(m.contains("The backup didn't start:"), "{m}");
     let _ = fs::remove_dir_all(&dir);
 }

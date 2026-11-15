@@ -711,7 +711,7 @@ fn a_backup_spans_tapes_and_asks_for_new_ones() {
     let cap = 24 * 1024 * 1024;
     let ui = BackupUi::new(&sim, vec![lto_sim::Cart::new("NEW001L5", cap), lto_sim::Cart::new("NEW002L5", cap)]);
     let set = "Backup T\\span";
-    let r = a.backup(&src, set, &["LTO002L5".into(), "lto001l5".into()], BackupOptions { archive_only: false, clear_archive: true }, &ui).unwrap();
+    let r = a.backup(&src, set, &["LTO002L5".into(), "lto001l5".into()], BackupOptions { archive_only: false, clear_archive: true, ..Default::default() }, &ui).unwrap();
     assert!(!r.cancelled && r.too_big.is_empty() && r.unreadable.is_empty(), "{r:?}");
     assert_eq!(r.written(), (12, 12 * 2 * 1024 * 1024));
     let order: Vec<&str> = r.tapes.iter().map(|t| t.barcode.as_str()).collect();
@@ -746,7 +746,7 @@ fn an_archive_only_backup_takes_what_changed() {
     }
     let b = src.join("sub\\f01.bin");
     set_archive(&b).unwrap();
-    let only = |clear| BackupOptions { archive_only: true, clear_archive: clear };
+    let only = |clear| BackupOptions { archive_only: true, clear_archive: clear, ..Default::default() };
     // differential: the attribute stays
     let r = a.backup(&src, "Backup 1\\arch", &["LTO001L5".into()], only(false), &NoUi).unwrap();
     assert_eq!(r.written().0, 1);
@@ -771,7 +771,7 @@ fn a_file_larger_than_a_tape_is_left_out() {
     let src = backup_source("big", 1, 1000);
     let big = src.join("big.bin");
     fs::write(&big, vec![1u8; 30 * 1024 * 1024]).unwrap();
-    let r = a.backup(&src, "Backup B\\big", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: true }, &NoUi).unwrap();
+    let r = a.backup(&src, "Backup B\\big", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: true, ..Default::default() }, &NoUi).unwrap();
     assert_eq!(r.too_big, [big.clone()]);
     assert_eq!(r.written().0, 1);
     assert!(archive_set(&big).unwrap(), "left set");
@@ -792,7 +792,7 @@ fn a_new_tape_with_data_is_refused() {
     let src = backup_source("refuse", 6, 2 * 1024 * 1024);
     let ui = BackupUi::new(&sim, vec![lto_sim::Cart::new("NEW009L5", 24 * 1024 * 1024)]);
     // only LTO001L5 ticked: full after four files; the mail slot offers LTO003L5 first
-    let r = a.backup(&src, "Backup R\\refuse", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: false }, &ui).unwrap();
+    let r = a.backup(&src, "Backup R\\refuse", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: false, ..Default::default() }, &ui).unwrap();
     assert_eq!(r.written().0, 6, "{r:?}");
     let problems = ui.problems.lock().unwrap().clone();
     assert!(problems.iter().any(|p| p.contains("HasData(\"LTO003L5\")")), "{problems:?}");
@@ -810,11 +810,375 @@ fn a_cancelled_backup_keeps_what_it_wrote() {
     let src = backup_source("cancel", 6, 100_000);
     let mut ui = BackupUi::new(&sim, Vec::new());
     ui.cancel_after = Some(2);
-    let r = a.backup(&src, "Backup C\\cancel", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: true }, &ui).unwrap();
+    let r = a.backup(&src, "Backup C\\cancel", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: true, ..Default::default() }, &ui).unwrap();
     assert!(r.cancelled);
     assert_eq!(r.written().0, 2);
     assert_eq!(backed_up(&a, &["LTO001L5"], "Backup C\\cancel").len(), 2);
     let set: Vec<bool> = (0..6).map(|i| archive_set(&src.join(format!("sub\\f{i:02}.bin"))).unwrap()).collect();
     assert_eq!(set, [false, false, true, true, true, true]);
     let _ = fs::remove_dir_all(&src);
+}
+
+/// The index written along the way: at the end of the data only, the tape
+/// doesn't go to the index partition each time (fewer LOCATEs); either way
+/// everything is on the tape and reads back, and the index at the end of
+/// the tape is in both partitions.
+#[test]
+fn a_backup_writes_its_interim_index_where_chosen() {
+    const LOCATE16: u8 = 0x92;
+    backup::TEST_COMMIT_EVERY.with(|c| c.set(Some(1024 * 1024)));
+    let src = backup_source("interim", 6, 1024 * 1024);
+    let mut locates = Vec::new();
+    for interim_index in [InterimIndex::DataPartition, InterimIndex::BothPartitions] {
+        let (sim, a) = small_library();
+        let before = sim.count(LOCATE16);
+        let r = a.backup(&src, "Backup I\\interim", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: false, interim_index }, &NoUi).unwrap();
+        assert_eq!(r.written().0, 6, "{r:?}");
+        locates.push(sim.count(LOCATE16) - before);
+        // the catalog's index is the tape's, and the files read back
+        let mut g = Got::default();
+        a.read(&["LTO001L5\\Backup I\\interim\\sub\\f05.bin".to_string()], &mut g, &NoUi).unwrap();
+        assert_eq!(g.files[0].1, fs::read(src.join("sub\\f05.bin")).unwrap());
+        // a fresh catalog, reading the tape, finds the same index
+        // generation
+        let generation = a.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap().generation;
+        let fresh = Archive::new(Box::new(sim.clone()), Catalog::in_memory().unwrap(), "test");
+        fresh.import("LTO001L5", &NoUi).unwrap();
+        assert_eq!(fresh.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap().generation, generation);
+    }
+    backup::TEST_COMMIT_EVERY.with(|c| c.set(None));
+    assert!(locates[0] + 5 <= locates[1], "data partition only: fewer moves {locates:?}");
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// A ticked tape that was written to after the catalog last saw it (here
+/// through another catalog): the backup brings the catalog up to date and
+/// goes on, instead of stopping; what was written before stays.
+#[test]
+fn a_backup_onto_a_tape_the_catalog_is_behind() {
+    let (sim, a) = small_library();
+    let other = Archive::new(Box::new(sim.clone()), Catalog::in_memory().unwrap(), "test");
+    other.import("LTO001L5", &NoUi).unwrap();
+    let t = std::env::temp_dir().join(format!("lto-backup-{}-elsewhere.txt", std::process::id()));
+    fs::write(&t, b"written elsewhere").unwrap();
+    other.write("LTO001L5", &[(t.clone(), "elsewhere.txt".into())], &NoUi, &mut |_, _| true).unwrap();
+    let src = backup_source("behind", 2, 1000);
+    let r = a.backup(&src, "Backup S\\behind", &["LTO001L5".into()], BackupOptions::default(), &NoUi).unwrap();
+    assert_eq!(r.written().0, 2, "{r:?}");
+    assert!(a.catalog.lock().unwrap().entry("LTO001L5", "elsewhere.txt").unwrap().is_some(), "the catalog caught up");
+    assert_eq!(backed_up(&a, &["LTO001L5"], "Backup S\\behind").len(), 2);
+    let mut g = Got::default();
+    a.read(&["LTO001L5\\elsewhere.txt".to_string()], &mut g, &NoUi).unwrap();
+    assert_eq!(g.files[0].1, b"written elsewhere");
+    let _ = (fs::remove_dir_all(&src), fs::remove_file(&t));
+}
+
+/// The detailed log of a backup: the SCSI commands (data records summed
+/// up), what mount found in each partition, the catalog compared with the
+/// tape, each file with its block, and each index written.
+#[test]
+fn a_backup_is_in_the_detailed_log() {
+    let (_sim, a) = small_library();
+    let src = backup_source("logged", 3, 1000);
+    let file = std::env::temp_dir().join(format!("lto-backup-{}-detail.log", std::process::id()));
+    let _ = fs::remove_file(&file);
+    lto_scsi::log::open(&file).unwrap();
+    let r = a.backup(&src, "Backup L\\logged", &["LTO001L5".into()], BackupOptions::default(), &NoUi);
+    lto_scsi::log::close();
+    assert_eq!(r.unwrap().written().0, 3);
+    let text = fs::read_to_string(&file).unwrap();
+    for want in [
+        "job: backup",
+        "acquire LTO001L5: in ",
+        "the cartridge says LTO001L5",
+        "LOCATE [92 ",
+        "ltfs last index of partition a: blocks ",
+        "ltfs last index of partition b: blocks ",
+        "ltfs mount LTO001L5: volume ",
+        "catalog LTO001L5: holds volume ",
+        ": the same",
+        "backup: \"sub\\f00.bin\" 1000 bytes at b:",
+        "WRITE x",
+        "ltfs index LTO001L5: generation 2 into the data partition at block ",
+        "ltfs commit LTO001L5: generation 2 into the index partition",
+        "catalog LTO001L5: recorded volume ",
+        "backup done: 3 files",
+    ] {
+        assert!(text.contains(want), "{want:?} isn't in the log:\n{text}");
+    }
+    // values, not program internals
+    for internal in ["Some(", "None", "Ok(", "Err(", "Time {", "\\\\"] {
+        assert!(!text.contains(internal), "{internal:?} is in the log:\n{text}");
+    }
+    let _ = (fs::remove_dir_all(&src), fs::remove_file(&file));
+}
+
+/// The TS3100 as it is used: one drive, three tapes formatted by the
+/// plugin and ticked, a backup filling all three, with an interim index
+/// now and then (every 100 GB on real tapes), written either way.
+#[test]
+fn a_backup_fills_three_ticked_tapes_in_one_drive() {
+    let file = std::env::temp_dir().join(format!("lto-backup-{}-three.log", std::process::id()));
+    let _ = fs::remove_file(&file);
+    lto_scsi::log::open(&file).unwrap();
+    for interim_index in [InterimIndex::BothPartitions, InterimIndex::DataPartition] {
+        for drives in [1, 2] {
+            let cap = 24 * 1024 * 1024;
+            let sim = SimLibrary::new(&Config { capacity: cap, drives, ..Config::default() });
+            let a = Archive::new(Box::new(sim.clone()), Catalog::in_memory().unwrap(), "test");
+            for b in ["LTO001L5", "LTO002L5", "LTO003L5"] {
+                a.format(b, b, &NoUi).unwrap();
+            }
+            backup::TEST_COMMIT_EVERY.with(|c| c.set(Some(3 * 1024 * 1024)));
+            let src = backup_source(&format!("three-{drives}-{interim_index:?}"), 13, 2 * 1024 * 1024);
+            let r = a.backup(&src, "Backup 3\\three", &["LTO001L5".into(), "LTO002L5".into(), "LTO003L5".into()], BackupOptions { interim_index, ..Default::default() }, &NoUi);
+            backup::TEST_COMMIT_EVERY.with(|c| c.set(None));
+            let r = r.unwrap_or_else(|e| panic!("{drives} drives, {interim_index:?}: {e}"));
+            let order: Vec<&str> = r.tapes.iter().map(|t| t.barcode.as_str()).collect();
+            assert_eq!(order, ["LTO001L5", "LTO002L5", "LTO003L5"], "{drives} drives, {interim_index:?}: {r:?}");
+            let _ = fs::remove_dir_all(&src);
+        }
+    }
+    lto_scsi::log::close();
+    let text = fs::read_to_string(&file).unwrap();
+    let mine: Vec<&str> = text.lines().filter(|l| l.contains("three_ticked") && l.contains("OUT OF DATE")).collect();
+    assert!(mine.is_empty(), "{}", mine.join("
+"));
+}
+
+/// A cartridge in the drive that holds another tape's volume than the one
+/// asked for (the catalog has another volume for that barcode): nothing is
+/// written, the catalog isn't overwritten with the wrong tape's index, and
+/// the error names the tape the volume belongs to.
+#[test]
+fn another_volume_in_the_drive_is_never_written_or_recorded() {
+    let (sim, a) = small_library();
+    let before = a.catalog.lock().unwrap().tape("LTO002L5").unwrap().unwrap();
+    // LTO002L5's cartridge now holds what LTO001L5 holds (labels and
+    // memory say LTO002L5, as a mixed-up drive would show)
+    let one = sim.cart("LTO001L5").unwrap();
+    sim.with_cart("LTO002L5", |c| c.parts = one.parts.clone()).unwrap();
+    let src = backup_source("other", 2, 1000);
+    // the backup ends with its report, which says why it stopped
+    let r = a.backup(&src, "Backup O\\other", &["LTO002L5".into()], BackupOptions::default(), &NoUi).unwrap();
+    let e = r.error.expect("stopped");
+    assert!(e.contains("LTO002L5") && e.contains("(the volume in the drive is tape LTO001L5's)"), "{e}");
+    assert_eq!(r.failed_tapes.len(), 1);
+    assert!(r.tapes.is_empty());
+    let after = a.catalog.lock().unwrap().tape("LTO002L5").unwrap().unwrap();
+    assert_eq!((after.uuid, after.generation), (before.uuid, before.generation), "the catalog kept LTO002L5's own volume");
+    assert_eq!(sim.cart("LTO002L5").unwrap().parts, one.parts, "nothing written");
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// Folders have an Archive attribute too: a backup clears it on the
+/// folders it put on the tape; archive-only takes a folder whose attribute
+/// is set even when nothing in it changed (an empty one too), and leaves
+/// out the folders whose attribute is clear and that hold nothing changed.
+#[test]
+fn folders_have_their_archive_attribute_cleared_too() {
+    let (_sim, a) = small_library();
+    let src = backup_source("folders", 2, 1000);
+    fs::create_dir_all(src.join("quiet")).unwrap();
+    let dirs = [src.join("sub"), src.join("empty"), src.join("quiet")];
+    for d in &dirs {
+        set_archive(d).unwrap();
+    }
+    let all = BackupOptions { clear_archive: true, ..Default::default() };
+    a.backup(&src, "Backup F1\\folders", &["LTO001L5".into()], all, &NoUi).unwrap();
+    for d in &dirs {
+        assert!(!archive_set(d).unwrap(), "{} cleared", d.display());
+    }
+    // a new empty folder, and one whose attribute is set again
+    fs::create_dir_all(src.join("new")).unwrap();
+    set_archive(&src.join("new")).unwrap();
+    set_archive(&src.join("empty")).unwrap();
+    let only = BackupOptions { archive_only: true, clear_archive: true, ..Default::default() };
+    let r = a.backup(&src, "Backup F2\\folders", &["LTO001L5".into()], only, &NoUi).unwrap();
+    assert_eq!((r.total_files, r.total_folders), (0, 2), "{r:?}");
+    let c = a.catalog.lock().unwrap();
+    assert!(c.entry("LTO001L5", "Backup F2\\folders\\new").unwrap().is_some());
+    assert!(c.entry("LTO001L5", "Backup F2\\folders\\empty").unwrap().is_some());
+    assert!(c.entry("LTO001L5", "Backup F2\\folders\\quiet").unwrap().is_none(), "unchanged: left out");
+    drop(c);
+    assert!(!archive_set(&src.join("new")).unwrap() && !archive_set(&src.join("empty")).unwrap());
+    // nothing changed now
+    let r = a.backup(&src, "Backup F3\\folders", &["LTO001L5".into()], only, &NoUi).unwrap();
+    assert_eq!((r.total_files, r.total_folders, r.tapes.len()), (0, 0, 0));
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// The backup's step says the average speed once data has been written,
+/// and not before.
+#[test]
+fn a_backup_step_has_its_average_speed() {
+    struct Speeds(Mutex<Vec<Option<u64>>>);
+    impl Ui for Speeds {
+        fn step(&self, step: Step) {
+            if let Step::Backup { speed, .. } = step {
+                self.0.lock().unwrap().push(speed);
+            }
+        }
+        fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool, _: &Places) -> Answer {
+            Answer::Cancel
+        }
+    }
+    let (_sim, a) = small_library();
+    let src = backup_source("speed", 3, 100_000);
+    let ui = Speeds(Mutex::new(Vec::new()));
+    a.backup(&src, "Backup S\\speed", &["LTO001L5".into()], BackupOptions::default(), &ui).unwrap();
+    let seen = ui.0.into_inner().unwrap();
+    assert_eq!(seen.first(), Some(&None), "{seen:?}");
+    assert!(seen.len() >= 3 && seen[1..].iter().all(|s| s.is_some_and(|b| b > 0)), "{seen:?}");
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// Records what a job says about damage, and answers whether a backup
+/// goes on with another tape.
+#[derive(Default)]
+struct DamageUi {
+    warnings: Mutex<Vec<IndexWarning>>,
+    failed: Mutex<Vec<(String, String)>>,
+    go_on: bool,
+}
+
+impl Ui for DamageUi {
+    fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool, _: &Places) -> Answer {
+        Answer::Cancel
+    }
+    fn index_damaged(&self, w: &IndexWarning) {
+        self.warnings.lock().unwrap().push(w.clone());
+    }
+    fn tape_failed(&self, barcode: &str, error: &str, _: u64) -> Answer {
+        self.failed.lock().unwrap().push((barcode.into(), error.into()));
+        if self.go_on {
+            Answer::Retry
+        } else {
+            Answer::Cancel
+        }
+    }
+}
+
+fn condition(a: &Archive, barcode: &str) -> Vec<lto_catalog::Condition> {
+    a.catalog.lock().unwrap().tape(barcode).unwrap().unwrap().condition
+}
+
+/// The data partition's index can't be read: the job says so, reads with
+/// the index partition's, refuses changes, and the catalog notes the tape;
+/// a catalog newer than that index isn't set back.
+#[test]
+fn a_damaged_index_is_said_and_the_other_used() {
+    use lto_catalog::Condition as C;
+    let (sim, a) = small_library();
+    let src = backup_source("dmg-index", 3, 100_000);
+    a.write("LTO001L5", &[(src.clone(), "x".into())], &NoUi, &mut |_, _| true).unwrap();
+    sim.damage_last_index("LTO001L5", 1).unwrap();
+    let ui = DamageUi::default();
+    let mut g = Got::default();
+    a.read(&[r"LTO001L5\x".into()], &mut g, &ui).unwrap();
+    assert_eq!(g.files.len(), 3, "read with the other index");
+    {
+        let w = ui.warnings.lock().unwrap();
+        assert_eq!(w.len(), 1);
+        assert_eq!((w[0].damage[0].partition, w[0].damage[0].label, w[0].partition), ('b', false, 'a'));
+        assert_eq!(w[0].catalog_generation, None, "both copies were the same generation");
+    }
+    let cond = condition(&a, "LTO001L5");
+    assert!(cond.contains(&C::Index('b')) && cond.contains(&C::Alert(4)), "{cond:?}");
+    assert!(a.take_notices().iter().any(|n| n.flag == 4 && n.barcode == "LTO001L5"));
+    assert!(a.take_notices().is_empty(), "taken once");
+    assert!(matches!(a.mkdir("LTO001L5", "new", &ui), Err(Error::Ltfs(ltfs::Error::ReadOnly(_)))));
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// A check reads every file, goes on past one that can't be read, notes
+/// the tape; a check without a fault clears what was noted.
+#[test]
+fn a_check_finds_the_files_that_cannot_be_read() {
+    use lto_catalog::Condition as C;
+    let (sim, a) = small_library();
+    let src = backup_source("verify", 4, 600_000);
+    a.write("LTO001L5", &[(src.clone(), "v".into())], &NoUi, &mut |_, _| true).unwrap();
+    let r = a.verify(&["LTO001L5".into()], &NoUi).unwrap();
+    assert_eq!((r[0].files, r[0].total_files, r[0].bad.len(), r[0].bytes), (4, 4, 0, 2_400_000));
+    assert!(condition(&a, "LTO001L5").is_empty());
+    // the second file's first block is damaged
+    let ix = a.import("LTO001L5", &NoUi).unwrap().unwrap();
+    let Some(Node::File(f)) = ix.find(r"v\sub\f01.bin").cloned() else { panic!("f01") };
+    sim.damage("LTO001L5", 1, f.extents[0].start_block as usize);
+    let steps = Mutex::new(0u32);
+    struct Count<'a>(&'a Mutex<u32>);
+    impl Ui for Count<'_> {
+        fn step(&self, s: Step) {
+            if matches!(s, Step::Verifying { .. }) {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+        fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool, _: &Places) -> Answer {
+            Answer::Cancel
+        }
+    }
+    let r = a.verify(&["LTO001L5".into()], &Count(&steps)).unwrap();
+    assert_eq!((r[0].files, r[0].bad.len()), (3, 1), "{r:?}");
+    assert!(r[0].bad[0].0.ends_with("f01.bin"), "{:?}", r[0].bad);
+    assert!(*steps.lock().unwrap() >= 4);
+    let cond = condition(&a, "LTO001L5");
+    assert!(cond.contains(&C::Read) && cond.contains(&C::Unreadable(1)) && cond.contains(&C::Alert(5)), "{cond:?}");
+    // the place is good again (another drive read it): cleared
+    sim.with_cart("LTO001L5", |c| c.damaged.clear());
+    let r = a.verify(&["LTO001L5".into()], &NoUi).unwrap();
+    assert!(r[0].bad.is_empty());
+    assert!(condition(&a, "LTO001L5").is_empty());
+    // a tape not put in is skipped
+    let r = a.verify(&["NOPE01L5".into()], &DamageUi::default());
+    assert!(matches!(r, Err(Error::NotInLibrary(_))) || r.unwrap()[0].skipped);
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// A tape that can't be written: the person goes on with the next one,
+/// and what its index doesn't hold is written there; or stops, and the
+/// report says why.
+#[test]
+fn a_backup_goes_on_after_a_tape_fails() {
+    use lto_catalog::Condition as C;
+    let (sim, a) = small_library();
+    let src = backup_source("failover", 4, 1024 * 1024);
+    // LTO001L5 fails in its second file (two 512 KiB blocks a file), and
+    // its index can't be written there either
+    let end = sim.cart("LTO001L5").unwrap().parts[1].len();
+    sim.damage("LTO001L5", 1, end + 3);
+    let ui = DamageUi { go_on: true, ..DamageUi::default() };
+    let set = r"Backup T\failover";
+    let r = a.backup(&src, set, &["LTO001L5".into(), "LTO002L5".into()], BackupOptions { archive_only: false, clear_archive: true, ..Default::default() }, &ui).unwrap();
+    assert_eq!(r.error, None, "{r:?}");
+    assert_eq!(r.failed_tapes.len(), 1);
+    assert_eq!(r.failed_tapes[0].0, "LTO001L5");
+    assert_eq!(ui.failed.lock().unwrap().len(), 1);
+    assert_eq!(r.written(), (4, 4 * 1024 * 1024), "{r:?}");
+    let got = backed_up(&a, &["LTO001L5", "LTO002L5"], set);
+    assert_eq!(got.len(), 4);
+    assert!(got.iter().all(|(_, t)| t == "LTO002L5"), "the first tape's index never held them: {got:?}");
+    assert!(condition(&a, "LTO001L5").contains(&C::Write));
+    for i in 0..4 {
+        assert!(!archive_set(&src.join(format!(r"sub\f{i:02}.bin"))).unwrap());
+    }
+    // stopping instead: the report says why
+    let src2 = backup_source("failover-stop", 2, 1024 * 1024);
+    let r = a.backup(&src2, r"Backup T\stop", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: true, ..Default::default() }, &DamageUi::default()).unwrap();
+    assert!(r.error.is_some() && !r.cancelled, "{r:?}");
+    assert_eq!(r.failed_tapes.len(), 1);
+    let _ = (fs::remove_dir_all(&src), fs::remove_dir_all(&src2));
+}
+
+/// The drive asks to be cleaned: the job's notices say so; nothing goes
+/// against the tape.
+#[test]
+fn a_drive_asking_for_cleaning_is_said() {
+    let (sim, a) = small_library();
+    sim.raise_alert(0, lto_sim::alert::CLEAN_NOW);
+    sim.raise_alert(1, lto_sim::alert::CLEAN_NOW);
+    a.import("LTO001L5", &NoUi).unwrap();
+    let n = a.take_notices();
+    assert_eq!(n.iter().map(|n| n.flag).collect::<Vec<_>>(), [20], "{n:?}");
+    assert!(condition(&a, "LTO001L5").is_empty(), "cleaning is the drive's");
 }

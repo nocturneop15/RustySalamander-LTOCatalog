@@ -13,7 +13,7 @@ pub mod xml;
 pub use index::{Dir, Extent, File, Index, Location, Node, Times};
 pub use label::Label;
 pub use time::Time;
-pub use volume::{format, probe, Error, Volume};
+pub use volume::{format, probe, Damage, Error, Volume};
 
 /// What this program writes as the creator of labels and indexes.
 pub fn creator() -> String {

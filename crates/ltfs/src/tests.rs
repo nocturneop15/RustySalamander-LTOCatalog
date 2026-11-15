@@ -150,3 +150,100 @@ fn cancelled_full_and_protected() {
     assert!(matches!(v.write_data(&mut &b"x"[..], &mut |_| true), Err(Error::ReadOnly(_))));
     assert!(matches!(format(l.drive(), "LTO003L5", "", "t"), Err(Error::ReadOnly(_))));
 }
+
+/// An index written to the data partition only (a backup's interim one):
+/// the index partition keeps the one before, mounting still finds the
+/// newer one, and the next full commit brings the index partition up to
+/// date.
+#[test]
+fn an_index_in_the_data_partition_only_counts() {
+    let (_sim, lib) = lib();
+    let mut l = lib.acquire("LTO003L5", &|| false).unwrap();
+    format(l.drive(), "LTO003L5", "", "test").unwrap();
+    let ip_generation = |d: &mut lto_scsi::tape::TapeDrive| {
+        let mut buf = vec![0u8; crate::label::BLOCK_SIZE as usize];
+        crate::volume::last_index(d, 0, &mut buf).unwrap().unwrap().1.generation
+    };
+    {
+        let mut v = Volume::mount(l.drive(), "LTO003L5", "test").unwrap();
+        let (extents, length) = v.write_data(&mut &b"synced"[..], &mut |_| true).unwrap();
+        let now = Time::now();
+        let uid = v.index.next_uid();
+        let f = File { name: "s.txt".into(), length, readonly: false, open_for_write: false, times: Times::all(now), uid, xattrs: vec![], extents, symlink: None, extra: vec![] };
+        v.index.put("", Node::File(f), now).unwrap();
+        v.sync().unwrap();
+        assert_eq!(v.index.generation, 2);
+        // the program stops here: no full commit
+    }
+    assert_eq!(ip_generation(l.drive()), 1, "the index partition wasn't written");
+    {
+        let mut v = Volume::mount(l.drive(), "LTO003L5", "test").unwrap();
+        assert_eq!(v.index.generation, 2, "the newer index, from the data partition");
+        assert_eq!(read(&mut v, "s.txt"), b"synced");
+        write(&mut v, &[("t.txt", b"committed".to_vec())]);
+    }
+    assert_eq!(ip_generation(l.drive()), 3);
+    let mut v = Volume::mount(l.drive(), "LTO003L5", "test").unwrap();
+    assert_eq!(v.index.generation, 3);
+    assert_eq!(read(&mut v, "s.txt"), b"synced");
+    assert_eq!(read(&mut v, "t.txt"), b"committed");
+}
+
+/// One partition's index damaged: the other partition's is used, the
+/// volume is read-only and says what couldn't be read; its files still read,
+/// and a damaged place in a file fails that file only.
+#[test]
+fn a_damaged_index_is_made_up_for_by_the_other() {
+    let (sim, lib) = lib();
+    let mut l = lib.acquire("LTO003L5", &|| false).unwrap();
+    format(l.drive(), "LTO003L5", "", "test").unwrap();
+    {
+        let mut v = Volume::mount(l.drive(), "LTO003L5", "test").unwrap();
+        write(&mut v, &[("a.bin", big(300_000, 1)), ("b.bin", big(300_000, 2))]);
+        assert!(v.damage.is_empty());
+    }
+    // the data partition's newest index
+    sim.damage_last_index("LTO003L5", 1).expect("an index in b");
+    {
+        let mut v = Volume::mount(l.drive(), "LTO003L5", "test").unwrap();
+        assert_eq!(v.damage.len(), 1);
+        assert_eq!((v.damage[0].partition, v.damage[0].label), ('b', false));
+        assert!(v.damage[0].error.contains("11/00") || v.damage[0].error.contains("unrecovered read error"), "{}", v.damage[0].error);
+        assert_eq!(v.index.generation, 2, "the index partition's copy is as new");
+        assert!(v.read_only.is_some());
+        assert!(matches!(v.begin_append(), Err(Error::ReadOnly(_))));
+        assert_eq!(read(&mut v, "a.bin"), big(300_000, 1));
+    }
+    // the drive raised its flags: media, read failure
+    let alerts = l.drive().tape_alerts().unwrap();
+    assert!(alerts.contains(&4) && alerts.contains(&5), "{alerts:?}");
+    assert!(l.drive().tape_alerts().unwrap().is_empty(), "cleared once read");
+    // the index partition's too: nothing to mount
+    sim.damage_last_index("LTO003L5", 0).expect("an index in a");
+    match Volume::mount(l.drive(), "LTO003L5", "test") {
+        Err(Error::Corrupt(m)) => assert!(m.contains("neither index"), "{m}"),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("mounted without an index"),
+    }
+}
+
+/// A damaged place inside a file: that file fails, the next one reads.
+#[test]
+fn a_damaged_file_fails_alone() {
+    let (sim, lib) = lib();
+    let mut l = lib.acquire("LTO004L5", &|| false).unwrap();
+    format(l.drive(), "LTO004L5", "", "test").unwrap();
+    let mut v = Volume::mount(l.drive(), "LTO004L5", "test").unwrap();
+    write(&mut v, &[("one.bin", big(200_000, 1)), ("two.bin", big(200_000, 2))]);
+    let Some(Node::File(one)) = v.index.find("one.bin").cloned() else { panic!() };
+    let Some(Node::File(two)) = v.index.find("two.bin").cloned() else { panic!() };
+    sim.damage("LTO004L5", 1, one.extents[0].start_block as usize);
+    assert!(v.read_file(&one, &mut |_| Ok(true)).is_err());
+    let mut out = Vec::new();
+    v.read_file(&two, &mut |b| {
+        out.extend_from_slice(b);
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(out, big(200_000, 2));
+}

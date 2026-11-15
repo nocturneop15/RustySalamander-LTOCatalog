@@ -46,17 +46,25 @@ files:
   mv <barcode>\\<path> <new path>
   rm <barcode>\\<path>
   format <barcode> [--name <volume name>]  ERASES the tape, makes it an empty LTFS volume
-  backup <folder> [<barcode>...] [--archive-only] [--keep-archive]
+  verify <barcode>...        read every file of the tapes, to find what can't be read
+                             (nothing is written; a tape read without a fault is no longer
+                             noted as damaged)
+  backup <folder> [<barcode>...] [--archive-only] [--keep-archive] [--index data|both]
                              back up a folder into \"Backup <date> <time>\\<folder>\" on the tapes
                              (in barcode order, then new ones asked for); --archive-only: only
-                             files with the Archive attribute; --keep-archive: don't clear it
+                             files with the Archive attribute; --keep-archive: don't clear it;
+                             --index: the index written every 100 GB goes to the end of the data
+                             only (data), or into the index partition too (both); default: as in
+                             the plugin's Library settings, else data
 
 options:
   --program <folder> the RustySalamander folder (with rustysalamander.exe): use the plugin's
                      catalog and library settings, wherever the program keeps them (its folder,
-                     or %APPDATA% in multi-user mode). Default: ltocat's own folder, when
-                     rustysalamander.exe is there.
+                     or %APPDATA% in multi-user mode). Default: the program ltocat is
+                     installed in (plugins\\ltocatalog, or next to rustysalamander.exe).
   --catalog <file>   this catalog instead
+  --log <file>       write the detailed log there (default: ltocat.log in the plugin's data
+                     folder, unless the log is turned off in the plugin's Library settings)
   --changer <list>   changers, comma-separated: \\\\.\\Changer0 or scsi:<port>:<bus>:<target>:<lun>
                      (default: every one found)
   --drives <list>    tape drives, comma-separated: \\\\.\\Tape0,\\\\.\\Tape1 (default: all)
@@ -68,6 +76,8 @@ options:
 
 simulation only:
   sim-move <barcode> drive<N>|mail<N>|shelf   move a tape by hand (a new one if it's nowhere)
+  sim-damage <barcode> a|b [<record>]         damage a tape: that record of the partition, or
+                                              the start of the partition's last index
 ";
 
 struct Opts {
@@ -84,6 +94,8 @@ struct Opts {
     name: String,
     archive_only: bool,
     keep_archive: bool,
+    interim_index: Option<lto_archive::InterimIndex>,
+    log: Option<PathBuf>,
     args: Vec<String>,
 }
 
@@ -105,6 +117,8 @@ fn parse() -> Result<Opts, String> {
         name: String::new(),
         archive_only: false,
         keep_archive: false,
+        interim_index: None,
+        log: None,
         args: Vec::new(),
     };
     let mut program: Option<PathBuf> = None;
@@ -124,6 +138,14 @@ fn parse() -> Result<Opts, String> {
             "--rescan" => o.rescan = true,
             "--archive-only" => o.archive_only = true,
             "--keep-archive" => o.keep_archive = true,
+            "--log" => o.log = Some(PathBuf::from(val("--log")?)),
+            "--index" => {
+                o.interim_index = Some(match val("--index")?.to_ascii_lowercase().as_str() {
+                    "data" => lto_archive::InterimIndex::DataPartition,
+                    "both" => lto_archive::InterimIndex::BothPartitions,
+                    v => return Err(format!("--index is data or both, not {v}")),
+                })
+            }
             "-h" | "--help" | "help" => {
                 print!("{HELP}");
                 std::process::exit(0);
@@ -137,7 +159,7 @@ fn parse() -> Result<Opts, String> {
         std::process::exit(0);
     }
     // the plugin's catalog and library settings, from RustySalamander's folder
-    let own = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).filter(|d| place::is_program_dir(d));
+    let own = std::env::current_exe().ok().and_then(|e| e.parent().and_then(place::program_of_ltocat));
     if let Some(dir) = program.or(own) {
         if !place::is_program_dir(&dir) {
             return Err(format!("{} has no {}", dir.display(), place::PROGRAM_EXE));
@@ -150,6 +172,10 @@ fn parse() -> Result<Opts, String> {
         }
         if o.drives.is_empty() {
             o.drives = list(&s.drives);
+        }
+        o.interim_index.get_or_insert(lto_archive::InterimIndex::from_key(&s.backup_index));
+        if s.log_on() && o.log.is_none() {
+            o.log = Some(place::ltocat_log_file(&data));
         }
     }
     Ok(o)
@@ -232,8 +258,16 @@ impl Ui for Console {
             S::Reading(b, p) => format!("{b}: reading {p}"),
             S::Writing(b, p) => format!("{b}: writing {p}"),
             S::WritingIndex(b) => format!("{b}: writing its index"),
-            S::Backup { tape, files, bytes } => format!("{tape}: backing up, {} of {} files, {} of {}", files.0, files.1, size(bytes.0), size(bytes.1)),
+            S::Backup { tape, files, bytes, speed } => format!(
+                "{tape}: backing up, {} of {} files, {} of {}{}",
+                files.0,
+                files.1,
+                size(bytes.0),
+                size(bytes.1),
+                speed.map(|s| format!(", average {}/s", size(s))).unwrap_or_default()
+            ),
             S::NewTape => "waiting for a new tape in the mail slot".to_owned(),
+            S::Verifying { tape, files, bytes } => format!("{tape}: checking, {} of {} files, {} of {}", files.0, files.1, size(bytes.0), size(bytes.1)),
         };
         eprintln!("... {text}");
     }
@@ -277,6 +311,31 @@ impl Ui for Console {
             Answer::Retry
         }
     }
+    fn index_damaged(&self, w: &lto_archive::IndexWarning) {
+        println!("WARNING: part of tape {} can't be read:", w.barcode);
+        for d in &w.damage {
+            println!("  the {} in partition {}: {}", if d.label { "label" } else { "index" }, d.partition, d.error);
+        }
+        println!(
+            "  Its index is read from the other copy, in partition {} (generation {}, written {}); the tape is used read-only.",
+            w.partition,
+            w.generation,
+            w.written.format()
+        );
+        if let Some(g) = w.catalog_generation {
+            println!("  The catalog lists generation {g}: files written after generation {} can't be read from the tape.", w.generation);
+        }
+        println!("  Copy its files onto another tape and stop using it (ltocat verify finds the files that can't be read).");
+    }
+    fn tape_failed(&self, barcode: &str, error: &str, left: u64) -> Answer {
+        println!("Tape {barcode} failed: {error}");
+        let a = ask(&format!("{} is still to back up. Go on with another tape? [Y/n]", size(left)));
+        if a.eq_ignore_ascii_case("n") || a.eq_ignore_ascii_case("q") {
+            Answer::Cancel
+        } else {
+            Answer::Retry
+        }
+    }
     fn confirm_format(&self, barcode: &str) -> Answer {
         let a = ask(&format!("Tape {barcode} isn't an LTFS volume. Type its barcode to format it (ERASES it) and use it, s for another tape, q to stop:"));
         if a.eq_ignore_ascii_case(barcode) {
@@ -285,6 +344,15 @@ impl Ui for Console {
             Answer::Cancel
         } else {
             Answer::Skip
+        }
+    }
+}
+
+/// What the drives reported during the job (TapeAlert).
+fn print_notices(a: &Archive) {
+    for n in a.take_notices() {
+        if let Some(al) = lto_scsi::tapealert::describe(n.flag) {
+            println!("{} (tape {}) reported TapeAlert {}: {}", n.drive, n.barcode, n.flag, al.text);
         }
     }
 }
@@ -370,6 +438,10 @@ fn print_tapes(tapes: &[Tape]) {
         };
         let note = if t.note.is_empty() { String::new() } else { format!(" / {}", t.note) };
         println!("{:<10} {:<12} {:>8} {:>10} {:>10} {:>5}  {kind}{note}", t.barcode, wh, t.files, size(t.bytes), free, t.generation);
+        if !t.condition.is_empty() {
+            let when = t.condition_time.map(|c| format!(" (noted {})", &c.format()[..10])).unwrap_or_default();
+            println!("           DAMAGED{when}: {}", t.condition.iter().map(|c| c.text()).collect::<Vec<_>>().join("; "));
+        }
     }
 }
 
@@ -534,6 +606,7 @@ fn run(o: &Opts) -> Result<(), String> {
                     Err(err) => println!("{b}: {err}"),
                 }
             }
+            print_notices(&a);
             Ok(())
         }
         "index" => {
@@ -583,7 +656,9 @@ fn run(o: &Opts) -> Result<(), String> {
             let a = archive(o)?;
             let mut sink = ToFolder { root: PathBuf::from(&o.args[2]), file: None, done: 0, started: Instant::now() };
             fs::create_dir_all(&sink.root).map_err(|e| e.to_string())?;
-            a.read(&[o.args[1].clone()], &mut sink, &Console).map_err(e)?;
+            let r = a.read(&[o.args[1].clone()], &mut sink, &Console);
+            print_notices(&a);
+            r.map_err(e)?;
             let secs = sink.started.elapsed().as_secs_f64().max(0.001);
             println!("{} in {secs:.0} s ({}/s)", size(sink.done), size((sink.done as f64 / secs) as u64));
             Ok(())
@@ -644,18 +719,27 @@ fn run(o: &Opts) -> Result<(), String> {
             Ok(())
         }
         "backup" => {
-            need(o, 1, "backup <folder> [<barcode>...] [--archive-only] [--keep-archive]")?;
+            need(o, 1, "backup <folder> [<barcode>...] [--archive-only] [--keep-archive] [--index data|both]")?;
             let src = PathBuf::from(&o.args[1]);
             let tapes: Vec<String> = o.args[2..].iter().map(|b| b.to_uppercase()).collect();
             let set = lto_archive::backup_set_name(&src);
-            let opts = lto_archive::BackupOptions { archive_only: o.archive_only, clear_archive: !o.keep_archive };
-            let r = archive(o)?.backup(&src, &set, &tapes, opts, &Console).map_err(e)?;
+            let opts = lto_archive::BackupOptions { archive_only: o.archive_only, clear_archive: !o.keep_archive, interim_index: o.interim_index.unwrap_or_default() };
+            let a = archive(o)?;
+            let r = a.backup(&src, &set, &tapes, opts, &Console);
+            print_notices(&a);
+            let r = r.map_err(e)?;
             if r.total_files == 0 && opts.archive_only {
                 println!("Nothing to back up: no file in {} has the Archive attribute set.", src.display());
                 return Ok(());
             }
             let (files, bytes) = r.written();
+            if let Some(err) = &r.error {
+                println!("The backup stopped: {err}");
+            }
             println!("{}{files} of {} files ({}) backed up into \"{set}\".", if r.cancelled { "Cancelled. " } else { "" }, r.total_files, size(bytes));
+            for (b, why) in &r.failed_tapes {
+                println!("tape failed, noted as damaged: {b}: {why}");
+            }
             for t in &r.tapes {
                 println!("  {}: {} files, {}", t.barcode, t.files, size(t.bytes));
             }
@@ -668,6 +752,42 @@ fn run(o: &Opts) -> Result<(), String> {
             for p in &r.not_cleared {
                 println!("Archive attribute left set: {}", p.display());
             }
+            Ok(())
+        }
+        "verify" => {
+            need(o, 1, "verify <barcode>...")?;
+            let a = archive(o)?;
+            let reports = a.verify(&o.args[1..], &Console);
+            print_notices(&a);
+            for r in reports.map_err(e)? {
+                if r.skipped {
+                    println!("{}: skipped", r.barcode);
+                    continue;
+                }
+                println!("{}: {} of {} files read ({}), {} can't be read", r.barcode, r.files, r.total_files, size(r.bytes), r.bad.len());
+                for (p, why) in &r.bad {
+                    println!("  can't be read: {p}: {why}");
+                }
+                if let Some(err) = &r.error {
+                    println!("  the check stopped: {err}");
+                }
+                if r.damaged_index {
+                    println!("  one copy of its index can't be read");
+                }
+            }
+            Ok(())
+        }
+        "sim-damage" => {
+            need(o, 2, "sim-damage <barcode> a|b [<record>]")?;
+            let site = sim(o).map_err(|e| e.to_string())?.ok_or("sim-damage works on simulated devices only (--sim <file>)")?;
+            let part = match o.args[2].as_str() {
+                "a" => 0,
+                "b" => 1,
+                other => return Err(format!("partition a or b, not {other}")),
+            };
+            let record = o.args.get(3).map(|r| r.parse::<usize>().map_err(|_| format!("{r} isn't a record number"))).transpose()?;
+            let at = site.damage(&o.args[1], part, record)?;
+            println!("{} is damaged at record {at} of partition {}.", o.args[1].to_uppercase(), o.args[2]);
             Ok(())
         }
         "sim-move" => {
@@ -689,8 +809,22 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(m) = run(&o) {
+    if let Some(file) = &o.log {
+        match lto_scsi::log::open(file) {
+            Ok(()) => lto_scsi::log!(
+                "ltocat {}: {}",
+                env!("CARGO_PKG_VERSION"),
+                std::env::args().skip(1).map(|a| if a.is_empty() || a.contains(' ') { format!("\"{a}\"") } else { a }).collect::<Vec<_>>().join(" ")
+            ),
+            Err(e) => eprintln!("ltocat: the log {} can't be written: {e}", file.display()),
+        }
+    }
+    let r = run(&o);
+    lto_scsi::log::flush_counts();
+    if let Err(m) = r {
+        lto_scsi::log!("ltocat failed: {m}");
         eprintln!("ltocat: {m}");
         std::process::exit(1);
     }
+    lto_scsi::log!("ltocat done");
 }

@@ -107,6 +107,23 @@ pub fn ask(windows: &Windows, look: Values, title: String, text: String, detail:
     rx.recv().ok()
 }
 
+/// A warning with OK, in a modal window: the program's window takes no
+/// input until it is closed. `wait`: return once it is closed (a job goes
+/// on only after it was read); else at once. False when the program can't
+/// show the plugin's windows.
+pub fn warn(windows: &Windows, look: Values, title: String, text: String, detail: String, wait: bool) -> bool {
+    let (tx, rx) = channel();
+    let buttons = vec![sal_plugin_api::tr("OK")];
+    let make: sal_window::Make = Box::new(move || Box::new(AskWin { title, text, detail, buttons, default: 0, dismiss: 0, tx: Some(tx), dialog_set: false }));
+    if windows.open_modal(make, look).is_err() {
+        return false;
+    }
+    if wait {
+        let _ = rx.recv();
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

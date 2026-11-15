@@ -19,9 +19,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lto_archive::{Answer, Archive, BackupOptions, BackupReport, NewTapeProblem, ReadSink, Step, Ui};
-use lto_catalog::{Catalog, Tape};
+use lto_archive::{Answer, Archive, BackupOptions, BackupReport, IndexWarning, InterimIndex, NewTapeProblem, ReadSink, Step, Ui, VerifyReport};
+use lto_catalog::{Catalog, Condition, Tape};
 use lto_scsi::library::Devices;
+use lto_scsi::log;
 use ltfs::names::{from_windows, safe_relative, to_windows};
 use ltfs::Time;
 use lto_catalog::place::{self, Settings};
@@ -61,6 +62,8 @@ pub struct LtoCatalog {
     /// Catalog searches, by their connection's authority (`search-3`).
     searches: Mutex<BTreeMap<String, Arc<Vec<Found>>>>,
     next_search: std::sync::atomic::AtomicUsize,
+    /// The warnings shown (their text), newest last: for the tests.
+    warned: Mutex<Vec<String>>,
 }
 
 /// The state of the command [`LtoCatalog::run`] is running.
@@ -94,9 +97,61 @@ fn step_text(step: Step) -> String {
         Step::Reading(b, p) => trf("{barcode}: reading {path}", &[("barcode", &b), ("path", &to_inner(p))]),
         Step::Writing(b, p) => trf("{barcode}: writing {path}", &[("barcode", &b), ("path", &to_inner(p))]),
         Step::WritingIndex(b) => trf("{barcode}: writing its index…", &[("barcode", &b)]),
-        Step::Backup { tape, files, bytes } => trf("{barcode}: backing up, {n} of {total} files, {done} of {all}…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1))]),
+        Step::Backup { tape, files, bytes, speed: None } => trf("{barcode}: backing up, {n} of {total} files, {done} of {all}…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1))]),
+        Step::Backup { tape, files, bytes, speed: Some(s) } => trf("{barcode}: backing up, {n} of {total} files, {done} of {all}, average {speed}/s…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1)), ("speed", &size_text(s))]),
         Step::NewTape => tr("waiting for a new tape in the mail slot…"),
+        Step::Verifying { tape, files, bytes } => trf("{barcode}: checking, {n} of {total} files, {done} of {all}…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1))]),
     }
+}
+
+/// What TapeAlert flag `flag` means, for people.
+fn alert_text(flag: u8) -> String {
+    match flag {
+        1 => tr("the drive has severe trouble reading this tape"),
+        2 => tr("the drive has severe trouble writing this tape"),
+        3 => tr("an error that couldn't be recovered while reading, writing or positioning"),
+        4 => tr("the tape is damaged, or the drive is faulty: copy the data off it"),
+        5 => tr("read failure: the tape is damaged, or the drive is faulty"),
+        6 => tr("write failure: the tape is damaged, or the drive is faulty"),
+        7 => tr("the tape has reached the end of its life: copy the data onto another tape"),
+        8 => tr("the tape isn't data grade"),
+        15 => tr("the cartridge memory chip has failed"),
+        18 | 51 => tr("the tape's directory is damaged: reading may be slow"),
+        19 => tr("the tape is nearing the end of its life"),
+        20 => tr("the drive needs cleaning now"),
+        21 => tr("the drive is due for its routine cleaning"),
+        22 => tr("the cleaning cartridge is used up"),
+        23 => tr("the cleaning cartridge isn't a valid one"),
+        30 => tr("the drive has a hardware fault: switch it off and on again"),
+        31 | 39 => tr("the drive has a hardware fault: run its diagnostics"),
+        38 => tr("the drive predicts that it will fail"),
+        52 | 53 => tr("the tape's system area is damaged"),
+        55 | 56 => tr("the tape couldn't be loaded or unloaded"),
+        f => match lto_scsi::tapealert::describe(f) {
+            Some(a) => trf("TapeAlert {n}: {text}", &[("n", &f), ("text", &a.text)]),
+            None => trf("TapeAlert {n}", &[("n", &f)]),
+        },
+    }
+}
+
+/// What the catalog holds against a tape, for people.
+fn condition_text(c: &Condition) -> String {
+    match c {
+        Condition::Index(p) => trf("its index in partition {partition} can't be read", &[("partition", p)]),
+        Condition::Read => tr("reading it failed"),
+        Condition::Write => tr("writing it failed"),
+        Condition::Alert(f) => alert_text(*f),
+        Condition::Unreadable(n) => trf("{n} files can't be read", &[("n", n)]),
+    }
+}
+
+/// "Damaged: …" for a tape the catalog holds something against; empty if
+/// nothing.
+fn damaged_text(t: &Tape) -> String {
+    if t.condition.is_empty() {
+        return String::new();
+    }
+    trf("Damaged: {what}", &[("what", &t.condition.iter().map(condition_text).collect::<Vec<_>>().join("; "))])
 }
 
 export_plugin!(LtoCatalog);
@@ -122,6 +177,47 @@ fn devices(data: &Path, s: &Settings) -> Result<Box<dyn Devices>, String> {
         return lto_sim::SimSite::persistent(&file, libraries, drives).map(|l| Box::new(l) as Box<dyn Devices>).map_err(|e| format!("{}: {e}", file.display()));
     }
     Ok(Box::new(lto_scsi::windows::WindowsDevices { changers: list(&s.changer), drives: list(&s.drives) }))
+}
+
+/// Start or stop the detailed log, as the settings say.
+fn apply_log(data: &Path, s: &Settings) {
+    if !s.log_on() {
+        if lto_scsi::log::enabled() {
+            log!("the log is turned off in Library settings");
+        }
+        lto_scsi::log::close();
+        return;
+    }
+    let file = place::log_file(data);
+    if lto_scsi::log::path().as_deref() == Some(file.as_path()) {
+        return;
+    }
+    if lto_scsi::log::open(&file).is_ok() {
+        log!(
+            "LTO Catalog {} (interface {}), settings: changers {}, drives {}, catalog \"{}\", backup index {}",
+            env!("CARGO_PKG_VERSION"),
+            sal_plugin_api::abi::VERSION,
+            if s.changer.trim().is_empty() { "every one found" } else { s.changer.trim() },
+            if s.drives.trim().is_empty() { "all" } else { s.drives.trim() },
+            s.catalog_path(data).display(),
+            lto_archive::InterimIndex::from_key(&s.backup_index).key()
+        );
+    }
+}
+
+/// What a command was given, for the log: the fields of the forms, not the
+/// program's look.
+fn logged_input(input: &Values) -> String {
+    const FIELDS: [&str; 22] = [
+        "folder", "what", "clear", "barcode", "barcodes", "confirm", "name", "note", "which", "catalog", "changer", "drives", "backup_index", "log", "selected", "other", "match", "query",
+        "tape", "path", "rescan", "items",
+    ];
+    input
+        .iter()
+        .filter(|(k, _)| FIELDS.contains(&k.as_str()) || k.starts_with("tape:"))
+        .map(|(k, v)| format!("{k}={v:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn open_archive(data: &Path, s: &Settings) -> Result<Archive, String> {
@@ -150,6 +246,7 @@ impl Plugin for LtoCatalog {
         // its own folder, or %APPDATA% in multi-user mode (lto_catalog::place)
         let data = sal_plugin_api::data_dir(dir);
         let settings = Settings::load(&place::settings_file(&data));
+        apply_log(&data, &settings);
         let archive = open_archive(&data, &settings)?;
         Ok(LtoCatalog::with(data, settings, archive, None))
     }
@@ -167,6 +264,7 @@ impl LtoCatalog {
             cmd: CommandState::default(),
             searches: Mutex::new(BTreeMap::new()),
             next_search: std::sync::atomic::AtomicUsize::new(0),
+            warned: Mutex::new(Vec::new()),
         }
     }
 
@@ -270,6 +368,10 @@ impl LtoCatalog {
             if t.is_ltfs() && !t.name.is_empty() {
                 detail.push(trf("Volume: {name}", &[("name", &t.name)]));
             }
+            let damaged = damaged_text(t);
+            if !damaged.is_empty() {
+                detail.push(damaged);
+            }
         }
         let mut buttons = vec![tr("Retry")];
         if skip {
@@ -309,6 +411,75 @@ impl LtoCatalog {
 
     /// The new tape for a backup isn't an LTFS volume: format it? Enter
     /// takes the safe answer, another tape.
+    /// A backup's tape failed: go on with another one?
+    fn ask_tape_failed(&self, barcode: &str, error: &str, left: u64) -> Answer {
+        let text = trf("Tape {barcode} failed: {error}", &[("barcode", &barcode), ("error", &error)]);
+        let detail = trf("{size} is still to back up. What its last index holds is safe on the tape; the rest is written onto the next tape. The tape is noted as damaged in the catalog.", &[("size", &size_text(left))]);
+        let look = self.look.lock().unwrap().clone();
+        match ask::ask(&self.asks, look, tr("Back up a folder"), text, detail, vec![tr("Go on with another tape"), tr("Stop the backup")], 0, 1) {
+            Some(0) => Answer::Retry,
+            _ => Answer::Cancel,
+        }
+    }
+
+    /// A warning in a modal window; `wait`: until it is closed.
+    fn warn(&self, title: String, text: String, detail: String, wait: bool) {
+        log!("warning: {text} {detail}");
+        self.warned.lock().unwrap().push(format!("{text}\n{detail}"));
+        let look = self.look.lock().unwrap().clone();
+        ask::warn(&self.asks, look, title, text, detail, wait);
+    }
+
+    /// A tape's index can't be read in one partition: said before the job
+    /// goes on with the other partition's.
+    fn warn_index(&self, w: &IndexWarning) {
+        let time = w.written.format()[..19].replace('T', " ");
+        let what = [("barcode", &w.barcode as &dyn std::fmt::Display), ("partition", &w.partition), ("generation", &w.generation), ("time", &time)];
+        let text = trf("Part of tape {barcode} can't be read. Its index was read from the other copy, in partition {partition} (generation {generation}, written {time}). The tape is used read-only: nothing is written onto it.", &what);
+        let mut detail: Vec<String> = w
+            .damage
+            .iter()
+            .map(|d| {
+                if d.label {
+                    trf("Not readable: the label in partition {partition} ({error}).", &[("partition", &d.partition), ("error", &d.error)])
+                } else {
+                    trf("Not readable: the index in partition {partition} ({error}).", &[("partition", &d.partition), ("error", &d.error)])
+                }
+            })
+            .collect();
+        if let Some(g) = w.catalog_generation {
+            detail.push(trf("The catalog lists generation {catalog} of the tape: files written after generation {generation} are listed, but can't be read from it.", &[("catalog", &g), ("generation", &w.generation)]));
+        }
+        detail.push(tr("Copy its files onto another tape and stop using it. Plugins → Check tapes… finds the files that can't be read."));
+        self.warn(tr("Damaged tape"), text, detail.join("\n"), true);
+    }
+
+    /// What the drives reported since this was last asked, for people;
+    /// empty if nothing.
+    fn notices_text(&self) -> String {
+        let notices = self.archive().take_notices();
+        if notices.is_empty() {
+            return String::new();
+        }
+        let mut lines = vec![tr("The tape drives reported:")];
+        for n in notices {
+            let line = trf("{drive} (tape {barcode}): {alert}", &[("drive", &n.drive), ("barcode", &n.barcode), ("alert", &alert_text(n.flag))]);
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// What the drives reported during a file operation, in a modal window
+    /// (the operation doesn't wait for it).
+    fn show_notices(&self) {
+        let text = self.notices_text();
+        if !text.is_empty() {
+            self.warn(tr("Tape drives"), text, String::new(), false);
+        }
+    }
+
     fn ask_format(&self, barcode: &str) -> Answer {
         let text = trf("Tape {barcode} isn't an LTFS volume: it is blank, or in another format. Format it for this backup? Anything on it is erased.", &[("barcode", &barcode)]);
         let look = self.look.lock().unwrap().clone();
@@ -403,16 +574,33 @@ impl Ui for JobUi<'_> {
         self.plugin.say(step_text(step));
     }
     fn new_tape(&self, left: u64, places: &Places, problem: Option<NewTapeProblem>) -> Answer {
-        self.plugin.ask_new_tape(left, places, problem)
+        let a = self.plugin.ask_new_tape(left, places, problem);
+        let why = match problem {
+            None => "the tapes are full".to_owned(),
+            Some(NewTapeProblem::NothingNew) => "no new tape showed up".to_owned(),
+            Some(NewTapeProblem::HasData(b)) => format!("{b} holds files"),
+        };
+        log!("asked for a new tape ({why}; {} left to write): {a:?}", lto_scsi::log::bytes(left));
+        a
     }
     fn confirm_format(&self, barcode: &str) -> Answer {
-        self.plugin.ask_format(barcode)
+        let a = self.plugin.ask_format(barcode);
+        log!("asked whether to format {barcode}: {a:?}");
+        a
     }
     fn missing_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool, places: &Places) -> Answer {
         let a = self.plugin.ask_tape(barcode, tape, skip, places);
         if a == Answer::Cancel {
             self.cancelled.store(true, Ordering::Relaxed);
         }
+        a
+    }
+    fn index_damaged(&self, w: &IndexWarning) {
+        self.plugin.warn_index(w);
+    }
+    fn tape_failed(&self, barcode: &str, error: &str, left: u64) -> Answer {
+        let a = self.plugin.ask_tape_failed(barcode, error, left);
+        log!("asked whether to go on after {barcode} failed: {a:?}");
         a
     }
 }
@@ -442,6 +630,7 @@ fn not_ours() -> io::Error {
 
 /// A job's error as the program shows it.
 fn io_err(e: lto_archive::Error) -> io::Error {
+    log!("error: {e}");
     use lto_archive::Error as E;
     use io::ErrorKind as K;
     let (kind, msg) = match e {
@@ -452,6 +641,13 @@ fn io_err(e: lto_archive::Error) -> io::Error {
         E::StaleCatalog(b) => (
             K::Other,
             trf("The catalog of tape {barcode} was out of date and has been updated from the tape. Nothing was changed; check the files and try again.", &[("barcode", &b)]),
+        ),
+        E::OtherVolume { barcode, belongs_to, .. } => (
+            K::InvalidData,
+            match belongs_to {
+                Some(other) => trf("The tape loaded as {barcode} holds tape {other}'s LTFS volume. Nothing was written and the catalog wasn't changed. Run Inventory the libraries and drives, and check which tape is where.", &[("barcode", &barcode), ("other", &other)]),
+                None => trf("The tape loaded as {barcode} holds another LTFS volume than the catalog has for it. Nothing was written and the catalog wasn't changed. Run Inventory the libraries and drives; if the tape was formatted by another program, import it.", &[("barcode", &barcode)]),
+            },
         ),
         E::Missing(list) => (K::NotFound, trf("Not on the tape: {items}", &[("items", &list.iter().map(|p| to_inner(p)).collect::<Vec<_>>().join(", "))])),
         E::Skipped(list) => (K::Other, trf("These tapes were skipped, their files weren't copied: {tapes}", &[("tapes", &list.join(", "))])),
@@ -577,11 +773,13 @@ fn chosen_tapes(values: &Values) -> Vec<String> {
 
 /// What a backup did, for people: the first lines of each kind of problem.
 fn backup_report(r: &BackupReport, opts: BackupOptions) -> String {
-    if r.total_files == 0 && opts.archive_only {
+    if r.total_files == 0 && r.total_folders == 0 && opts.archive_only {
         return tr("Nothing to back up: no file in the folder has the Archive attribute set.");
     }
     let (files, bytes) = r.written();
-    let mut lines = vec![if r.cancelled {
+    let mut lines = vec![if let Some(e) = &r.error {
+        trf("The backup stopped: {error}\n{files} of {total} files ({size}) were backed up into \"{set}\" before; they are on the tapes.", &[("error", e), ("files", &files), ("total", &r.total_files), ("size", &size_text(bytes)), ("set", &r.set)])
+    } else if r.cancelled {
         trf("Cancelled. {files} of {total} files ({size}) were backed up into \"{set}\" before; they are on the tapes.", &[("files", &files), ("total", &r.total_files), ("size", &size_text(bytes)), ("set", &r.set)])
     } else {
         trf("{files} files ({size}) backed up into \"{set}\".", &[("files", &files), ("size", &size_text(bytes)), ("set", &r.set)])
@@ -600,9 +798,40 @@ fn backup_report(r: &BackupReport, opts: BackupOptions) -> String {
             lines.push(trf("… and {n} more", &[("n", &(items.len() - 20))]));
         }
     };
+    list(trf("Tapes that failed, noted as damaged in the catalog ({n}):", &[("n", &r.failed_tapes.len())]), r.failed_tapes.iter().map(|(b, why)| format!("{b}: {why}")).collect());
     list(trf("Left out, larger than a whole tape ({n}):", &[("n", &r.too_big.len())]), r.too_big.iter().map(|p| p.display().to_string()).collect());
     list(trf("Couldn't be read ({n}):", &[("n", &r.unreadable.len())]), r.unreadable.iter().map(|(p, why)| format!("{}: {why}", p.display())).collect());
     list(trf("Archive attribute left set: changed while backed up, or it can't be changed ({n}):", &[("n", &r.not_cleared.len())]), r.not_cleared.iter().map(|p| p.display().to_string()).collect());
+    lines.join("\n")
+}
+
+/// What a check of tapes found, for people.
+fn verify_report(reports: &[VerifyReport]) -> String {
+    let mut lines = Vec::new();
+    for r in reports {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        if r.skipped {
+            lines.push(trf("{barcode}: skipped, it wasn't put in.", &[("barcode", &r.barcode)]));
+            continue;
+        }
+        if r.bad.is_empty() && r.error.is_none() {
+            lines.push(trf("{barcode}: all {n} files read ({size}); nothing is wrong.", &[("barcode", &r.barcode), ("n", &r.files), ("size", &size_text(r.bytes))]));
+        } else if !r.bad.is_empty() {
+            lines.push(trf("{barcode}: {bad} of {total} files can't be read; the others were read. Copy what can be read onto another tape.", &[("barcode", &r.barcode), ("bad", &r.bad.len()), ("total", &r.total_files)]));
+            lines.extend(r.bad.iter().take(20).map(|(p, why)| format!("  {}: {why}", to_inner(p))));
+            if r.bad.len() > 20 {
+                lines.push(trf("… and {n} more", &[("n", &(r.bad.len() - 20))]));
+            }
+        }
+        if let Some(e) = &r.error {
+            lines.push(trf("{barcode}: the check stopped after {n} of {total} files: {error}", &[("barcode", &r.barcode), ("n", &r.files), ("total", &r.total_files), ("error", e)]));
+        }
+        if r.damaged_index {
+            lines.push(trf("{barcode}: one copy of its index can't be read; it is used read-only.", &[("barcode", &r.barcode)]));
+        }
+    }
     lines.join("\n")
 }
 
@@ -628,6 +857,11 @@ fn tape_label(t: &Tape) -> String {
         }
         label.push_str("  ·  ");
         label.push_str(&trf("Note: {note}", &[("note", &n)]));
+    }
+    let damaged = damaged_text(t);
+    if !damaged.is_empty() {
+        label.push_str("  ·  ⚠ ");
+        label.push_str(&damaged);
     }
     label
 }
@@ -845,11 +1079,63 @@ impl LtoCatalog {
         if let Some(bad) = list.iter().find(|b| !barcode_ok(b)) {
             return Err(bad_barcode(bad));
         }
-        let opts = BackupOptions { archive_only: values.get("what").is_some_and(|w| w == "archive"), clear_archive: values.get("clear").is_some_and(|c| !c.is_empty()) };
+        let opts = BackupOptions {
+            archive_only: values.get("what").is_some_and(|w| w == "archive"),
+            clear_archive: values.get("clear").is_some_and(|c| !c.is_empty()),
+            interim_index: InterimIndex::from_key(&self.settings.lock().unwrap().backup_index),
+        };
         let set = lto_archive::backup_set_name(&src);
         let ui = self.command_ui();
-        let r = self.archive().backup(&src, &set, &list, opts, &ui).map_err(io_err)?;
-        Ok(Reply::Message(backup_report(&r, opts)))
+        // the backup ends with its report, whatever happened; one that
+        // couldn't start says why the same way
+        match self.archive().backup(&src, &set, &list, opts, &ui) {
+            Ok(r) => Ok(Reply::Message(backup_report(&r, opts))),
+            Err(e) => Ok(Reply::Message(trf("The backup didn't start: {error}", &[("error", &io_err(e).to_string())]))),
+        }
+    }
+
+    /// The tapes to check: those in the libraries and drives with an LTFS
+    /// volume (those selected in the panel ticked), and a barcode for another.
+    fn cmd_verify_form(&self, values: &Values) -> io::Result<Reply> {
+        let chosen = chosen_tapes(values);
+        let mut fields = vec![note(tr("Every file of the ticked tapes is read, to find what can't be. Nothing is written, and the data read is thrown away; a full tape takes hours. A tape read without a fault is no longer noted as damaged."))];
+        let a = self.archive();
+        match a.inventory(false) {
+            Ok(_) => {
+                let tapes = a.catalog.lock().unwrap().tapes().map_err(|e| io::Error::other(e.to_string()))?;
+                let usable: Vec<&Tape> = tapes.iter().filter(|t| t.in_library() && t.is_ltfs() && !is_cleaning(&t.barcode)).collect();
+                if usable.is_empty() {
+                    fields.push(note(tr("No LTFS tape is in a library or drive now.")));
+                }
+                for t in usable {
+                    let ticked = if chosen.contains(&t.barcode.to_uppercase()) { "1" } else { "" };
+                    fields.push(field(&format!("tape:{}", t.barcode), tape_label(t), FieldKind::Check, ticked));
+                }
+            }
+            Err(e) => fields.push(note(io_err(e).to_string())),
+        }
+        let listed = |b: &String| fields.iter().any(|f| f.id == format!("tape:{b}"));
+        let other = chosen.iter().find(|b| !listed(b)).cloned().unwrap_or_default();
+        fields.push(field("barcode", tr("Another tape (barcode)"), FieldKind::Text, &other));
+        Ok(Reply::Form(Form { title: tr("Check tapes"), ok: tr("Check"), command: "verify_do".into(), fields }))
+    }
+
+    fn cmd_verify(&self, values: &Values) -> io::Result<Reply> {
+        let mut list: Vec<String> = values.iter().filter(|(k, v)| k.starts_with("tape:") && !v.is_empty()).map(|(k, _)| k[5..].to_uppercase()).collect();
+        if let Some(bad) = list.iter().find(|b| !barcode_ok(b)) {
+            return Err(bad_barcode(bad));
+        }
+        let typed = typed_barcode(values, "barcode")?;
+        if !typed.is_empty() && !list.contains(&typed) {
+            list.push(typed);
+        }
+        list.sort();
+        if list.is_empty() {
+            return Ok(Reply::Message(tr("Nothing was done: no tape was ticked or typed.")));
+        }
+        let ui = self.command_ui();
+        let reports = self.archive().verify(&list, &ui).map_err(io_err)?;
+        Ok(Reply::Message(verify_report(&reports)))
     }
 
     fn cmd_format(&self, values: &Values) -> io::Result<Reply> {
@@ -978,13 +1264,16 @@ impl LtoCatalog {
                 tr("not imported")
             };
             let note = if t.note.is_empty() { String::new() } else { format!(" — {}", t.note) };
-            lines.push(format!("{}  ({place}): {what}{note}", t.barcode));
+            let damaged = damaged_text(t);
+            let damaged = if damaged.is_empty() { damaged } else { format!(" — ⚠ {damaged}") };
+            lines.push(format!("{}  ({place}): {what}{note}{damaged}", t.barcode));
         }
         Ok(Reply::Message(lines.join("\n")))
     }
 
     fn cmd_settings_form(&self) -> Reply {
         let s = self.settings.lock().unwrap().clone();
+        let choice = |id: &str, label: String| (id.to_owned(), label);
         Reply::Form(Form {
             title: tr("Library settings"),
             ok: tr("Save"),
@@ -994,6 +1283,17 @@ impl LtoCatalog {
                 field("changer", tr("Changers (\\\\.\\Changer0 or scsi:port:bus:target:lun, comma-separated)"), FieldKind::Text, &s.changer),
                 field("drives", tr("Tape drives, in libraries and standalone (\\\\.\\Tape0, \\\\.\\Tape1)"), FieldKind::Text, &s.drives),
                 field("catalog", tr("Catalog file"), FieldKind::File, &s.catalog_path(&self.data).display().to_string()),
+                field(
+                    "backup_index",
+                    tr("During a backup, every 100 GB, write the index"),
+                    FieldKind::Choice(vec![
+                        choice(InterimIndex::DataPartition.key(), tr("at the end of the data only (a few seconds; as IBM LTFS does)")),
+                        choice(InterimIndex::BothPartitions.key(), tr("into the index partition too (the tape moves there and back, a minute or two)")),
+                    ]),
+                    InterimIndex::from_key(&s.backup_index).key(),
+                ),
+                note(tr("At the end of each tape the index is always written into both partitions. After a failure, the newest index is at the end of the data; this plugin and IBM LTFS find it there.")),
+                field("log", trf("Write a detailed log ({file})", &[("file", &place::log_file(&self.data).display())]), FieldKind::Check, if s.log_on() { "1" } else { "" }),
             ],
         })
     }
@@ -1003,6 +1303,8 @@ impl LtoCatalog {
             changer: values.get("changer").cloned().unwrap_or_default(),
             drives: values.get("drives").cloned().unwrap_or_default(),
             catalog: values.get("catalog").cloned().unwrap_or_default(),
+            backup_index: InterimIndex::from_key(values.get("backup_index").map(String::as_str).unwrap_or("")).key().to_owned(),
+            log: if values.get("log").is_some_and(|v| !v.is_empty()) { String::new() } else { "off".into() },
         };
         if Path::new(s.catalog.trim()) == place::default_catalog(&self.data) {
             s.catalog.clear();
@@ -1018,6 +1320,7 @@ impl LtoCatalog {
         }
         let archive = open_archive(&self.data, &s).map_err(io::Error::other)?;
         s.save(&place::settings_file(&self.data))?;
+        apply_log(&self.data, &s);
         *self.settings.lock().unwrap() = s;
         *self.archive.lock().unwrap() = Arc::new(archive);
         Ok(Reply::Message(tr("Saved. The library is opened again when it is needed.")))
@@ -1142,6 +1445,7 @@ impl FolderPlugin for LtoCatalog {
         let mut sink = ToDisk { out, file: None, done: &done, total, progress: &report, cancelled: &cancelled };
         let r = a.read(&paths, &mut sink, &JobUi::polling(self, &cancelled, &poll));
         report(done.get().max(total), total.max(done.get()));
+        self.show_notices();
         r.map_err(io_err)
     }
 
@@ -1152,7 +1456,9 @@ impl FolderPlugin for LtoCatalog {
         let paths: Vec<String> = items.iter().map(|i| to_ltfs(i)).collect();
         let cancelled = AtomicBool::new(false);
         let mut s = ToSink { sink, cancelled: &cancelled };
-        self.archive().read(&paths, &mut s, &JobUi::new(self, &cancelled)).map_err(io_err)
+        let r = self.archive().read(&paths, &mut s, &JobUi::new(self, &cancelled));
+        self.show_notices();
+        r.map_err(io_err)
     }
 
     fn add(&self, file: &Path, items: &[(PathBuf, String)], progress: &mut Progress) -> io::Result<()> {
@@ -1177,7 +1483,7 @@ impl FolderPlugin for LtoCatalog {
             (progress.borrow_mut())(d, t)
         };
         let ui = JobUi::polling(self, &cancelled, &poll);
-        for (b, list) in by_tape {
+        let r = by_tape.into_iter().try_for_each(|(b, list)| {
             a.write(&b, &list, &ui, &mut |d, t| {
                 at.set((d, t));
                 let go = (progress.borrow_mut())(d, t);
@@ -1186,9 +1492,9 @@ impl FolderPlugin for LtoCatalog {
                 }
                 go
             })
-            .map_err(io_err)?;
-        }
-        Ok(())
+        });
+        self.show_notices();
+        r.map_err(io_err)
     }
 
     fn delete(&self, file: &Path, items: &[String], _progress: &mut Progress) -> io::Result<()> {
@@ -1274,6 +1580,7 @@ impl FolderPlugin for LtoCatalog {
             c("status", tr("Library status")),
             c("format", tr("Format tapes…")),
             c("backup", tr("Back up a folder…")),
+            c("verify", tr("Check tapes…")),
             c("eject", tr("Eject a tape…")),
             c("unload", tr("Unload tapes from drives")),
             c("note", tr("Note about a tape…")),
@@ -1290,6 +1597,7 @@ impl FolderPlugin for LtoCatalog {
             c("search", tr("Search the catalog…")),
             c("import", tr("Import tape…")),
             c("format", tr("Format tape…")),
+            c("verify", tr("Check tape…")),
             c("eject", tr("Eject tape…")),
             c("note", tr("Note about tape…")),
             c("forget", tr("Forget tape…")),
@@ -1306,8 +1614,9 @@ impl FolderPlugin for LtoCatalog {
             "inventory" | "status" => Some(tr("reading the libraries' inventories…")),
             "import_do" => Some(tr("importing tapes…")),
             "format_do" => Some(tr("formatting…")),
-            "format" | "backup" => Some(tr("reading the libraries' inventories…")),
+            "format" | "backup" | "verify" => Some(tr("reading the libraries' inventories…")),
             "backup_do" => Some(tr("backing up…")),
+            "verify_do" => Some(tr("checking tapes…")),
             "search_do" => Some(tr("searching the catalog…")),
             "eject_do" => Some(tr("ejecting the tape…")),
             "unload" => Some(tr("putting the tapes back…")),
@@ -1315,7 +1624,8 @@ impl FolderPlugin for LtoCatalog {
             _ => None,
         };
         let _running = starting.map(|what| self.begin(what));
-        match command {
+        log!("command {command}: {}", logged_input(input));
+        let result = match command {
             "open" => Ok(Self::mount()),
             "inventory" => self.cmd_inventory(),
             "import" => Ok(self.cmd_import_form(input)),
@@ -1327,6 +1637,8 @@ impl FolderPlugin for LtoCatalog {
             "format_do" => self.cmd_format(input),
             "backup" => self.cmd_backup_form(input),
             "backup_do" => self.cmd_backup(input),
+            "verify" => self.cmd_verify_form(input),
+            "verify_do" => self.cmd_verify(input),
             "eject" => Ok(self.one_tape_form(
                 input,
                 tr("Eject a tape"),
@@ -1358,7 +1670,26 @@ impl FolderPlugin for LtoCatalog {
             "settings" => Ok(self.cmd_settings_form()),
             "settings_do" => self.cmd_settings(input),
             other => Err(io::Error::new(io::ErrorKind::Unsupported, format!("unknown command \"{other}\""))),
+        };
+        // what the drives reported goes with what the command says
+        let notices = self.notices_text();
+        let result = match result {
+            _ if notices.is_empty() => result,
+            Ok(Reply::Message(m)) => Ok(Reply::Message(format!("{m}\n\n{notices}"))),
+            Ok(Reply::Done) => Ok(Reply::Message(notices)),
+            Ok(other) => {
+                self.warn(tr("Tape drives"), notices, String::new(), false);
+                Ok(other)
+            }
+            Err(e) => Err(io::Error::new(e.kind(), format!("{e}\n\n{notices}"))),
+        };
+        match &result {
+            Ok(Reply::Message(m)) => log!("command {command}: done: {m:?}"),
+            Ok(_) => log!("command {command}: done"),
+            Err(e) => log!("command {command}: failed ({:?}): {e}", e.kind()),
         }
+        lto_scsi::log::flush_counts();
+        result
     }
 }
 

@@ -37,13 +37,13 @@ cargo test --workspace      # everything, on the simulated library
 
 ## Installing
 
-1. Unzip `ltocatalog-<version>.zip` into the RustySalamander folder (the one with `rustysalamander.exe`): `plugins\ltocatalog` lands among the other plugins and `ltocat.exe` next to the program, where it finds the plugin's catalog and settings by itself.
+1. Unzip `ltocatalog-<version>.zip` into the RustySalamander folder (the one with `rustysalamander.exe`): `plugins\ltocatalog` lands among the other plugins, with `ltocat.exe` in it, where it finds the plugin's catalog and settings by itself. RustySalamander's update check (Help → Check for updates) keeps both up to date. To type just `ltocat`, add `<RustySalamander folder>\plugins\ltocatalog` to PATH. An `ltocat.exe` next to `rustysalamander.exe`, from a release before 0.4.1, is no longer updated: delete it.
 2. **Run RustySalamander as administrator.** SCSI pass-through needs it.
 3. The tape drives need their Windows driver, so that `\\.\Tape0` and `\\.\Tape1` exist; IBM's tape driver or Windows' own LTO driver both work. The changer needs no driver. Without one, the plugin reaches it through the SAS adapter (the TS3100's changer is LUN 1 of the first drive).
 
 ## First use on the library (step by step)
 
-Check the hardware with `ltocat` first, in an administrator prompt. Until step 4, nothing is moved or written. Next to `rustysalamander.exe`, `ltocat` uses the plugin's catalog and library settings; anywhere else, tell it where the program is with `--program <RustySalamander folder>` (or name a catalog with `--catalog <file>`):
+Check the hardware with `ltocat` first, in an administrator prompt. Until step 4, nothing is moved or written. In `plugins\ltocatalog` (or next to `rustysalamander.exe`), `ltocat` uses the plugin's catalog and library settings; anywhere else, tell it where the program is with `--program <RustySalamander folder>` (or name a catalog with `--catalog <file>`):
 
 ```text
 ltocat devices          the drives (with serial numbers) and the changers Windows shows
@@ -112,16 +112,34 @@ Wherever RustySalamander keeps its settings, so the plugin is as portable as the
 
 *Plugins → Back up a folder…* copies a folder onto tapes:
 
-- **What:** everything in it, or only the files whose Archive attribute is set (changed since the last backup that cleared it). With *Clear the Archive attribute of the files backed up* ticked (the default), each file's attribute is cleared once it is on a tape, so the next "only Archive" backup takes only what changed since (incremental). Unticked, the attribute stays (differential). A file that changed while it was written keeps its attribute.
+- **What:** everything in it, or only the files and folders whose Archive attribute is set (changed since the last backup that cleared it); folders without it are made on the tape only where a changed file goes. With *Clear the Archive attribute of the files backed up* ticked (the default), the attribute of each file and folder is cleared once it is on a tape, so the next "only Archive" backup takes only what changed since (incremental). Unticked, the attribute stays (differential). A file that changed while it was written keeps its attribute.
 - **Where:** into the folder `Backup <date> <time>\<folder name>` on each tape used, so backups never overwrite each other.
 - **Tapes:** the form lists the LTFS tapes in the libraries and drives, with their free space and notes. The ones ticked are filled in barcode order. A file goes onto a tape whole; one that doesn't fit on the rest of a tape goes onto the next. When the ticked tapes are full, a new tape is asked for in the mail slot:
   - an empty LTFS tape is used;
   - a tape with files is refused;
   - a blank tape, or one in another format, is formatted (named by its barcode) only after you confirm.
 - **Afterwards:** a report lists the files and size on each tape, plus anything left out: files larger than a whole tape, and files that couldn't be read.
-- **Cancel:** what was written stays on the tapes, with its index; the index is also written every 100 GB.
+- **Cancel:** what was written stays on the tapes, with its index.
+- **The index along the way:** every 100 GB the index is written, so a failure (power, a crash) loses at most that much. By default it goes only to the end of the data, as IBM LTFS does while a tape is mounted: a stop of a few seconds. *Library settings…* can have it written into the index partition too, as at the end of each tape; the tape then moves there and back each time, a minute or two. Either way, the index at the end of each tape is written into both partitions.
 
-From the command line: `ltocat backup <folder> [<barcode>...] [--archive-only] [--keep-archive]`.
+From the command line: `ltocat backup <folder> [<barcode>...] [--archive-only] [--keep-archive] [--index data|both]` (`--index` overrides the Library setting).
+
+- **A tape that fails** during a backup (it can't be read or written) is noted as damaged, and you are asked whether to go on with another tape. What the failed tape's last index holds is safe there; everything after it is written onto the next tape. The report lists the tapes that failed.
+- **The report comes at the end whatever happened**, also when the backup stopped on an error, saying what was backed up before.
+
+## Damaged tapes
+
+LTO drives retry and correct errors themselves; the plugin only sees what a drive gave up on (a *medium error*), and that goes into the detailed log with the drive's sense codes.
+
+- **One copy of the index can't be read.** LTFS keeps the label and the index in both partitions. When one partition's can't be read, the other's is used and a warning says so before the job goes on (in a modal window from RustySalamander 0.9.10; a separate window before). The tape is then used read-only. If the copy read is older than what the catalog lists (the newest index was at the end of the data), the catalog keeps the newer listing, and the warning says which files can't be read from the tape.
+- **Check tapes** (*Plugins → Check tapes…*, `ltocat verify <barcode>...`) reads every file of the tapes ticked, in their order on the tape, and lists the files that can't be read; the others are read on. Nothing is written, and the data read is thrown away. A full LTO-5 tape takes about 2 hours.
+- **What the drives report (TapeAlert).** After each use of a drive, its TapeAlert flags are read: "the tape is damaged", "the tape is nearing the end of its life", "the drive needs cleaning", hardware faults. They are shown with the command's result (after a copy, in a window of their own).
+- **Damaged in the catalog.** Read or write failures, an index that can't be read, files a check couldn't read, and what TapeAlert says about a tape are noted against the tape: the tape lists in the forms and *Library status* show "Damaged: …" (`ltocat tapes`: DAMAGED). A check that reads the whole tape without a fault removes the note.
+- **On the simulator:** `ltocat --sim <file> sim-damage <barcode> a|b [<record>]` damages a tape (that record of the partition, or the start of its last index), to see all this without a damaged tape.
+
+## The detailed log
+
+`ltocatalog.log`, next to the catalog (see above), records what the plugin does with the tapes: every SCSI command (data records summed up), what each partition of a tape holds when it is mounted, every index written, the catalog compared with the tape, the loads, the backups file by file, the commands, questions and errors. It is on by default and can be turned off in *Library settings…*. At 64 MB it is renamed `ltocatalog.1.log` (four older files are kept). `ltocat` writes `ltocat.log` in the same folder (or `--log <file>`). When something goes wrong on a tape, that file says what happened; it holds file and folder names, so look through it before sending it to anyone.
 
 ## Safety
 

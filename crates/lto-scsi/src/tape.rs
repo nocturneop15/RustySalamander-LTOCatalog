@@ -404,6 +404,17 @@ impl TapeDrive {
         ))
     }
 
+    /// The TapeAlert flags the drive raised since they were last read
+    /// (reading them clears them), by number; see [`crate::tapealert`].
+    pub fn tape_alerts(&mut self) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; 4 + 64 * 5];
+        let n = buf.len();
+        // LOG SENSE, current cumulative values (PC 01) of page 0x2E
+        let cdb = [0x4D, 0x00, 0x40 | 0x2E, 0, 0, 0, 0, (n >> 8) as u8, n as u8, 0];
+        let r = self.cmd("LOG SENSE (TapeAlert)", &cdb, Data::In(&mut buf), T_SHORT, |_| false)?;
+        Ok(crate::tapealert::parse_page(&buf[..r.transferred.min(n)]))
+    }
+
     pub fn prevent_removal(&mut self, prevent: bool) -> Result<()> {
         crate::prevent_removal(&mut *self.t, prevent)
     }

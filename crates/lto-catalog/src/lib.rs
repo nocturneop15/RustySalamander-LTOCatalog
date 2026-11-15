@@ -39,6 +39,68 @@ pub struct Tape {
     pub seen: Option<Time>,
     /// When its index was last read into the catalog.
     pub imported: Option<Time>,
+    /// What went wrong with it, most recent last (see [`Condition`]);
+    /// empty when nothing is known against it.
+    pub condition: Vec<Condition>,
+    /// When the last of that was noticed.
+    pub condition_time: Option<Time>,
+}
+
+/// Something wrong with a tape, as the catalog remembers it until a check
+/// of the whole tape reads it without a fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Condition {
+    /// The label or index in this partition (`a`, `b`) couldn't be read.
+    Index(char),
+    /// A read of the tape failed (the tape couldn't be read there).
+    Read,
+    /// A write onto the tape failed.
+    Write,
+    /// The drive raised this TapeAlert flag about the tape.
+    Alert(u8),
+    /// A check of the whole tape found this many files that can't be read.
+    Unreadable(u64),
+}
+
+impl Condition {
+    /// As kept in the catalog: `index:b`, `read`, `write`, `alert:4`,
+    /// `unreadable:3`.
+    pub fn key(&self) -> String {
+        match self {
+            Condition::Index(p) => format!("index:{p}"),
+            Condition::Read => "read".into(),
+            Condition::Write => "write".into(),
+            Condition::Alert(f) => format!("alert:{f}"),
+            Condition::Unreadable(n) => format!("unreadable:{n}"),
+        }
+    }
+
+    /// From the catalog; `None` for what this version doesn't know.
+    pub fn parse(key: &str) -> Option<Condition> {
+        let (k, v) = key.split_once(':').unwrap_or((key, ""));
+        match k {
+            "index" => v.chars().next().filter(|c| c.is_ascii_lowercase()).map(Condition::Index),
+            "read" => Some(Condition::Read),
+            "write" => Some(Condition::Write),
+            "alert" => v.parse().ok().filter(|f| (1..=64).contains(f)).map(Condition::Alert),
+            "unreadable" => v.parse().ok().map(Condition::Unreadable),
+            _ => None,
+        }
+    }
+
+    /// In English (the log, `ltocat`).
+    pub fn text(&self) -> String {
+        match self {
+            Condition::Index(p) => format!("the index or label in partition {p} can't be read"),
+            Condition::Read => "a read failed".into(),
+            Condition::Write => "a write failed".into(),
+            Condition::Alert(f) => match lto_scsi::tapealert::describe(*f) {
+                Some(a) => format!("TapeAlert {f}: {}", a.text),
+                None => format!("TapeAlert {f}"),
+            },
+            Condition::Unreadable(n) => format!("{n} files can't be read"),
+        }
+    }
 }
 
 impl Tape {
@@ -95,6 +157,15 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 INSERT OR IGNORE INTO meta VALUES('schema', '1');
 ";
 
+/// Columns added since the first catalogs, added to those.
+fn upgrade(db: &Connection) -> Result<()> {
+    let cols: Vec<String> = db.prepare("SELECT name FROM pragma_table_info('tapes')")?.query_map([], |r| r.get(0))?.collect::<Result<_>>()?;
+    if !cols.iter().any(|c| c == "condition") {
+        db.execute_batch("ALTER TABLE tapes ADD COLUMN condition TEXT NOT NULL DEFAULT ''; ALTER TABLE tapes ADD COLUMN condition_time INTEGER;")?;
+    }
+    Ok(())
+}
+
 fn time(secs: Option<i64>, ns: Option<i64>) -> Option<Time> {
     secs.map(|s| Time { secs: s, nanos: ns.unwrap_or(0) as u32 })
 }
@@ -116,6 +187,7 @@ impl Catalog {
         db.pragma_update(None, "synchronous", "NORMAL")?;
         db.busy_timeout(std::time::Duration::from_secs(10))?;
         db.execute_batch(SCHEMA)?;
+        upgrade(&db)?;
         Ok(Catalog { db })
     }
 
@@ -123,6 +195,7 @@ impl Catalog {
     pub fn in_memory() -> Result<Catalog> {
         let db = Connection::open_in_memory()?;
         db.execute_batch(SCHEMA)?;
+        upgrade(&db)?;
         Ok(Catalog { db })
     }
 
@@ -142,10 +215,12 @@ impl Catalog {
             note: r.get(12)?,
             seen: time(r.get(13)?, None),
             imported: time(r.get(14)?, None),
+            condition: r.get::<_, String>(15)?.split(';').filter_map(Condition::parse).collect(),
+            condition_time: time(r.get(16)?, None),
         })
     }
 
-    const TAPE_COLS: &'static str = "barcode, uuid, name, generation, updated, updated_ns, capacity, remaining, files, bytes, write_protected, location, note, seen, imported";
+    const TAPE_COLS: &'static str = "barcode, uuid, name, generation, updated, updated_ns, capacity, remaining, files, bytes, write_protected, location, note, seen, imported, condition, condition_time";
 
     /// Every tape, by barcode.
     pub fn tapes(&self) -> Result<Vec<Tape>> {
@@ -252,6 +327,33 @@ impl Catalog {
     pub fn set_note(&self, barcode: &str, note: &str) -> Result<()> {
         self.ensure(barcode)?;
         self.db.execute("UPDATE tapes SET note = ?2 WHERE barcode = ?1", params![barcode, note])?;
+        Ok(())
+    }
+
+    /// Remember `what` against the tape, with what it had already
+    /// (a check's count of unreadable files replaces the last one's).
+    pub fn add_condition(&self, barcode: &str, what: &[Condition]) -> Result<()> {
+        if what.is_empty() {
+            return Ok(());
+        }
+        self.ensure(barcode)?;
+        let mut all = self.tape(barcode)?.map(|t| t.condition).unwrap_or_default();
+        for c in what {
+            if matches!(c, Condition::Unreadable(_)) {
+                all.retain(|o| !matches!(o, Condition::Unreadable(_)));
+            }
+            if !all.contains(c) {
+                all.push(c.clone());
+            }
+        }
+        let text = all.iter().map(|c| c.key()).collect::<Vec<_>>().join(";");
+        self.db.execute("UPDATE tapes SET condition = ?2, condition_time = ?3 WHERE barcode = ?1", params![barcode, text, Time::now().secs])?;
+        Ok(())
+    }
+
+    /// Nothing is known against the tape any more (a check read all of it).
+    pub fn clear_condition(&self, barcode: &str) -> Result<()> {
+        self.db.execute("UPDATE tapes SET condition = '', condition_time = NULL WHERE barcode = ?1", [barcode])?;
         Ok(())
     }
 
@@ -466,5 +568,36 @@ mod tests {
         c.forget("ABC123L5").unwrap();
         assert_eq!(c.tapes().unwrap().len(), 1);
         assert!(c.files_under("ABC123L5", "").unwrap().is_empty());
+    }
+
+    /// A tape's condition is kept, added to, and cleared; a catalog from
+    /// before conditions gets the columns.
+    #[test]
+    fn conditions_are_remembered() {
+        let file = std::env::temp_dir().join(format!("lto-cat-cond-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        {
+            let db = Connection::open(&file).unwrap();
+            db.execute_batch(SCHEMA).unwrap();
+            db.execute("INSERT INTO tapes(barcode, note) VALUES('OLD001L5', 'vault')", []).unwrap();
+        }
+        let c = Catalog::open(&file).unwrap();
+        let old = c.tape("OLD001L5").unwrap().unwrap();
+        assert!(old.condition.is_empty() && old.condition_time.is_none());
+        assert_eq!(old.note, "vault");
+        c.add_condition("OLD001L5", &[Condition::Index('b'), Condition::Alert(4)]).unwrap();
+        c.add_condition("OLD001L5", &[Condition::Alert(4), Condition::Unreadable(3)]).unwrap();
+        c.add_condition("OLD001L5", &[Condition::Unreadable(2)]).unwrap();
+        let t = c.tape("OLD001L5").unwrap().unwrap();
+        assert_eq!(t.condition, [Condition::Index('b'), Condition::Alert(4), Condition::Unreadable(2)]);
+        assert!(t.condition_time.is_some());
+        assert_eq!(Condition::Alert(4).text(), "TapeAlert 4: the tape is damaged, or the drive is faulty: copy the data off it");
+        c.clear_condition("OLD001L5").unwrap();
+        assert!(c.tape("OLD001L5").unwrap().unwrap().condition.is_empty());
+        // keys this version doesn't know are passed over
+        assert_eq!(Condition::parse("alert:99"), None);
+        assert_eq!(Condition::parse("future:1"), None);
+        drop(c);
+        let _ = std::fs::remove_file(&file);
     }
 }

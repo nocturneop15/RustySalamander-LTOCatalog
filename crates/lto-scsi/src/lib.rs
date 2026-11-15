@@ -12,9 +12,11 @@
 
 pub mod changer;
 pub mod library;
+pub mod log;
 pub mod sense;
 pub mod site;
 pub mod tape;
+pub mod tapealert;
 #[cfg(windows)]
 pub mod windows;
 
@@ -84,6 +86,12 @@ impl Error {
             _ => None,
         }
     }
+
+    /// The tape couldn't be read or written there (sense key MEDIUM
+    /// ERROR): damaged, worn, or a drive that needs cleaning.
+    pub fn is_medium(&self) -> bool {
+        self.sense().is_some_and(|s| s.key == sense::key::MEDIUM_ERROR)
+    }
 }
 
 impl fmt::Display for Error {
@@ -122,7 +130,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// sense the caller accepts (`ok` returns true for it): then the sense comes
 /// back with the reply.
 pub(crate) fn run(t: &mut dyn Transport, op: &'static str, cdb: &[u8], data: Data<'_>, timeout_s: u32, ok: impl Fn(&Sense) -> bool) -> Result<Reply> {
-    let r = t.exec(cdb, data, timeout_s)?;
+    let r = exec_logged(t, op, cdb, data, timeout_s)?;
     match r.status {
         GOOD => Ok(r),
         CHECK_CONDITION => match &r.sense {
@@ -132,6 +140,48 @@ pub(crate) fn run(t: &mut dyn Transport, op: &'static str, cdb: &[u8], data: Dat
         },
         status => Err(Error::Status { op, status }),
     }
+}
+
+/// Send a command, and put it into the detailed log when one is open:
+/// READ(6) and WRITE(6) of data that went well are only counted.
+fn exec_logged(t: &mut dyn Transport, op: &'static str, cdb: &[u8], data: Data<'_>, timeout_s: u32) -> io::Result<Reply> {
+    if !log::enabled() {
+        return t.exec(cdb, data, timeout_s);
+    }
+    let (dir, len) = match &data {
+        Data::None => ("", 0),
+        Data::In(b) => ("in ", b.len()),
+        Data::Out(b) => ("out ", b.len()),
+    };
+    let started = std::time::Instant::now();
+    let r = t.exec(cdb, data, timeout_s);
+    let took = started.elapsed();
+    let device = t.describe();
+    match &r {
+        Ok(reply) if reply.status == GOOD && matches!(cdb.first(), Some(0x08 | 0x0A)) => log::count(&device, op, reply.transferred, took),
+        _ => {
+            log::flush_counts();
+            let how = match &r {
+                Err(e) => format!("transport error: {e}"),
+                Ok(reply) => {
+                    let mut s = match reply.status {
+                        GOOD => "GOOD".to_owned(),
+                        CHECK_CONDITION => match &reply.sense {
+                            Some(sense) => format!("CHECK {sense}{}{}{}{}", if sense.filemark { " filemark" } else { "" }, if sense.eom { " EOM" } else { "" }, if sense.ili { " ILI" } else { "" }, sense.info.map(|i| format!(" info={i}")).unwrap_or_default()),
+                            None => "CHECK without sense".to_owned(),
+                        },
+                        s => format!("status {s:02X}"),
+                    };
+                    if len > 0 {
+                        s.push_str(&format!(", {} of {len} bytes", reply.transferred));
+                    }
+                    s
+                }
+            };
+            crate::log!("{device} {op} [{}] {dir}{len}: {how} ({} ms)", log::hex(cdb), took.as_millis());
+        }
+    }
+    r
 }
 
 /// Big-endian helpers.
@@ -187,7 +237,7 @@ pub fn serial_number(t: &mut dyn Transport) -> Result<String> {
 
 /// TEST UNIT READY: `Ok(None)` when ready, else the sense saying why not.
 pub fn test_unit_ready(t: &mut dyn Transport) -> Result<Option<Sense>> {
-    let r = t.exec(&[0x00, 0, 0, 0, 0, 0], Data::None, 30)?;
+    let r = exec_logged(t, "TEST UNIT READY", &[0x00, 0, 0, 0, 0, 0], Data::None, 30)?;
     match r.status {
         GOOD => Ok(None),
         CHECK_CONDITION => Ok(Some(r.sense.unwrap_or_else(|| Sense::new(sense::key::NOT_READY, 0, 0)))),

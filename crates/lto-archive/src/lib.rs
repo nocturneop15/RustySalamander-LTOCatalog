@@ -6,7 +6,14 @@
 //! - [`Archive::read`]: files from tapes, each tape read front to back;
 //! - [`Archive::write`], [`Archive::mkdir`], [`Archive::rename`],
 //!   [`Archive::delete`]: change a tape's volume;
-//! - [`Archive::format`]: make a tape an empty LTFS volume.
+//! - [`Archive::format`]: make a tape an empty LTFS volume;
+//! - [`Archive::verify`]: read every file of tapes, to find what can't be.
+//!
+//! A tape whose label or index can't be read in one partition is used with
+//! the other partition's, read-only ([`Ui::index_damaged`] says so). After
+//! each use of a drive its TapeAlert flags are read: what they say about
+//! the tape goes into the catalog ([`lto_catalog::Condition`]), and
+//! everything they say waits in [`Archive::take_notices`] for the person.
 //!
 //! The tapes are in any number of libraries and standalone drives
 //! ([`lto_scsi::site::Site`]). A tape in a standalone drive is identified by
@@ -24,14 +31,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lto_catalog::{Catalog, Tape};
+use lto_catalog::{Catalog, Condition, Tape};
 use lto_scsi::library::{Lease, LoadError};
+use lto_scsi::log;
 use lto_scsi::site::{Devices, Places, Site};
 use lto_scsi::tape::{attr, TapeDrive};
 use ltfs::{File, Index, Node, Time, Times, Volume};
 
 mod backup;
-pub use backup::{archive_set, backup_set_name, clear_archive, set_archive, BackupOptions, BackupReport, NewTapeProblem, TapeDone};
+pub use backup::{archive_set, backup_set_name, clear_archive, set_archive, BackupOptions, BackupReport, InterimIndex, NewTapeProblem, TapeDone, COMMIT_EVERY};
 
 /// What to do about a tape that no library or drive has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,10 +72,62 @@ pub enum Step<'a> {
     Writing(&'a str, &'a str),
     /// Writing the tape's index after a change.
     WritingIndex(&'a str),
-    /// Backing up a folder onto this tape: (done, of) files and bytes.
-    Backup { tape: &'a str, files: (u64, u64), bytes: (u64, u64) },
+    /// Backing up a folder onto this tape: (done, of) files and bytes, and
+    /// the average speed of writing data so far in this backup, bytes a
+    /// second (loading tapes and writing indexes not counted; None before
+    /// any data was written).
+    Backup { tape: &'a str, files: (u64, u64), bytes: (u64, u64), speed: Option<u64> },
     /// Waiting for a new tape for a backup to show up in a mail slot.
     NewTape,
+    /// Checking this tape: (done, of) files and bytes read.
+    Verifying { tape: &'a str, files: (u64, u64), bytes: (u64, u64) },
+}
+
+/// One partition's label or index of a tape couldn't be read: the other
+/// partition's was used, and the tape is read-only.
+#[derive(Debug, Clone)]
+pub struct IndexWarning {
+    pub barcode: String,
+    /// What couldn't be read.
+    pub damage: Vec<ltfs::Damage>,
+    /// The index used: its partition, generation and when it was written.
+    pub partition: char,
+    pub generation: u64,
+    pub written: Time,
+    /// The generation the catalog holds for the volume, when it is newer
+    /// than the one used: files written since are listed in the catalog,
+    /// but can't be read from the tape.
+    pub catalog_generation: Option<u64>,
+}
+
+/// Something a drive said during a job, for the person (TapeAlert).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// The drive's name.
+    pub drive: String,
+    /// The tape that was in it.
+    pub barcode: String,
+    /// The TapeAlert flag raised; see [`lto_scsi::tapealert::describe`].
+    pub flag: u8,
+}
+
+/// What a check of a tape found ([`Archive::verify`]).
+#[derive(Debug, Clone, Default)]
+pub struct VerifyReport {
+    pub barcode: String,
+    /// Files and bytes on the tape, and those read.
+    pub total_files: u64,
+    pub total_bytes: u64,
+    pub files: u64,
+    pub bytes: u64,
+    /// Files that couldn't be read: (path on the tape, why).
+    pub bad: Vec<(String, String)>,
+    /// One partition's label or index couldn't be read.
+    pub damaged_index: bool,
+    /// Skipped at the person's word (it wasn't put in).
+    pub skipped: bool,
+    /// Why the tape couldn't be checked (to the end).
+    pub error: Option<String>,
 }
 
 /// How a job talks to the person behind it.
@@ -98,6 +158,20 @@ pub trait Ui {
     /// tape, Cancel stops the backup. The default stops.
     fn confirm_format(&self, barcode: &str) -> Answer {
         let _ = barcode;
+        Answer::Cancel
+    }
+    /// A tape's label or index couldn't be read in one partition; the job
+    /// goes on with the other partition's, read-only, once this returns
+    /// (the plugin shows it in a window the person closes). The default
+    /// says nothing.
+    fn index_damaged(&self, warning: &IndexWarning) {
+        let _ = warning;
+    }
+    /// A backup's tape failed with `error` (it couldn't be read or written)
+    /// and `left` bytes are still to go: Retry goes on with another tape,
+    /// anything else stops the backup. The default stops.
+    fn tape_failed(&self, barcode: &str, error: &str, left: u64) -> Answer {
+        let _ = (barcode, error, left);
         Answer::Cancel
     }
 }
@@ -137,6 +211,10 @@ pub enum Error {
     /// `found` (the library's drives matched to the wrong tape devices, or
     /// tapes moved outside this program); nothing was done to it.
     WrongTape { wanted: String, found: String, drive: String },
+    /// The tape mounted as `barcode` holds another LTFS volume than the one
+    /// the catalog has for it (`belongs_to`: the tape the catalog has that
+    /// volume for); nothing was done to it, the catalog wasn't changed.
+    OtherVolume { barcode: String, catalog: String, tape: String, belongs_to: Option<String> },
     Cancelled,
     Library(lto_scsi::Error),
     Ltfs(ltfs::Error),
@@ -160,6 +238,13 @@ impl std::fmt::Display for Error {
                 f,
                 "drive {drive} was to hold tape {wanted}, but the cartridge in it says it is {found}; nothing was done to it. The library's drives may be matched to the wrong tape devices, or tapes were moved outside this program: run an inventory, and check `ltocat selftest`"
             ),
+            Error::OtherVolume { barcode, catalog, tape, belongs_to } => {
+                write!(f, "the tape mounted as {barcode} holds the LTFS volume {tape}, but the catalog has the volume {catalog} for {barcode}")?;
+                if let Some(b) = belongs_to {
+                    write!(f, " (the volume in the drive is tape {b}'s)")?;
+                }
+                write!(f, "; nothing was done to it and the catalog wasn't changed. Run an inventory; if the tape was formatted again by another program, import it")
+            }
             Error::Cancelled => write!(f, "cancelled"),
             Error::Library(e) => write!(f, "{e}"),
             Error::Ltfs(e) => write!(f, "{e}"),
@@ -219,6 +304,8 @@ pub struct Archive {
     site: Mutex<Option<Arc<Site>>>,
     pub catalog: Mutex<Catalog>,
     creator: String,
+    /// What the drives said since the last [`Archive::take_notices`].
+    notices: Mutex<Vec<Notice>>,
 }
 
 /// How long to wait for a library to read what was put into its mail slot
@@ -294,7 +381,7 @@ fn cartridge_says(drive: &mut TapeDrive) -> Option<Said> {
 
 impl Archive {
     pub fn new(devices: Box<dyn Devices>, catalog: Catalog, creator: &str) -> Archive {
-        Archive { devices, site: Mutex::new(None), catalog: Mutex::new(catalog), creator: creator.to_owned() }
+        Archive { devices, site: Mutex::new(None), catalog: Mutex::new(catalog), creator: creator.to_owned(), notices: Mutex::new(Vec::new()) }
     }
 
     /// The libraries and drives, opened the first time they are needed.
@@ -368,6 +455,12 @@ impl Archive {
     /// A tape without LTFS and without a barcode is unknown, except to a
     /// Format, which takes it as `blank_as`.
     fn identify(&self, drive: &mut TapeDrive, blank_as: Option<&str>) -> Option<String> {
+        let found = self.identify_inner(drive, blank_as);
+        log!("identify the cartridge in a drive: {}", found.as_deref().unwrap_or("unknown"));
+        found
+    }
+
+    fn identify_inner(&self, drive: &mut TapeDrive, blank_as: Option<&str>) -> Option<String> {
         if let Ok(Some(v)) = drive.read_attribute(0, attr::BARCODE) {
             let b = lto_scsi::ascii(&v);
             if !b.is_empty() {
@@ -409,15 +502,19 @@ impl Archive {
         let identify = |d: &mut TapeDrive| self.identify(d, blank_as);
         // a library still reading its mail slot was waited for
         let mut waited = false;
+        log!("acquire {barcode}: skip {skip}, blank {blank}");
         loop {
             ui.step(Step::Loading(barcode));
             match site.acquire(barcode, &identify, &|| ui.cancelled()) {
                 Ok(mut l) => {
+                    log!("acquire {barcode}: in {}{}", l.drive_name, if l.standalone() { " (standalone)" } else { "" });
                     // a library's drive: the cartridge in it must agree that it is
                     // the tape, before anything is read or written (a format of
                     // the wrong tape destroys it)
                     if !l.standalone() {
-                        if let Some(found) = cartridge_says(l.drive()).filter(|s| !s.is(barcode)) {
+                        let said = cartridge_says(l.drive());
+                        log!("acquire {barcode}: the cartridge says {}", said.as_ref().map(|s| s.text()).unwrap_or_else(|| "nothing".into()));
+                        if let Some(found) = said.filter(|s| !s.is(barcode)) {
                             let drive = l.drive_name.clone();
                             drop(l);
                             let _ = site.refresh(false, &identify);
@@ -430,8 +527,12 @@ impl Archive {
                     return Ok(Some(l));
                 }
                 Err(LoadError::Cancelled) => return Err(Error::Cancelled),
-                Err(LoadError::Scsi(e)) => return Err(e.into()),
+                Err(LoadError::Scsi(e)) => {
+                    log!("acquire {barcode}: failed: {e}");
+                    return Err(e.into());
+                }
                 Err(LoadError::NotInLibrary(_)) => {
+                    log!("acquire {barcode}: in no library or drive");
                     // everything was looked at again: record where things are
                     let _ = self.record_locations(site);
                     // a tape just put into a mail slot, not read yet: wait for it
@@ -445,7 +546,9 @@ impl Archive {
                     // no empty standalone drive: eject the idle one's tape
                     let ejected = site.make_room();
                     let places = Places { ejected, ..site.places() };
-                    match ui.missing_tape(barcode, tape.as_ref(), skip, &places) {
+                    let answer = ui.missing_tape(barcode, tape.as_ref(), skip, &places);
+                    log!("acquire {barcode}: asked for it, answer {answer:?}");
+                    match answer {
                         Answer::Retry => {
                             // pressed before the library read its mail slot: wait for that
                             waited = true;
@@ -501,6 +604,16 @@ impl Archive {
         let dp = ltfs::volume::part_number(v.label.data_partition) as u8;
         let (remaining, capacity) = v.drive().capacity(dp).unwrap_or((None, None));
         let wp = v.read_only.is_some() && v.drive().write_protected().unwrap_or(false);
+        let (files, bytes) = v.index.totals();
+        log!(
+            "catalog {}: recorded volume {}, generation {}, {files} files, {}; free: {} of {}",
+            v.barcode,
+            v.index.volume_uuid,
+            v.index.generation,
+            lto_scsi::log::bytes(bytes),
+            lto_scsi::log::or_unknown(remaining.map(lto_scsi::log::bytes)),
+            lto_scsi::log::or_unknown(capacity.map(lto_scsi::log::bytes))
+        );
         self.catalog.lock().unwrap().import(&v.barcode, &v.index, capacity, remaining, wp)?;
         Ok(())
     }
@@ -510,7 +623,40 @@ impl Archive {
     fn sync(&self, v: &mut Volume) -> Result<bool> {
         let known = self.catalog.lock().unwrap().tape(&v.barcode)?;
         let current = known.as_ref().is_some_and(|t| t.uuid == v.index.volume_uuid && t.generation == v.index.generation);
+        match &known {
+            Some(t) => log!(
+                "catalog {}: holds volume {} generation {} (written {}, imported {}); the tape holds {} generation {} (written {}): {}",
+                v.barcode,
+                if t.uuid.is_empty() { "(none)" } else { t.uuid.as_str() },
+                t.generation,
+                lto_scsi::log::or_unknown(t.updated.map(|x| x.format())),
+                lto_scsi::log::or_unknown(t.imported.map(|x| x.format())),
+                v.index.volume_uuid,
+                v.index.generation,
+                v.index.update_time.format(),
+                if current { "the same" } else { "OUT OF DATE, updated from the tape" }
+            ),
+            None => log!("catalog {}: not in the catalog; the tape holds {} generation {}", v.barcode, v.index.volume_uuid, v.index.generation),
+        }
+        // another volume than the catalog's for this barcode: the wrong
+        // cartridge in the drive, never recorded under this barcode
+        if let Some(t) = known.as_ref().filter(|t| !t.uuid.is_empty() && t.uuid != v.index.volume_uuid) {
+            let belongs_to = self.catalog.lock().unwrap().tape_by_uuid(&v.index.volume_uuid).ok().flatten().map(|o| o.barcode);
+            log!(
+                "catalog {}: ANOTHER VOLUME in the drive ({} belongs to {}): stopped",
+                v.barcode,
+                v.index.volume_uuid,
+                belongs_to.as_deref().unwrap_or("no tape in the catalog")
+            );
+            return Err(Error::OtherVolume { barcode: v.barcode.clone(), catalog: t.uuid.clone(), tape: v.index.volume_uuid.clone(), belongs_to });
+        }
         if !current {
+            // one partition's index couldn't be read and the other's is
+            // older than the catalog's: the catalog isn't set back
+            if !v.damage.is_empty() && self.catalog_is_newer(v)? {
+                log!("catalog {}: kept: newer than the index that could be read", v.barcode);
+                return Ok(false);
+            }
             self.record(v)?;
         }
         Ok(current)
@@ -519,6 +665,7 @@ impl Archive {
     /// Read the tape's index into the catalog (whether it holds LTFS at
     /// all, too). The volume's index comes back, `None` for a tape without LTFS.
     pub fn import(&self, barcode: &str, ui: &dyn Ui) -> Result<Option<Index>> {
+        log!("job: import {barcode}");
         let site = self.site()?;
         let mut lease = self.acquire(&site, barcode, ui, false, false)?.expect("no skip");
         let drive = lease.drive();
@@ -527,20 +674,108 @@ impl Archive {
             self.catalog.lock().unwrap().mark_not_ltfs(barcode, wp)?;
             return Ok(None);
         }
-        let mut v = Volume::mount(drive, barcode, &self.creator)?;
-        self.record(&mut v)?;
-        Ok(Some(v.index.clone()))
+        let r = self.mount(drive, barcode, ui).and_then(|mut v| {
+            if v.damage.is_empty() || !self.catalog_is_newer(&v)? {
+                self.record(&mut v)?;
+            }
+            Ok(Some(v.index.clone()))
+        });
+        self.after_use(&mut lease, barcode, r.as_ref().err());
+        r
+    }
+
+    /// What the drives said since this was last asked (TapeAlert flags),
+    /// in the order they said it.
+    pub fn take_notices(&self) -> Vec<Notice> {
+        std::mem::take(&mut *self.notices.lock().unwrap())
+    }
+
+    /// Mount the tape's volume in `drive`. When one partition's label or
+    /// index can't be read, the person is told ([`Ui::index_damaged`]) and
+    /// the catalog notes it.
+    fn mount<'d>(&self, drive: &'d mut TapeDrive, barcode: &str, ui: &dyn Ui) -> Result<Volume<'d>> {
+        let v = match Volume::mount(drive, barcode, &self.creator) {
+            Err(ltfs::Error::NotLtfs(_)) => return Err(Error::NotLtfs(barcode.to_owned())),
+            r => r?,
+        };
+        if !v.damage.is_empty() {
+            let catalog_generation = {
+                let cat = self.catalog.lock().unwrap();
+                cat.add_condition(barcode, &v.damage.iter().map(|d| Condition::Index(d.partition)).collect::<Vec<_>>())?;
+                cat.tape(barcode)?.filter(|t| t.uuid == v.index.volume_uuid && t.generation > v.index.generation).map(|t| t.generation)
+            };
+            let w = IndexWarning {
+                barcode: barcode.to_owned(),
+                damage: v.damage.clone(),
+                partition: v.index.location.partition,
+                generation: v.index.generation,
+                written: v.index.update_time,
+                catalog_generation,
+            };
+            log!(
+                "warning {barcode}: {} can't be read; the index of partition {} (generation {}, written {}) is used, read-only; the catalog's generation: {}",
+                lto_scsi::log::list(w.damage.iter().map(|d| format!("the {} of partition {} ({})", if d.label { "label" } else { "index" }, d.partition, d.error))),
+                w.partition,
+                w.generation,
+                w.written.format(),
+                lto_scsi::log::or_unknown(w.catalog_generation)
+            );
+            ui.index_damaged(&w);
+        }
+        Ok(v)
+    }
+
+    /// Whether the catalog holds a newer generation of the volume than the
+    /// index read from the tape (one partition's couldn't be read): the
+    /// catalog is kept then, not set back.
+    fn catalog_is_newer(&self, v: &Volume) -> Result<bool> {
+        let t = self.catalog.lock().unwrap().tape(&v.barcode)?;
+        Ok(t.is_some_and(|t| t.uuid == v.index.volume_uuid && t.generation > v.index.generation))
+    }
+
+    /// A drive was used for `barcode` (the job failed with `failure`): read
+    /// its TapeAlert flags. Those about the tape, and a failure to read or
+    /// write it, go into the catalog; all wait for the person in
+    /// [`Self::take_notices`]. The flags about the tape come back.
+    fn after_use(&self, lease: &mut Lease, barcode: &str, failure: Option<&Error>) -> Vec<u8> {
+        let drive_name = lease.drive_name.clone();
+        let flags = match lease.drive().tape_alerts() {
+            Ok(f) => f,
+            Err(e) => {
+                log!("tapealert {drive_name}: can't be read: {e}");
+                Vec::new()
+            }
+        };
+        let mut conds = Vec::new();
+        let mut tape_flags = Vec::new();
+        for f in &flags {
+            let Some(a) = lto_scsi::tapealert::describe(*f) else { continue };
+            log!("tapealert {drive_name} ({barcode}): flag {f}: {}", a.text);
+            if a.concern == lto_scsi::tapealert::Concern::Tape {
+                conds.push(Condition::Alert(*f));
+                tape_flags.push(*f);
+            }
+            self.notices.lock().unwrap().push(Notice { drive: drive_name.clone(), barcode: barcode.to_owned(), flag: *f });
+        }
+        if let Some(c) = failure.and_then(medium_condition) {
+            conds.push(c);
+        }
+        if !conds.is_empty() {
+            log!("catalog {barcode}: condition {}", lto_scsi::log::list(conds.iter().map(|c| c.text())));
+            if let Err(e) = self.catalog.lock().unwrap().add_condition(barcode, &conds) {
+                log!("catalog {barcode}: the condition can't be recorded: {e}");
+            }
+        }
+        tape_flags
     }
 
     /// Mount `barcode`'s volume (asking for the tape if needed) and run `f`.
     fn with_volume<R>(&self, barcode: &str, ui: &dyn Ui, f: impl FnOnce(&mut Volume) -> Result<R>) -> Result<R> {
         let site = self.site()?;
         let mut lease = self.acquire(&site, barcode, ui, false, false)?.expect("no skip");
-        let mut v = match Volume::mount(lease.drive(), barcode, &self.creator) {
-            Err(ltfs::Error::NotLtfs(_)) => return Err(Error::NotLtfs(barcode.to_owned())),
-            r => r?,
-        };
-        f(&mut v)
+        let r = self.mount(lease.drive(), barcode, ui).and_then(|mut v| f(&mut v));
+        self.after_use(&mut lease, barcode, r.as_ref().err());
+        r
     }
 
     /// Read `items` (paths starting with the barcode; a folder with
@@ -548,6 +783,7 @@ impl Archive {
     /// already in a drive are read first, the rest one after the other; the
     /// files of each tape in the order they are on it.
     pub fn read(&self, items: &[String], sink: &mut dyn ReadSink, ui: &dyn Ui) -> Result<()> {
+        log!("job: read {} items", items.len());
         let mut by_tape: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for it in items {
             let (b, p) = split_tape(it);
@@ -573,51 +809,9 @@ impl Archive {
                 skipped.push(barcode);
                 continue;
             };
-            let mut v = match Volume::mount(lease.drive(), &barcode, &self.creator) {
-                Err(ltfs::Error::NotLtfs(_)) => return Err(Error::NotLtfs(barcode)),
-                r => r?,
-            };
-            self.sync(&mut v)?;
-            // what to read: folders and files, each file once
-            let mut dirs: Vec<(String, Time)> = Vec::new();
-            let mut files: BTreeMap<String, File> = BTreeMap::new();
-            for p in paths {
-                if ui.cancelled() {
-                    return Err(Error::Cancelled);
-                }
-                let node = if p.is_empty() { None } else { v.index.find(p).cloned() };
-                match (p.is_empty(), node) {
-                    (true, _) => collect(&Node::Dir(v.index.root.clone()), "", &mut dirs, &mut files),
-                    (false, Some(n)) => collect(&n, &canonical(&v.index, p), &mut dirs, &mut files),
-                    (false, None) => missing.push(format!("{barcode}\\{p}")),
-                }
-            }
-            for (d, t) in &dirs {
-                sink.dir(&join(&barcode, d), *t)?;
-            }
-            let mut list: Vec<(String, File)> = files.into_iter().collect();
-            list.sort_by_key(|(_, f)| f.extents.first().map(|e| (e.partition, e.start_block)).unwrap_or(('\0', 0)));
-            for (path, f) in list {
-                if ui.cancelled() {
-                    return Err(Error::Cancelled);
-                }
-                ui.step(Step::Reading(&barcode, &path));
-                if !sink.begin(&join(&barcode, &path), f.length, f.times.modify)? {
-                    // not wanted, or the person stopped everything
-                    if ui.cancelled() {
-                        return Err(Error::Cancelled);
-                    }
-                    continue;
-                }
-                let mut stopped = false;
-                v.read_file(&f, &mut |b| {
-                    let go = sink.write(b)? && !ui.cancelled();
-                    stopped |= !go;
-                    Ok(go)
-                })
-                .map_err(|e| if stopped { Error::Cancelled } else { e.into() })?;
-                sink.end()?;
-            }
+            let r = self.mount(lease.drive(), &barcode, ui).and_then(|mut v| self.read_tape(&mut v, &barcode, paths, sink, ui, &mut missing));
+            self.after_use(&mut lease, &barcode, r.as_ref().err());
+            r?;
         }
         if !missing.is_empty() {
             return Err(Error::Missing(missing));
@@ -628,10 +822,144 @@ impl Archive {
         Ok(())
     }
 
+    /// Read `paths` (a folder with everything inside, "" the whole tape) of
+    /// the mounted tape into `sink`, each file once, in the order they are
+    /// on the tape; paths not on it go into `missing`.
+    fn read_tape(&self, v: &mut Volume, barcode: &str, paths: &[String], sink: &mut dyn ReadSink, ui: &dyn Ui, missing: &mut Vec<String>) -> Result<()> {
+        self.sync(v)?;
+        // what to read: folders and files, each file once
+        let mut dirs: Vec<(String, Time)> = Vec::new();
+        let mut files: BTreeMap<String, File> = BTreeMap::new();
+        for p in paths {
+            if ui.cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let node = if p.is_empty() { None } else { v.index.find(p).cloned() };
+            match (p.is_empty(), node) {
+                (true, _) => collect(&Node::Dir(v.index.root.clone()), "", &mut dirs, &mut files),
+                (false, Some(n)) => collect(&n, &canonical(&v.index, p), &mut dirs, &mut files),
+                (false, None) => missing.push(format!("{barcode}\\{p}")),
+            }
+        }
+        for (d, t) in &dirs {
+            sink.dir(&join(barcode, d), *t)?;
+        }
+        for (path, f) in in_tape_order(files) {
+            if ui.cancelled() {
+                return Err(Error::Cancelled);
+            }
+            ui.step(Step::Reading(barcode, &path));
+            if !sink.begin(&join(barcode, &path), f.length, f.times.modify)? {
+                // not wanted, or the person stopped everything
+                if ui.cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                continue;
+            }
+            let mut stopped = false;
+            v.read_file(&f, &mut |b| {
+                let go = sink.write(b)? && !ui.cancelled();
+                stopped |= !go;
+                Ok(go)
+            })
+            .map_err(|e| if stopped { Error::Cancelled } else { e.into() })?;
+            sink.end()?;
+        }
+        Ok(())
+    }
+
+    /// Check tapes: read every file of each (in the order they are on it,
+    /// the data thrown away), going on past files that can't be read. A tape
+    /// read to the end without a fault is cleared of what the catalog held
+    /// against it; one with faults gets them noted. A tape not put in when
+    /// asked for is skipped.
+    pub fn verify(&self, tapes: &[String], ui: &dyn Ui) -> Result<Vec<VerifyReport>> {
+        log!("job: verify {}", lto_scsi::log::list(tapes));
+        let site = self.site()?;
+        let mut out = Vec::new();
+        for barcode in tapes.iter().map(|b| b.trim().to_uppercase()).filter(|b| !b.is_empty()) {
+            if ui.cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let mut report = VerifyReport { barcode: barcode.clone(), ..VerifyReport::default() };
+            let Some(mut lease) = self.acquire(&site, &barcode, ui, true, false)? else {
+                report.skipped = true;
+                out.push(report);
+                continue;
+            };
+            let r = self.mount(lease.drive(), &barcode, ui).and_then(|mut v| self.verify_tape(&mut v, &mut report, ui));
+            let tape_flags = self.after_use(&mut lease, &barcode, r.as_ref().err());
+            match r {
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(e) => report.error = Some(e.to_string()),
+                Ok(()) => {}
+            }
+            let cat = self.catalog.lock().unwrap();
+            if report.bad.is_empty() && report.error.is_none() && !report.damaged_index && tape_flags.is_empty() {
+                log!("verify {barcode}: all {} files read, nothing wrong", report.files);
+                cat.clear_condition(&barcode)?;
+            } else if !report.bad.is_empty() {
+                cat.add_condition(&barcode, &[Condition::Read, Condition::Unreadable(report.bad.len() as u64)])?;
+            }
+            drop(cat);
+            log!("verify {barcode}: {} of {} files read, {} can't be read{}", report.files, report.total_files, report.bad.len(), report.error.as_deref().map(|e| format!("; stopped: {e}")).unwrap_or_default());
+            out.push(report);
+        }
+        Ok(out)
+    }
+
+    /// [`Self::verify`] of the mounted tape.
+    fn verify_tape(&self, v: &mut Volume, report: &mut VerifyReport, ui: &dyn Ui) -> Result<()> {
+        report.damaged_index = !v.damage.is_empty();
+        if !report.damaged_index || !self.catalog_is_newer(v)? {
+            self.sync(v)?;
+        }
+        let mut dirs = Vec::new();
+        let mut files: BTreeMap<String, File> = BTreeMap::new();
+        collect(&Node::Dir(v.index.root.clone()), "", &mut dirs, &mut files);
+        report.total_files = files.len() as u64;
+        report.total_bytes = files.values().map(|f| f.length).sum();
+        let barcode = report.barcode.clone();
+        for (path, f) in in_tape_order(files) {
+            if ui.cancelled() {
+                return Err(Error::Cancelled);
+            }
+            ui.step(Step::Verifying { tape: &barcode, files: (report.files, report.total_files), bytes: (report.bytes, report.total_bytes) });
+            let mut read = 0u64;
+            let mut shown = Instant::now();
+            let r = v.read_file(&f, &mut |b| {
+                read += b.len() as u64;
+                if shown.elapsed() >= Duration::from_secs(1) {
+                    shown = Instant::now();
+                    ui.step(Step::Verifying { tape: &barcode, files: (report.files, report.total_files), bytes: (report.bytes + read, report.total_bytes) });
+                }
+                Ok(!ui.cancelled())
+            });
+            report.bytes += read;
+            match r {
+                Ok(()) => report.files += 1,
+                Err(ltfs::Error::Cancelled) => return Err(Error::Cancelled),
+                // the tape couldn't be read there, or the data isn't all
+                // there: noted, and on with the next file
+                Err(e @ ltfs::Error::Corrupt(_)) => report.bad.push((path, e.to_string())),
+                Err(ltfs::Error::Scsi(e)) if e.is_medium() => {
+                    log!("verify {barcode}: \"{path}\" can't be read: {e}");
+                    report.bad.push((path, e.to_string()));
+                }
+                // the drive or its connection: no use going on
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
     /// Check that a change can be made to the tape's volume: writable, and
     /// the catalog current (else it is updated and the change refused).
     fn ready_to_change(&self, v: &mut Volume) -> Result<()> {
-        v.writable()?;
+        if let Err(e) = v.writable() {
+            log!("{}: can't be changed: {e}", v.barcode);
+            return Err(e.into());
+        }
         if !self.sync(v)? {
             return Err(Error::StaleCatalog(v.barcode.clone()));
         }
@@ -644,11 +972,19 @@ impl Archive {
         self.record(v)
     }
 
+    /// Write the volume's index to the data partition only (see
+    /// [`Volume::sync`]) and put it into the catalog.
+    fn sync_index(&self, v: &mut Volume) -> Result<()> {
+        v.sync()?;
+        self.record(v)
+    }
+
     /// Copy files and folders from disk onto a tape: `(path on disk, path
     /// on the tape)`, folders with everything inside. An item already at a
     /// path is replaced. `progress(done, total)` in bytes; false cancels
     /// (what was written before stays, in a consistent index).
     pub fn write(&self, barcode: &str, items: &[(PathBuf, String)], ui: &dyn Ui, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<()> {
+        log!("job: write {} items onto {barcode}", items.len());
         let mut plan: Vec<(PathBuf, String, bool)> = Vec::new();
         for (disk, dest) in items {
             if ltfs::index::split(dest).is_empty() {
@@ -731,6 +1067,7 @@ impl Archive {
 
     /// Make a folder on a tape.
     pub fn mkdir(&self, barcode: &str, path: &str, ui: &dyn Ui) -> Result<()> {
+        log!("job: make folder {path:?} on {barcode}");
         if ltfs::index::split(path).is_empty() {
             return Err(Error::Refused("tapes can't be made as folders; use Format tape".into()));
         }
@@ -746,6 +1083,7 @@ impl Archive {
 
     /// Rename or move an item within a tape.
     pub fn rename(&self, barcode: &str, old: &str, new: &str, ui: &dyn Ui) -> Result<()> {
+        log!("job: rename {old:?} to {new:?} on {barcode}");
         if ltfs::index::split(old).is_empty() || ltfs::index::split(new).is_empty() {
             return Err(Error::Refused("tapes can't be renamed".into()));
         }
@@ -765,6 +1103,7 @@ impl Archive {
 
     /// Delete items of a tape (from its index: LTFS never frees space).
     pub fn delete(&self, barcode: &str, paths: &[String], ui: &dyn Ui) -> Result<()> {
+        log!("job: delete {} items on {barcode}", paths.len());
         if paths.iter().any(|p| ltfs::index::split(p).is_empty()) {
             return Err(Error::Refused("tapes can't be deleted; use Forget tape to take one out of the catalog".into()));
         }
@@ -783,6 +1122,7 @@ impl Archive {
     /// its memory is taken as `barcode` (a new tape); a tape that is
     /// another one is never formatted in its place.
     pub fn format(&self, barcode: &str, name: &str, ui: &dyn Ui) -> Result<Index> {
+        log!("job: format {barcode}, name {name:?}");
         let site = self.site()?;
         let mut lease = self.acquire(&site, barcode, ui, false, true)?.expect("no skip");
         let drive_name = lease.drive_name.clone();
@@ -799,8 +1139,34 @@ impl Archive {
             }
         };
         let (remaining, capacity) = drive.capacity(1).unwrap_or((None, None));
+        log!("catalog {barcode}: recorded the new volume {}, generation {}", f.index.volume_uuid, f.index.generation);
         self.catalog.lock().unwrap().import(barcode, &f.index, capacity, remaining, false)?;
         Ok(f.index)
+    }
+}
+
+/// Files in the order they are on the tape (by their first block).
+fn in_tape_order(files: BTreeMap<String, File>) -> Vec<(String, File)> {
+    let mut list: Vec<(String, File)> = files.into_iter().collect();
+    list.sort_by_key(|(_, f)| f.extents.first().map(|e| (e.partition, e.start_block)).unwrap_or(('\0', 0)));
+    list
+}
+
+/// The SCSI error inside a job's error, if it is one.
+fn scsi_of(e: &Error) -> Option<&lto_scsi::Error> {
+    match e {
+        Error::Library(e) | Error::Ltfs(ltfs::Error::Scsi(e)) => Some(e),
+        _ => None,
+    }
+}
+
+/// What a job's failure says about its tape: it couldn't be read, or
+/// written, there (a medium error).
+fn medium_condition(e: &Error) -> Option<Condition> {
+    let s = scsi_of(e).filter(|s| s.is_medium())?;
+    match s {
+        lto_scsi::Error::Check { op, .. } if op.starts_with("WRITE") => Some(Condition::Write),
+        _ => Some(Condition::Read),
     }
 }
 

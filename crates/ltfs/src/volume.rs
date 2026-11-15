@@ -18,6 +18,7 @@
 
 use std::io::{self, Read};
 
+use lto_scsi::log;
 use lto_scsi::tape::{attr, Read as TapeRead, TapeDrive, FORMAT_ASCII, FORMAT_BINARY};
 
 use crate::index::{Extent, File, Index, Location};
@@ -98,6 +99,30 @@ fn letter(p: u32) -> char {
 /// The block where the first index follows the label construct.
 const FIRST_INDEX: u64 = 4;
 
+/// A copy of the label or of the index that couldn't be read when the
+/// volume was mounted; the other partition's was used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Damage {
+    /// The partition, `a` or `b`.
+    pub partition: char,
+    /// Its label (else its newest index).
+    pub label: bool,
+    /// What went wrong.
+    pub error: String,
+}
+
+/// Whether a failure to read one partition's label or index can be made up
+/// for by the other partition's: the tape couldn't be read there, or what
+/// was read makes no sense. Anything else (the drive, the connection, a
+/// cancel) stops the mount.
+fn other_copy_helps(e: &Error) -> bool {
+    match e {
+        Error::Scsi(e) => e.is_medium(),
+        Error::Corrupt(_) => true,
+        _ => false,
+    }
+}
+
 /// A mounted volume.
 pub struct Volume<'d> {
     drive: &'d mut TapeDrive,
@@ -124,6 +149,9 @@ pub struct Volume<'d> {
     /// Things worth knowing that didn't stop the work (medium attributes
     /// that couldn't be written).
     pub warnings: Vec<String>,
+    /// What couldn't be read when the volume was mounted, the other
+    /// partition's copy used instead (the volume is then read-only).
+    pub damage: Vec<Damage>,
 }
 
 /// Read the label construct of partition `p`.
@@ -154,8 +182,14 @@ pub fn probe(drive: &mut TapeDrive) -> Result<Option<Label>> {
         return Ok(None);
     }
     match read_label(drive, 0) {
-        Ok(l) => Ok(Some(l)),
-        Err(Error::NotLtfs(_)) => Ok(None),
+        Ok(l) => {
+            log!("ltfs probe: LTFS volume {}, created by {}", l.volume_uuid, l.creator);
+            Ok(Some(l))
+        }
+        Err(Error::NotLtfs(why)) => {
+            log!("ltfs probe: not LTFS: {why}");
+            Ok(None)
+        }
         Err(e) => Err(e),
     }
 }
@@ -204,11 +238,12 @@ fn read_text(drive: &mut TapeDrive, buf: &mut [u8]) -> Result<String> {
 /// its closing filemark). `None` when none is found there. Data written
 /// after the last index without one of its own (writing cut short) is
 /// passed over: the index before it is found.
-fn last_index(drive: &mut TapeDrive, p: u32, buf: &mut [u8]) -> Result<Option<(u64, Index, u64)>> {
+pub(crate) fn last_index(drive: &mut TapeDrive, p: u32, buf: &mut [u8]) -> Result<Option<(u64, Index, u64)>> {
     drive.locate(p, 0)?;
     drive.space_to_eod()?;
     let eod = drive.position()?.block;
     if eod < FIRST_INDEX + 2 {
+        log!("ltfs last index of partition {}: none, end of data at block {eod}", letter(p));
         return Ok(None);
     }
     // the filemark before the last index: back over two, forward over one
@@ -218,8 +253,25 @@ fn last_index(drive: &mut TapeDrive, p: u32, buf: &mut [u8]) -> Result<Option<(u
     let text = read_text(drive, buf)?;
     let after = drive.position()?.block;
     match Index::parse(&text) {
-        Ok(ix) => Ok(Some((start, ix, after))),
-        Err(_) => Ok(None),
+        Ok(ix) => {
+            log!(
+                "ltfs last index of partition {}: blocks {start}..{after} (end of data at {eod}), generation {}, volume {}, says it is at {}:{}, previous {}, written {} by {}",
+                letter(p),
+                ix.generation,
+                ix.volume_uuid,
+                ix.location.partition,
+                ix.location.block,
+                ix.previous.map_or_else(|| "none".to_owned(), |l| format!("{}:{}", l.partition, l.block)),
+                ix.update_time.format(),
+                ix.creator
+            );
+            Ok(Some((start, ix, after)))
+        }
+        Err(e) => {
+            let head: String = text.chars().take(300).collect();
+            log!("ltfs last index of partition {}: blocks {start}..{after} (end of data at {eod}) aren't an index ({e}), {} bytes: {head:?}", letter(p), text.len());
+            Ok(None)
+        }
     }
 }
 
@@ -230,21 +282,62 @@ impl<'d> Volume<'d> {
         if drive.partitions()? < 2 {
             return Err(Error::NotLtfs("the tape has a single partition".into()));
         }
-        let la = read_label(drive, 0)?;
-        let lb = read_label(drive, 1)?;
-        if la.volume_uuid != lb.volume_uuid {
-            return Err(Error::Corrupt("the labels of the two partitions belong to different volumes".into()));
-        }
-        let label = la;
+        // LTFS keeps the label and the index in both partitions: one that
+        // can't be read is made up for by the other, read-only
+        let mut damage = Vec::new();
+        let lost = |p: u32, label: bool, e: Error, damage: &mut Vec<Damage>| {
+            log!("ltfs mount {barcode}: the {} of partition {} CAN'T BE READ ({e}): the other partition's is used", if label { "label" } else { "index" }, letter(p));
+            damage.push(Damage { partition: letter(p), label, error: e.to_string() });
+        };
+        let label = match (read_label(drive, 0), read_label(drive, 1)) {
+            (Ok(la), Ok(lb)) => {
+                if la.volume_uuid != lb.volume_uuid {
+                    return Err(Error::Corrupt("the labels of the two partitions belong to different volumes".into()));
+                }
+                la
+            }
+            (Ok(la), Err(e)) if other_copy_helps(&e) => {
+                lost(1, true, e, &mut damage);
+                la
+            }
+            (Err(e), Ok(mut lb)) if other_copy_helps(&e) => {
+                lost(0, true, e, &mut damage);
+                lb.location = 'a';
+                lb
+            }
+            (Err(e), _) | (_, Err(e)) => return Err(e),
+        };
         let (ip, dp) = (part_number(label.index_partition), part_number(label.data_partition));
         let mut buf = vec![0u8; label.block_size as usize];
-        let ipi = last_index(drive, ip, &mut buf)?;
-        let dpi = last_index(drive, dp, &mut buf)?;
-        let dp_eod = {
+        let mut index_of = |p: u32, damage: &mut Vec<Damage>| match last_index(drive, p, &mut buf) {
+            Ok(x) => Ok(x),
+            Err(e) if other_copy_helps(&e) => {
+                lost(p, false, e, damage);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        };
+        let ipi = index_of(ip, &mut damage)?;
+        let dpi = index_of(dp, &mut damage)?;
+        let (ipi_generation, dpi_generation) = (ipi.as_ref().map(|x| x.1.generation), dpi.as_ref().map(|x| x.1.generation));
+        let eod = |drive: &mut TapeDrive| -> lto_scsi::Result<u64> {
             drive.locate(dp, 0)?;
             drive.space_to_eod()?;
-            drive.position()?.block
+            Ok(drive.position()?.block)
         };
+        let dp_eod = match eod(drive) {
+            Ok(b) => b,
+            // read-only anyway: where the data ends doesn't matter
+            Err(e) if !damage.is_empty() && e.is_medium() => {
+                log!("ltfs mount {barcode}: the end of the data partition can't be found ({e})");
+                0
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if ipi.is_none() && dpi.is_none() && damage.iter().any(|d| !d.label) {
+            let why = damage.iter().filter(|d| !d.label).map(|d| format!("partition {}: {}", d.partition, d.error)).collect::<Vec<_>>().join("; ");
+            return Err(Error::Corrupt(format!("neither index can be read ({why})")));
+        }
         let (index, ip_index, dp_index, dp_after_index) = match (ipi, dpi) {
             (Some((ia, ix_i, _)), Some((da, ix_d, after))) => {
                 let dloc = Location { partition: label.data_partition, block: da };
@@ -267,13 +360,27 @@ impl<'d> Volume<'d> {
         if index.volume_uuid != label.volume_uuid {
             return Err(Error::Corrupt("the index belongs to another volume than the label".into()));
         }
+        log!(
+            "ltfs mount {barcode}: volume {}, generation {} (index partition {}, data partition {}), index partition's index at block {ip_index}, data partition's at {}:{}, after it block {dp_after_index}, end of data at {dp_eod}",
+            label.volume_uuid,
+            index.generation,
+            ipi_generation.map(|g| g.to_string()).unwrap_or_else(|| "none".into()),
+            dpi_generation.map(|g| g.to_string()).unwrap_or_else(|| "none".into()),
+            dp_index.partition,
+            dp_index.block
+        );
         let mut read_only = None;
-        if drive.write_protected()? {
+        if !damage.is_empty() {
+            read_only = Some("part of the tape can't be read (one of the two copies of its index or label): copy its files onto another tape".to_string());
+        } else if drive.write_protected()? {
             read_only = Some("the tape is write-protected".to_string());
         } else if matches!(index.volume_lock_state.as_deref(), Some("locked" | "permlocked")) {
             read_only = Some("the volume is locked".to_string());
         } else if index.has_data_in(label.index_partition) {
             read_only = Some("files are stored in the index partition (by another LTFS program), which this program doesn't write".to_string());
+        }
+        if let Some(r) = &read_only {
+            log!("ltfs mount {barcode}: read-only: {r}");
         }
         Ok(Volume {
             drive,
@@ -290,6 +397,7 @@ impl<'d> Volume<'d> {
             buf,
             creator: creator.to_owned(),
             warnings: Vec::new(),
+            damage,
         })
     }
 
@@ -312,8 +420,18 @@ impl<'d> Volume<'d> {
     }
 
     /// Read the file `f`, giving its bytes to `out` in order; `out`
-    /// returning false stops it (`Cancelled`).
+    /// returning false stops it (`Cancelled`). After a failure the next
+    /// file is read from where it starts (a damaged place is skipped).
     pub fn read_file(&mut self, f: &File, out: &mut dyn FnMut(&[u8]) -> io::Result<bool>) -> Result<()> {
+        let r = self.read_file_from_tape(f, out);
+        if r.is_err() {
+            // where the drive stopped isn't known
+            self.pos = None;
+        }
+        r
+    }
+
+    fn read_file_from_tape(&mut self, f: &File, out: &mut dyn FnMut(&[u8]) -> io::Result<bool>) -> Result<()> {
         let zeros = vec![0u8; 64 * 1024];
         let mut written = 0u64;
         let fill = |written: &mut u64, upto: u64, out: &mut dyn FnMut(&[u8]) -> io::Result<bool>| -> Result<()> {
@@ -410,9 +528,11 @@ impl<'d> Volume<'d> {
             self.dp_end = next;
             total += n as u64;
             if !progress(n as u64) {
+                log!("ltfs write {}: cancelled after {total} bytes of a file, at block {next}", self.barcode);
                 return Err(Error::Cancelled);
             }
             if ew {
+                log!("ltfs write {}: early warning at block {next}, {total} bytes of the file written (left out of the index)", self.barcode);
                 return Err(Error::Full);
             }
             if n < bs {
@@ -427,9 +547,31 @@ impl<'d> Volume<'d> {
     /// everything there, then over the index partition's, and record it in
     /// the medium attributes.
     pub fn commit(&mut self) -> Result<()> {
+        self.sync()?;
+        let ip = part_number(self.label.index_partition);
+        // the index partition: the same generation over the last index there
+        let mut copy = self.index.clone();
+        copy.location = Location { partition: self.label.index_partition, block: self.ip_index };
+        self.drive.locate(ip, self.ip_index)?;
+        let blocks = self.write_records(copy.to_xml().as_bytes())?;
+        self.drive.write_filemarks(1)?;
+        self.pos = None;
+        log!("ltfs commit {}: generation {} into the index partition at block {}, {blocks} blocks", self.barcode, self.index.generation, self.ip_index);
+        if let Err(e) = write_coherency(self.drive, ip as u8, self.index.generation, self.ip_index, &self.label.volume_uuid) {
+            self.warnings.push(format!("the volume coherency attribute of partition {} couldn't be written: {e}", letter(ip)));
+        }
+        Ok(())
+    }
+
+    /// Write the index (a new generation) to the data partition only, after
+    /// everything there, as LTFS does while a volume stays mounted: the tape
+    /// doesn't move to the index partition and back. Mounting takes the
+    /// newer index of the two partitions, so this one counts even if
+    /// [`Volume::commit`] never follows; the index partition keeps the
+    /// older one until it does.
+    pub fn sync(&mut self) -> Result<()> {
         self.writable()?;
         let dp = part_number(self.label.data_partition);
-        let ip = part_number(self.label.index_partition);
         let at = match self.append {
             Some(a) => a,
             None => {
@@ -457,17 +599,16 @@ impl<'d> Volume<'d> {
         self.dp_end = start + blocks + 1;
         self.dp_after_index = self.dp_end;
         self.append = None;
-        // the index partition: the same generation over the last index there
-        let mut copy = self.index.clone();
-        copy.location = Location { partition: self.label.index_partition, block: self.ip_index };
-        self.drive.locate(ip, self.ip_index)?;
-        self.write_records(copy.to_xml().as_bytes())?;
-        self.drive.write_filemarks(1)?;
-        self.pos = None;
-        for (p, block) in [(dp, self.dp_index.block), (ip, self.ip_index)] {
-            if let Err(e) = write_coherency(self.drive, p as u8, self.index.generation, block, &self.label.volume_uuid) {
-                self.warnings.push(format!("the volume coherency attribute of partition {} couldn't be written: {e}", letter(p)));
-            }
+        self.pos = Some((dp, self.dp_end));
+        let (files, bytes) = self.index.totals();
+        log!(
+            "ltfs index {}: generation {} into the data partition at block {start} (data ended at {at}), {blocks} blocks, end of data now {}; {files} files, {bytes} bytes",
+            self.barcode,
+            self.index.generation,
+            self.dp_end
+        );
+        if let Err(e) = write_coherency(self.drive, dp as u8, self.index.generation, self.dp_index.block, &self.label.volume_uuid) {
+            self.warnings.push(format!("the volume coherency attribute of partition {} couldn't be written: {e}", letter(dp)));
         }
         Ok(())
     }
@@ -575,6 +716,7 @@ pub fn format(drive: &mut TapeDrive, barcode: &str, volume_name: &str, creator: 
         }
     }
     l.location = 'a';
+    log!("ltfs format {barcode}: volume {uuid}, generation {}, name {volume_name:?}; warnings: {}", index.generation, lto_scsi::log::list(&warnings));
     Ok(Formatted { label: l, index, warnings })
 }
 

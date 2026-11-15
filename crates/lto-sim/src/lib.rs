@@ -51,12 +51,16 @@ pub struct Cart {
     pub attrs: BTreeMap<(u8, u16), (u8, Vec<u8>)>,
     /// Volume change reference: counts writes.
     pub vcr: u64,
+    /// Damaged places: (partition, record). Reading the record fails with a
+    /// medium error (11/00), and so does writing a record there (0C/00);
+    /// the drive raises its TapeAlert flags.
+    pub damaged: Vec<(usize, usize)>,
 }
 
 impl Cart {
     /// A new, unpartitioned tape of `capacity` bytes.
     pub fn new(barcode: &str, capacity: u64) -> Cart {
-        Cart { barcode: barcode.into(), parts: vec![Vec::new()], caps: vec![capacity], write_protect: false, attrs: BTreeMap::new(), vcr: 1 }
+        Cart { barcode: barcode.into(), parts: vec![Vec::new()], caps: vec![capacity], write_protect: false, attrs: BTreeMap::new(), vcr: 1, damaged: Vec::new() }
     }
 
     fn used(&self, p: usize) -> u64 {
@@ -85,6 +89,8 @@ struct Drive {
     /// Partitions asked for by MODE SELECT, applied by FORMAT MEDIUM:
     /// (additional partitions, unit exponent, sizes).
     pending: Option<(u8, u8, Vec<u16>)>,
+    /// TapeAlert flags raised (bit n-1 for flag n), cleared when read.
+    alerts: u64,
 }
 
 /// The library's state.
@@ -108,6 +114,34 @@ pub struct State {
     pub id: u8,
     /// It has a changer; without one, its drives are standalone.
     pub changer: bool,
+}
+
+/// TapeAlert flags (SSC-4 annex): numbers 1 to 64.
+pub mod alert {
+    pub const HARD_ERROR: u8 = 3;
+    pub const MEDIA: u8 = 4;
+    pub const READ_FAILURE: u8 = 5;
+    pub const WRITE_FAILURE: u8 = 6;
+    pub const CLEAN_NOW: u8 = 20;
+}
+
+/// The bit of TapeAlert flag `n` in a drive's flags.
+fn alert_bit(n: u8) -> u64 {
+    1u64 << (n - 1)
+}
+
+/// The TapeAlert log page (0x2E) for `flags`: 64 parameters, one per flag.
+fn tape_alert_page(flags: u64) -> Vec<u8> {
+    let mut b = vec![0x2E, 0, 0, 0];
+    for n in 1..=64u16 {
+        b.extend_from_slice(&n.to_be_bytes());
+        b.push(0x03);
+        b.push(1);
+        b.push(u8::from(flags & (1u64 << (n - 1)) != 0));
+    }
+    let len = (b.len() - 4) as u16;
+    b[2..4].copy_from_slice(&len.to_be_bytes());
+    b
 }
 
 /// A simulated library; clone it to share.
@@ -168,7 +202,7 @@ impl SimLibrary {
             slots[i] = Some(Cart::new(b, cfg.capacity));
         }
         let drives = (0..cfg.drives)
-            .map(|i| Drive { serial: drive_serial(cfg.id, i), cart: None, from: None, loaded: false, part: 0, pos: 0, unit_attention: false, compression: true, prevent: false, pending: None })
+            .map(|i| Drive { serial: drive_serial(cfg.id, i), cart: None, from: None, loaded: false, part: 0, pos: 0, unit_attention: false, compression: true, prevent: false, pending: None, alerts: 0 })
             .collect();
         let state = State {
             slots,
@@ -244,6 +278,35 @@ impl SimLibrary {
         let s = &mut *s;
         let c = s.slots.iter_mut().chain(s.mail.iter_mut()).flatten().chain(s.drives.iter_mut().filter_map(|d| d.cart.as_mut())).find(|c| c.barcode == barcode)?;
         Some(f(c))
+    }
+
+    /// Damage the tape `barcode` at `record` of `partition` (see
+    /// [`Cart::damaged`]); false when it is nowhere here.
+    pub fn damage(&self, barcode: &str, partition: usize, record: usize) -> bool {
+        let done = self.with_cart(barcode, |c| {
+            if !c.damaged.contains(&(partition, record)) {
+                c.damaged.push((partition, record));
+            }
+        });
+        let _ = self.save();
+        done.is_some()
+    }
+
+    /// Damage the first record of the last LTFS index in `partition` of
+    /// the tape `barcode` (after the next-to-last filemark): which record,
+    /// `None` when the tape is nowhere here or the partition holds no index.
+    pub fn damage_last_index(&self, barcode: &str, partition: usize) -> Option<usize> {
+        let recs = self.cart(barcode)?.parts.get(partition)?.clone();
+        let marks: Vec<usize> = recs.iter().enumerate().filter(|(_, r)| **r == Rec::Mark).map(|(i, _)| i).collect();
+        let start = marks.len().checked_sub(2).map(|i| marks[i] + 1).filter(|s| *s < recs.len())?;
+        self.damage(barcode, partition, start).then_some(start)
+    }
+
+    /// Raise TapeAlert flag `flag` (1 to 64) in drive `i`, as a drive does.
+    pub fn raise_alert(&self, i: usize, flag: u8) {
+        if let Some(d) = self.state.lock().unwrap().drives.get_mut(i) {
+            d.alerts |= alert_bit(flag);
+        }
     }
 
     /// Put a tape into standalone drive `i` by hand: it loads by itself.
@@ -375,6 +438,21 @@ impl SimSite {
         let shelf = Config { slots: 200, mail: 0, drives: 0, tapes: Vec::new(), id: SHELF, changer: false, ..Config::default() };
         parts.push(SimLibrary::persistent(&dir.join("sim-shelf.bin"), &shelf)?);
         Ok(SimSite { parts })
+    }
+
+    /// Damage the tape `barcode`, wherever it is: `record` of `partition`,
+    /// or (`None`) the first record of the partition's last index. The
+    /// record damaged.
+    pub fn damage(&self, barcode: &str, partition: usize, record: Option<usize>) -> Result<usize, String> {
+        let barcode = barcode.to_uppercase();
+        let part = self.parts.iter().find(|p| p.cart(&barcode).is_some()).ok_or_else(|| format!("{barcode} is nowhere in the simulation"))?;
+        match record {
+            Some(r) => {
+                part.damage(&barcode, partition, r);
+                Ok(r)
+            }
+            None => part.damage_last_index(&barcode, partition).ok_or_else(|| format!("{barcode} holds no index in that partition")),
+        }
     }
 
     /// Take the tape out wherever it is (as a person would).
@@ -673,6 +751,13 @@ fn tape_cmd(d: &mut Drive, cdb: &[u8], data: Data<'_>, ew: u64, min_part: u64) -
             d.prevent = cdb[4] & 1 != 0;
             return good(0);
         }
+        // LOG SENSE: the TapeAlert page, its flags cleared once read
+        0x4D if cdb[2] & 0x3F == 0x2E => {
+            let page = tape_alert_page(d.alerts);
+            d.alerts = 0;
+            return good(give(data, &page));
+        }
+        0x4D => return check(Sense::new(key::ILLEGAL_REQUEST, 0x24, 0x00)),
         _ => {}
     }
     if d.cart.is_none() {
@@ -737,6 +822,11 @@ fn tape_cmd(d: &mut Drive, cdb: &[u8], data: Data<'_>, ew: u64, min_part: u64) -
             if d.pos >= len {
                 return check(Sense::new(key::BLANK_CHECK, 0x00, 0x05));
             }
+            if cart.damaged.contains(&(part, d.pos)) {
+                d.pos += 1;
+                d.alerts |= alert_bit(alert::HARD_ERROR) | alert_bit(alert::MEDIA) | alert_bit(alert::READ_FAILURE);
+                return check(Sense::new(key::MEDIUM_ERROR, 0x11, 0x00));
+            }
             let rec = cart.parts[part][d.pos].clone();
             d.pos += 1;
             match rec {
@@ -756,6 +846,10 @@ fn tape_cmd(d: &mut Drive, cdb: &[u8], data: Data<'_>, ew: u64, min_part: u64) -
                 return check(Sense::new(key::DATA_PROTECT, 0x27, 0x00));
             }
             let n = u32::from_be_bytes([0, cdb[2], cdb[3], cdb[4]]) as usize;
+            if cart.damaged.contains(&(part, d.pos)) {
+                d.alerts |= alert_bit(alert::HARD_ERROR) | alert_bit(alert::MEDIA) | alert_bit(alert::WRITE_FAILURE);
+                return check(Sense::new(key::MEDIUM_ERROR, 0x0C, 0x00));
+            }
             cart.parts[part].truncate(d.pos);
             if cart.used(part) + n as u64 > cart.caps[part] {
                 return check(Sense { eom: true, ..Sense::new(key::VOLUME_OVERFLOW, 0x00, 0x02) });
@@ -999,7 +1093,7 @@ fn write_cart(o: &mut Vec<u8>, c: &Option<Cart>) {
         o.push(0);
         return;
     };
-    o.push(1);
+    o.push(2);
     wbytes(o, c.barcode.as_bytes());
     o.push(c.write_protect as u8);
     w64(o, c.vcr);
@@ -1023,6 +1117,11 @@ fn write_cart(o: &mut Vec<u8>, c: &Option<Cart>) {
         o.extend_from_slice(&id.to_le_bytes());
         o.push(*f);
         wbytes(o, v);
+    }
+    w64(o, c.damaged.len() as u64);
+    for (p, r) in &c.damaged {
+        w64(o, *p as u64);
+        w64(o, *r as u64);
     }
 }
 
@@ -1086,7 +1185,8 @@ impl Rd<'_> {
         String::from_utf8(self.bytes()?).map_err(|_| Self::bad())
     }
     fn cart(&mut self) -> io::Result<Option<Cart>> {
-        if self.u8()? == 0 {
+        let kind = self.u8()?;
+        if kind == 0 {
             return Ok(None);
         }
         let barcode = self.string()?;
@@ -1110,7 +1210,14 @@ impl Rd<'_> {
             let f = self.u8()?;
             attrs.insert((p, id), (f, self.bytes()?));
         }
-        Ok(Some(Cart { barcode, parts, caps, write_protect, attrs, vcr }))
+        // 2: damaged places follow (files from before them have 1)
+        let mut damaged = Vec::new();
+        if kind == 2 {
+            for _ in 0..self.u64()? {
+                damaged.push((self.u64()? as usize, self.u64()? as usize));
+            }
+        }
+        Ok(Some(Cart { barcode, parts, caps, write_protect, attrs, vcr, damaged }))
     }
 }
 
@@ -1133,7 +1240,7 @@ fn load(file: &Path) -> io::Result<State> {
             f => Some((f - 1) as u16),
         };
         let loaded = r.u8()? != 0;
-        drives.push(Drive { serial, cart, from, loaded, part: 0, pos: 0, unit_attention: true, compression: true, prevent: false, pending: None });
+        drives.push(Drive { serial, cart, from, loaded, part: 0, pos: 0, unit_attention: true, compression: true, prevent: false, pending: None, alerts: 0 });
     }
     let early_warning = r.u64()?;
     let min_partition = r.u64()?;
