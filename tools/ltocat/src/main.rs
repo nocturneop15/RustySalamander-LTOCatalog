@@ -55,7 +55,17 @@ files:
                              files with the Archive attribute; --keep-archive: don't clear it;
                              --index: the index written every 100 GB goes to the end of the data
                              only (data), or into the index partition too (both); default: as in
-                             the plugin's Library settings, else data
+                             the plugin's Library settings, else data; --check: read each tape's
+                             files back right after they are written, comparing them with the disk;
+                             --read-ahead <MB>: read from disk ahead of the tape (0: off; default:
+                             as in the plugin's Library settings, else 256); --name <name>: the
+                             folder on the tapes instead of Backup / Archive; --no-date: without
+                             the date and time
+  archive <folder> [<barcode>...] [--archive-only] [--keep-archive] [--index data|both] [--keep-source]
+                             as backup --check, into \"Archive <date> <time>\\<folder>\", then
+                             DELETES from disk the files found the same on the tapes (after you
+                             confirm; --yes: without asking), and the folders left empty;
+                             --keep-source: only check them
 
 options:
   --program <folder> the RustySalamander folder (with rustysalamander.exe): use the plugin's
@@ -94,7 +104,11 @@ struct Opts {
     name: String,
     archive_only: bool,
     keep_archive: bool,
+    check: bool,
+    keep_source: bool,
+    no_date: bool,
     interim_index: Option<lto_archive::InterimIndex>,
+    read_ahead_mb: Option<u64>,
     log: Option<PathBuf>,
     args: Vec<String>,
 }
@@ -117,7 +131,11 @@ fn parse() -> Result<Opts, String> {
         name: String::new(),
         archive_only: false,
         keep_archive: false,
+        check: false,
+        keep_source: false,
+        no_date: false,
         interim_index: None,
+        read_ahead_mb: None,
         log: None,
         args: Vec::new(),
     };
@@ -138,7 +156,17 @@ fn parse() -> Result<Opts, String> {
             "--rescan" => o.rescan = true,
             "--archive-only" => o.archive_only = true,
             "--keep-archive" => o.keep_archive = true,
+            "--check" => o.check = true,
+            "--keep-source" => o.keep_source = true,
+            "--no-date" => o.no_date = true,
             "--log" => o.log = Some(PathBuf::from(val("--log")?)),
+            "--read-ahead" => {
+                let n: u64 = val("--read-ahead")?.parse().map_err(|_| "--read-ahead needs a number of MB")?;
+                if n > place::MAX_READ_AHEAD_MB {
+                    return Err(format!("--read-ahead is at most {} MB", place::MAX_READ_AHEAD_MB));
+                }
+                o.read_ahead_mb = Some(n);
+            }
             "--index" => {
                 o.interim_index = Some(match val("--index")?.to_ascii_lowercase().as_str() {
                     "data" => lto_archive::InterimIndex::DataPartition,
@@ -174,6 +202,7 @@ fn parse() -> Result<Opts, String> {
             o.drives = list(&s.drives);
         }
         o.interim_index.get_or_insert(lto_archive::InterimIndex::from_key(&s.backup_index));
+        o.read_ahead_mb.get_or_insert(s.read_ahead_mb());
         if s.log_on() && o.log.is_none() {
             o.log = Some(place::ltocat_log_file(&data));
         }
@@ -213,7 +242,9 @@ fn devices(o: &Opts) -> io::Result<Box<dyn Devices>> {
 fn archive(o: &Opts) -> Result<Archive, String> {
     let file = o.catalog()?;
     let cat = Catalog::open(file).map_err(|e| format!("the catalog {}: {e}", file.display()))?;
-    Ok(Archive::new(devices(o).map_err(|e| e.to_string())?, cat, &ltfs::creator()))
+    let a = Archive::new(devices(o).map_err(|e| e.to_string())?, cat, &ltfs::creator());
+    a.set_read_ahead(o.read_ahead_mb.unwrap_or(place::DEFAULT_READ_AHEAD_MB) << 20);
+    Ok(a)
 }
 
 fn ask(question: &str) -> String {
@@ -267,6 +298,7 @@ impl Ui for Console {
                 speed.map(|s| format!(", average {}/s", size(s))).unwrap_or_default()
             ),
             S::NewTape => "waiting for a new tape in the mail slot".to_owned(),
+            S::Deleting { files } => format!("deleting the files found the same on the tapes, {} of {}", files.0, files.1),
             S::Verifying { tape, files, bytes, speed } => format!(
                 "{tape}: checking, {} of {} files, {} of {}{}",
                 files.0,
@@ -725,12 +757,32 @@ fn run(o: &Opts) -> Result<(), String> {
             println!("{b} is an empty LTFS volume {}.", ix.volume_uuid);
             Ok(())
         }
-        "backup" => {
-            need(o, 1, "backup <folder> [<barcode>...] [--archive-only] [--keep-archive] [--index data|both]")?;
+        "backup" | "archive" => {
+            let archiving = cmd == "archive";
+            if archiving {
+                need(o, 1, "archive <folder> [<barcode>...] [--archive-only] [--keep-archive] [--index data|both] [--keep-source]")?;
+            } else {
+                need(o, 1, "backup <folder> [<barcode>...] [--archive-only] [--keep-archive] [--index data|both] [--check]")?;
+            }
             let src = PathBuf::from(&o.args[1]);
             let tapes: Vec<String> = o.args[2..].iter().map(|b| b.to_uppercase()).collect();
-            let set = lto_archive::backup_set_name(&src);
-            let opts = lto_archive::BackupOptions { archive_only: o.archive_only, clear_archive: !o.keep_archive, interim_index: o.interim_index.unwrap_or_default() };
+            // the folder on the tapes: --name (else Backup or Archive), dated unless --no-date
+            let top = if o.name.trim().is_empty() { (if archiving { "Archive" } else { "Backup" }).to_owned() } else { o.name.trim().to_owned() };
+            let top = if o.no_date { top } else { lto_archive::dated(&top) };
+            let set = lto_archive::set_folder(&top, &src);
+            let delete = archiving && !o.keep_source;
+            if delete && !confirm(o, &format!("The files of {} found the same on the tapes will be DELETED from disk.", src.display())) {
+                return Ok(());
+            }
+            let opts = lto_archive::BackupOptions {
+                archive_only: o.archive_only,
+                clear_archive: !o.keep_archive,
+                interim_index: o.interim_index.unwrap_or_default(),
+                verify: archiving || o.check,
+                read_ahead: o.read_ahead_mb.unwrap_or(place::DEFAULT_READ_AHEAD_MB) << 20,
+                // asked above, before the job
+                delete: if delete { lto_archive::DeleteSource::Auto } else { lto_archive::DeleteSource::Keep },
+            };
             let a = archive(o)?;
             let r = a.backup(&src, &set, &tapes, opts, &Console);
             print_notices(&a);
@@ -758,6 +810,22 @@ fn run(o: &Opts) -> Result<(), String> {
             }
             for p in &r.not_cleared {
                 println!("Archive attribute left set: {}", p.display());
+            }
+            if opts.verify {
+                let (n, b) = r.verified_size();
+                println!("The same on the tapes as on disk: {n} files ({}); not: {}", size(b), r.verify_failed.len());
+                for (p, why) in &r.verify_failed {
+                    println!("check FAILED: {}: {why}", p.display());
+                }
+            }
+            if let Some(d) = &r.deleted {
+                println!("Deleted from disk: {} files ({}), {} folders.", d.files, size(d.bytes), d.folders);
+                for p in &d.changed {
+                    println!("kept, changed since it was checked: {}", p.display());
+                }
+                for (p, why) in &d.failed {
+                    println!("couldn't be deleted: {}: {why}", p.display());
+                }
             }
             Ok(())
         }

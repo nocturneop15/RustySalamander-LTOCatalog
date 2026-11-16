@@ -3,10 +3,10 @@
 //! (not everything was), and the full report with every file, saved to a
 //! text file when asked for.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 
-use lto_archive::{BackupOptions, BackupReport};
+use lto_archive::{BackupOptions, BackupReport, DeleteSource};
 use sal_plugin_api::{tr, trf, Values};
 use sal_window::egui::{self, Color32, RichText, ViewportCommand};
 use sal_window::{Content, Windows};
@@ -50,16 +50,24 @@ impl Report {
     }
 }
 
-/// The report of the backup of `src` that ended with `r`.
-pub fn backup(r: &BackupReport, opts: BackupOptions, src: &Path) -> Report {
+/// The report of the backup of `items` (files and folders; a folder alone
+/// backed up whole) that ended with `r`.
+pub fn backup(r: &BackupReport, opts: BackupOptions, items: &[PathBuf]) -> Report {
     let file_name = format!("{} - {}.txt", r.set.replace(['\\', '/'], " - "), tr("report"));
+    let taken: Vec<String> = items.iter().map(|p| format!("  {}", p.display())).collect();
     if r.total_files == 0 && r.total_folders == 0 && opts.archive_only {
-        let headline = tr("Nothing to back up: no file in the folder has the Archive attribute set.");
-        let full = [tr("LTO Catalog: backup report"), trf("Folder: {folder}", &[("folder", &src.display())]), headline.clone()].join("\r\n") + "\r\n";
-        return Report { ok: true, headline, summary: Vec::new(), full, file_name };
+        let headline = tr("Nothing to back up: no file has the Archive attribute set.");
+        let mut full = vec![tr("LTO Catalog: backup report"), trf("Files and folders ({n}):", &[("n", &items.len())])];
+        full.extend(taken);
+        full.push(headline.clone());
+        return Report { ok: true, headline, summary: Vec::new(), full: full.join("\r\n") + "\r\n", file_name };
     }
     let (files, bytes) = r.written();
-    let ok = r.error.is_none() && !r.cancelled && r.unreadable.is_empty() && r.too_big.is_empty() && files >= r.total_files;
+    // checked: every file written read back the same; deleted (when the
+    // person didn't keep them): every one of them
+    let checked_ok = !opts.verify || (r.verify_failed.is_empty() && r.verified.len() as u64 >= files);
+    let deleted_ok = r.deleted.as_ref().is_none_or(|d| d.failed.is_empty() && d.changed.is_empty());
+    let ok = r.error.is_none() && !r.cancelled && r.unreadable.is_empty() && r.too_big.is_empty() && files >= r.total_files && checked_ok && deleted_ok;
     let headline = if let Some(e) = &r.error {
         trf("The backup stopped: {error}\n{files} of {total} files ({size}) were backed up into \"{set}\" before; they are on the tapes.", &[("error", e), ("files", &files), ("total", &r.total_files), ("size", &size_text(bytes)), ("set", &r.set)])
     } else if r.cancelled {
@@ -104,6 +112,33 @@ pub fn backup(r: &BackupReport, opts: BackupOptions, src: &Path) -> Report {
         (r.unreadable.len(), trf("Couldn't be read: {n}", &[("n", &r.unreadable.len())])),
         (r.not_cleared.len(), trf("Archive attribute left set: {n}", &[("n", &r.not_cleared.len())])),
     ];
+    // the check after writing, and what an archive deleted
+    let (checked, checked_bytes) = r.verified_size();
+    let deletable = r.deletable_size().0;
+    let deleting = opts.delete != DeleteSource::Keep;
+    let mut after: Vec<String> = Vec::new();
+    if opts.verify {
+        after.push(trf("Read back from the tapes, the same as on disk: {files} files ({size}).", &[("files", &checked), ("size", &size_text(checked_bytes))]));
+    }
+    match &r.deleted {
+        Some(d) => after.push(trf("Deleted from disk: {files} files ({size}), {folders} folders.", &[("files", &d.files), ("size", &size_text(d.bytes)), ("folders", &d.folders)])),
+        None if deleting && deletable > 0 && !r.cancelled => after.push(tr("Nothing was deleted from disk: you chose to keep the files.")),
+        None if deleting => after.push(tr("Nothing was deleted from disk.")),
+        None => {}
+    }
+    if !after.is_empty() {
+        summary.push(String::new());
+        summary.extend(after.iter().cloned());
+    }
+    let (changed, not_deleted) = r.deleted.as_ref().map_or((0, 0), |d| (d.changed.len(), d.failed.len()));
+    let counts = [
+        counts[0].clone(),
+        counts[1].clone(),
+        counts[2].clone(),
+        (r.verify_failed.len(), trf("Not read back the same from the tapes (kept on disk): {n}", &[("n", &r.verify_failed.len())])),
+        (changed, trf("Changed since they were checked (kept on disk): {n}", &[("n", &changed)])),
+        (not_deleted, trf("Couldn't be deleted: {n}", &[("n", &not_deleted)])),
+    ];
     if counts.iter().any(|(n, _)| *n > 0) {
         summary.push(String::new());
         summary.extend(counts.into_iter().filter(|(n, _)| *n > 0).map(|(_, line)| line));
@@ -116,21 +151,43 @@ pub fn backup(r: &BackupReport, opts: BackupOptions, src: &Path) -> Report {
     let mut full = vec![
         tr("LTO Catalog: backup report"),
         String::new(),
-        trf("Folder: {folder}", &[("folder", &src.display())]),
         trf("On the tapes: {set}", &[("set", &r.set)]),
         trf("Backed up: {what}; Archive attribute cleared: {clear}", &[("what", &what), ("clear", &clear)]),
+        trf("Checked after writing: {checked}; deleted from disk: {delete}", &[
+            ("checked", &if opts.verify { tr("yes") } else { tr("no") }),
+            (
+                "delete",
+                &match opts.delete {
+                    DeleteSource::Keep => tr("no"),
+                    DeleteSource::Ask => tr("after asking"),
+                    DeleteSource::Auto => tr("yes, without asking"),
+                },
+            ),
+        ]),
         String::new(),
         if ok { tr("Result: everything was backed up.") } else { tr("Result: NOT everything was backed up.") },
         headline.clone(),
         found,
         trf("Written: {files} files ({size}).", &[("files", &files), ("size", &size_text(bytes))]),
     ];
+    full.extend(after);
+    full.push(String::new());
+    full.push(trf("Files and folders ({n}):", &[("n", &items.len())]));
+    full.extend(taken);
     if !tapes.is_empty() {
         full.push(String::new());
         full.push(trf("Tapes ({n}):", &[("n", &tapes.len())]));
         full.extend(tapes.iter().map(|t| format!("  {t}")));
     }
-    for (title, items) in problems.iter().filter(|(_, items)| !items.is_empty()) {
+    let mut more: Vec<(String, Vec<String>)> = vec![(
+        trf("Not read back the same from the tapes, kept on disk ({n}):", &[("n", &r.verify_failed.len())]),
+        r.verify_failed.iter().map(|(p, why)| format!("{}: {why}", p.display())).collect(),
+    )];
+    if let Some(d) = &r.deleted {
+        more.push((trf("Changed since they were checked, kept on disk ({n}):", &[("n", &d.changed.len())]), d.changed.iter().map(|p| p.display().to_string()).collect()));
+        more.push((trf("Couldn't be deleted ({n}):", &[("n", &d.failed.len())]), d.failed.iter().map(|(p, why)| format!("{}: {why}", p.display())).collect()));
+    }
+    for (title, items) in problems.iter().chain(more.iter()).filter(|(_, items)| !items.is_empty()) {
         full.push(String::new());
         full.push(title.clone());
         full.extend(items.iter().map(|i| format!("  {i}")));
@@ -312,7 +369,41 @@ mod tests {
     use lto_archive::{InterimIndex, TapeDone};
 
     fn opts() -> BackupOptions {
-        BackupOptions { archive_only: false, clear_archive: true, interim_index: InterimIndex::from_key("") }
+        BackupOptions { archive_only: false, clear_archive: true, interim_index: InterimIndex::from_key(""), ..Default::default() }
+    }
+
+    /// An archive: what was read back the same and deleted is in the
+    /// summary as numbers; a file that wasn't the same makes it red and is
+    /// named in the full report only.
+    #[test]
+    fn an_archive_reports_the_check_and_what_was_deleted() {
+        use lto_archive::{DeleteReport, FileDone};
+        let opts = BackupOptions { verify: true, delete: DeleteSource::Ask, ..opts() };
+        let verified = |n: usize| (0..n).map(|i| FileDone { path: PathBuf::from(format!("D:\\Data\\v{i}")), length: 100, modified: None }).collect::<Vec<_>>();
+        let r = BackupReport {
+            set: "Archive 2026-11-16 10.00\\Data".into(),
+            tapes: vec![TapeDone { barcode: "LTO001L5".into(), files: 3, bytes: 300 }],
+            total_files: 3,
+            total_bytes: 300,
+            checked: true,
+            verified: verified(3),
+            deleted: Some(DeleteReport { files: 3, bytes: 300, folders: 1, ..DeleteReport::default() }),
+            ..BackupReport::default()
+        };
+        let only = [PathBuf::from("D:\\Data\\a"), PathBuf::from("D:\\Data\\b")];
+        let rep = backup(&r, opts, &only);
+        assert!(rep.ok, "{rep:?}");
+        assert!(rep.summary.iter().any(|l| l.contains("the same as on disk: 3 files")), "{:#?}", rep.summary);
+        assert!(rep.summary.iter().any(|l| l.contains("Deleted from disk: 3 files")), "{:#?}", rep.summary);
+        assert!(rep.full.contains("Files and folders (2):\r\n  D:\\Data\\a\r\n  D:\\Data\\b\r\n"), "{}", rep.full);
+        // one not the same: red, kept, named only in the full report
+        let bad = BackupReport { verified: verified(2), verify_failed: vec![(PathBuf::from("D:\\Data\\odd.bin"), "differs".into())], deleted: None, ..r.clone() };
+        let rep = backup(&bad, opts, &[PathBuf::from("D:\\Data")]);
+        assert!(!rep.ok);
+        assert!(rep.summary.iter().any(|l| l == "Not read back the same from the tapes (kept on disk): 1"), "{:#?}", rep.summary);
+        assert!(rep.summary.iter().any(|l| l.contains("you chose to keep")), "{:#?}", rep.summary);
+        assert!(!rep.summary.iter().any(|l| l.contains("odd.bin")));
+        assert!(rep.full.contains("odd.bin: differs"));
     }
 
     /// A backup that left 300 files out: the summary names the first few,
@@ -328,7 +419,7 @@ mod tests {
             total_bytes: 10 << 30,
             ..BackupReport::default()
         };
-        let rep = backup(&r, opts(), Path::new("D:\\Data"));
+        let rep = backup(&r, opts(), &[PathBuf::from("D:\\Data")]);
         assert!(!rep.ok);
         assert!(rep.headline.contains("700 of 1000 files"), "{}", rep.headline);
         assert!(rep.summary.len() < 10, "{:#?}", rep.summary);
@@ -355,12 +446,12 @@ mod tests {
             total_bytes: 500,
             ..BackupReport::default()
         };
-        let rep = backup(&r, opts(), Path::new("D:\\Data"));
+        let rep = backup(&r, opts(), &[PathBuf::from("D:\\Data")]);
         assert!(rep.ok);
         assert!(rep.short().contains("LTO001L5: medium error"));
-        let stopped = backup(&BackupReport { error: Some("drive gone".into()), ..r.clone() }, opts(), Path::new("D:\\Data"));
+        let stopped = backup(&BackupReport { error: Some("drive gone".into()), ..r.clone() }, opts(), &[PathBuf::from("D:\\Data")]);
         assert!(!stopped.ok && stopped.headline.contains("drive gone"));
-        assert!(!backup(&BackupReport { cancelled: true, ..r }, opts(), Path::new("D:\\Data")).ok);
+        assert!(!backup(&BackupReport { cancelled: true, ..r }, opts(), &[PathBuf::from("D:\\Data")]).ok);
     }
 
     /// The window: fixed, never taller than the screen however long the
@@ -375,7 +466,7 @@ mod tests {
             total_files: 40,
             ..BackupReport::default()
         };
-        for (report, dark) in [(backup(&r, opts(), Path::new("D:\\Data")), true), (backup(&BackupReport { unreadable: Vec::new(), ..r.clone() }, opts(), Path::new("D:\\Data")), false)] {
+        for (report, dark) in [(backup(&r, opts(), &[PathBuf::from("D:\\Data")]), true), (backup(&BackupReport { unreadable: Vec::new(), ..r.clone() }, opts(), &[PathBuf::from("D:\\Data")]), false)] {
             let ok = report.ok;
             let mut w = ReportWin { title: "Backup report".into(), report, saving: None, saved: None, dialog_set: false };
             let ctx = egui::Context::default();

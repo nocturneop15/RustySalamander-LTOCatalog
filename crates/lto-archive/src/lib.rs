@@ -39,7 +39,10 @@ use lto_scsi::tape::{attr, TapeDrive};
 use ltfs::{File, Index, Node, Time, Times, Volume};
 
 mod backup;
-pub use backup::{archive_set, backup_set_name, clear_archive, set_archive, BackupOptions, BackupReport, InterimIndex, NewTapeProblem, TapeDone, COMMIT_EVERY};
+mod prefetch;
+pub use backup::{
+    archive_set, archive_set_name, backup_set_name, clear_archive, dated, delete_source, set_folder, set_archive, BackupOptions, BackupReport, DeleteReport, DeleteSource, FileDone, InterimIndex, NewTapeProblem, TapeDone, COMMIT_EVERY,
+};
 
 /// What to do about a tape that no library or drive has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +86,9 @@ pub enum Step<'a> {
     /// speed of reading its data so far, bytes a second (loading the tape
     /// not counted; None before any data was read).
     Verifying { tape: &'a str, files: (u64, u64), bytes: (u64, u64), speed: Option<u64> },
+    /// An archive deleting from disk the files found the same on the
+    /// tapes: (done, of) files.
+    Deleting { files: (u64, u64) },
 }
 
 /// One partition's label or index of a tape couldn't be read: the other
@@ -168,6 +174,13 @@ pub trait Ui {
     /// says nothing.
     fn index_damaged(&self, warning: &IndexWarning) {
         let _ = warning;
+    }
+    /// An archive's files are on the tapes: `files` (`bytes`) to delete
+    /// from disk (read back the same, when they were checked; `not_same`
+    /// weren't). True deletes them. The default keeps them.
+    fn confirm_delete(&self, files: u64, bytes: u64, not_same: u64) -> bool {
+        let _ = (files, bytes, not_same);
+        false
     }
     /// A backup's tape failed with `error` (it couldn't be read or written)
     /// and `left` bytes are still to go: Retry goes on with another tape,
@@ -308,6 +321,9 @@ pub struct Archive {
     creator: String,
     /// What the drives said since the last [`Archive::take_notices`].
     notices: Mutex<Vec<Notice>>,
+    /// Bytes a copy onto a tape reads from disk ahead of the tape
+    /// ([`Archive::set_read_ahead`]; 0: none).
+    read_ahead: std::sync::atomic::AtomicU64,
 }
 
 /// How long to wait for a library to read what was put into its mail slot
@@ -383,7 +399,21 @@ fn cartridge_says(drive: &mut TapeDrive) -> Option<Said> {
 
 impl Archive {
     pub fn new(devices: Box<dyn Devices>, catalog: Catalog, creator: &str) -> Archive {
-        Archive { devices, site: Mutex::new(None), catalog: Mutex::new(catalog), creator: creator.to_owned(), notices: Mutex::new(Vec::new()) }
+        Archive {
+            devices,
+            site: Mutex::new(None),
+            catalog: Mutex::new(catalog),
+            creator: creator.to_owned(),
+            notices: Mutex::new(Vec::new()),
+            read_ahead: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// How many bytes a copy onto a tape ([`Archive::write`]) reads from
+    /// disk ahead of the tape, while it writes (0: none, each file is read
+    /// when it is written). A backup has its own, in its options.
+    pub fn set_read_ahead(&self, bytes: u64) {
+        self.read_ahead.store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The libraries and drives, opened the first time they are needed.
@@ -1022,7 +1052,12 @@ impl Archive {
             }
             let mut done = 0u64;
             let mut first_error = None;
-            for (disk, dest, is_dir) in &plan {
+            // the files, read from disk while the tape writes
+            let files: Vec<(usize, PathBuf)> = plan.iter().enumerate().filter(|(_, (_, _, d))| !d).map(|(i, (p, _, _))| (i, p.clone())).collect();
+            let read_ahead = self.read_ahead.load(std::sync::atomic::Ordering::Relaxed);
+            log!("write: {} files, {}, read ahead {}", files.len(), lto_scsi::log::bytes(total), lto_scsi::log::bytes(read_ahead));
+            let mut prefetch = prefetch::Prefetch::start(files, read_ahead);
+            for (i, (disk, dest, is_dir)) in plan.iter().enumerate() {
                 let now = Time::now();
                 if *is_dir {
                     let t = fs::metadata(disk).ok().map(|m| times_of(&m, now)).unwrap_or(Times::all(now));
@@ -1042,8 +1077,12 @@ impl Archive {
                 }
                 ui.step(Step::Writing(barcode, dest));
                 let r = (|| -> Result<()> {
-                    let meta = fs::metadata(disk)?;
-                    let mut f = fs::File::open(disk)?;
+                    // in step: each file is read to its end, or the copy stops
+                    let meta = match prefetch.next_file() {
+                        Some((j, m)) if j == i => m.map_err(|e| Error::Io(io::Error::new(e.kind(), format!("\"{}\": {e}", disk.display()))))?,
+                        _ => return Err(Error::Refused(format!("\"{}\" wasn't read", disk.display()))),
+                    };
+                    let mut f = prefetch.reader();
                     let (extents, length) = v.write_data(&mut f, &mut |n| {
                         done += n;
                         progress(done, total) && !ui.cancelled()

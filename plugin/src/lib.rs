@@ -9,6 +9,7 @@
 //! ([`ltfs::names`]).
 
 mod ask;
+mod backupwin;
 mod report;
 
 use std::cell::{Cell, RefCell};
@@ -20,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lto_archive::{Answer, Archive, BackupOptions, IndexWarning, InterimIndex, NewTapeProblem, ReadSink, Step, Ui, VerifyReport};
+use lto_archive::{Answer, Archive, IndexWarning, InterimIndex, NewTapeProblem, ReadSink, Step, Ui, VerifyReport};
 use lto_catalog::{Catalog, Condition, Tape};
 use lto_scsi::library::Devices;
 use lto_scsi::log;
@@ -101,6 +102,7 @@ fn step_text(step: Step) -> String {
         Step::Backup { tape, files, bytes, speed: None } => trf("{barcode}: backing up, {n} of {total} files, {done} of {all}…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1))]),
         Step::Backup { tape, files, bytes, speed: Some(s) } => trf("{barcode}: backing up, {n} of {total} files, {done} of {all}, average {speed}/s…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1)), ("speed", &size_text(s))]),
         Step::NewTape => tr("waiting for a new tape in the mail slot…"),
+        Step::Deleting { files } => trf("deleting the files found the same on the tapes, {n} of {total}…", &[("n", &files.0), ("total", &files.1)]),
         Step::Verifying { tape, files, bytes, speed: Some(s) } => trf("{barcode}: checking, {n} of {total} files, {done} of {all}, average {speed}/s…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1)), ("speed", &size_text(s))]),
         Step::Verifying { tape, files, bytes, speed: None } => trf("{barcode}: checking, {n} of {total} files, {done} of {all}…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1))]),
     }
@@ -210,13 +212,13 @@ fn apply_log(data: &Path, s: &Settings) {
 /// What a command was given, for the log: the fields of the forms, not the
 /// program's look.
 fn logged_input(input: &Values) -> String {
-    const FIELDS: [&str; 22] = [
+    const FIELDS: [&str; 31] = [
         "folder", "what", "clear", "barcode", "barcodes", "confirm", "name", "note", "which", "catalog", "changer", "drives", "backup_index", "log", "selected", "other", "match", "query",
-        "tape", "path", "rescan", "items",
+        "tape", "path", "rescan", "items", "mode", "verify", "delete", "panel", "source_items", "other_selected", "read_ahead", "name", "dated",
     ];
     input
         .iter()
-        .filter(|(k, _)| FIELDS.contains(&k.as_str()) || k.starts_with("tape:"))
+        .filter(|(k, _)| FIELDS.contains(&k.as_str()) || k.starts_with("tape:") || k.starts_with("pick:"))
         .map(|(k, v)| format!("{k}={v:?}"))
         .collect::<Vec<_>>()
         .join(", ")
@@ -228,7 +230,9 @@ fn open_archive(data: &Path, s: &Settings) -> Result<Archive, String> {
         let _ = fs::create_dir_all(d);
     }
     let cat = Catalog::open(&path).map_err(|e| trf("The catalog {file} can't be opened: {error}", &[("file", &path.display()), ("error", &e)]))?;
-    Ok(Archive::new(devices(data, s)?, cat, &ltfs::creator()))
+    let a = Archive::new(devices(data, s)?, cat, &ltfs::creator());
+    a.set_read_ahead(s.read_ahead_mb() << 20);
+    Ok(a)
 }
 
 impl Plugin for LtoCatalog {
@@ -405,7 +409,7 @@ impl LtoCatalog {
         }
         detail.push(tr("A blank tape is formatted after you confirm."));
         let look = self.look.lock().unwrap().clone();
-        match ask::ask(&self.asks, look, tr("Back up a folder"), text, detail.join("\n"), vec![tr("Continue"), tr("Stop the backup")], 0, 1) {
+        match ask::ask(&self.asks, look, tr("Back up to tapes"), text, detail.join("\n"), vec![tr("Continue"), tr("Stop the backup")], 0, 1) {
             Some(0) => Answer::Retry,
             _ => Answer::Cancel,
         }
@@ -414,11 +418,24 @@ impl LtoCatalog {
     /// The new tape for a backup isn't an LTFS volume: format it? Enter
     /// takes the safe answer, another tape.
     /// A backup's tape failed: go on with another one?
+    /// An archive's files were read back from the tapes: delete those
+    /// found the same from disk? Keep is the default.
+    fn ask_delete(&self, files: u64, bytes: u64, not_same: u64) -> bool {
+        let text = trf("{files} files ({size}) are on the tapes and were read back the same as on disk. Delete them from disk now?", &[("files", &files), ("size", &size_text(bytes))]);
+        let mut detail = tr("They are deleted for good, not moved to the Recycle Bin, and so are the folders left empty.");
+        if not_same > 0 {
+            detail.push('\n');
+            detail.push_str(&trf("{n} files weren't read back the same: they stay on disk either way.", &[("n", &not_same)]));
+        }
+        let look = self.look.lock().unwrap().clone();
+        ask::ask(&self.asks, look, tr("Archive to tapes"), text, detail, vec![tr("Delete from disk"), tr("Keep them")], 1, 1) == Some(0)
+    }
+
     fn ask_tape_failed(&self, barcode: &str, error: &str, left: u64) -> Answer {
         let text = trf("Tape {barcode} failed: {error}", &[("barcode", &barcode), ("error", &error)]);
         let detail = trf("{size} is still to back up. What its last index holds is safe on the tape; the rest is written onto the next tape. The tape is noted as damaged in the catalog.", &[("size", &size_text(left))]);
         let look = self.look.lock().unwrap().clone();
-        match ask::ask(&self.asks, look, tr("Back up a folder"), text, detail, vec![tr("Go on with another tape"), tr("Stop the backup")], 0, 1) {
+        match ask::ask(&self.asks, look, tr("Back up to tapes"), text, detail, vec![tr("Go on with another tape"), tr("Stop the backup")], 0, 1) {
             Some(0) => Answer::Retry,
             _ => Answer::Cancel,
         }
@@ -485,7 +502,7 @@ impl LtoCatalog {
     fn ask_format(&self, barcode: &str) -> Answer {
         let text = trf("Tape {barcode} isn't an LTFS volume: it is blank, or in another format. Format it for this backup? Anything on it is erased.", &[("barcode", &barcode)]);
         let look = self.look.lock().unwrap().clone();
-        match ask::ask(&self.asks, look, tr("Back up a folder"), text, String::new(), vec![tr("Format and use it"), tr("Use another tape"), tr("Stop the backup")], 1, 2) {
+        match ask::ask(&self.asks, look, tr("Back up to tapes"), text, String::new(), vec![tr("Format and use it"), tr("Use another tape"), tr("Stop the backup")], 1, 2) {
             Some(0) => Answer::Retry,
             Some(1) => Answer::Skip,
             _ => Answer::Cancel,
@@ -599,6 +616,11 @@ impl Ui for JobUi<'_> {
     }
     fn index_damaged(&self, w: &IndexWarning) {
         self.plugin.warn_index(w);
+    }
+    fn confirm_delete(&self, files: u64, bytes: u64, not_same: u64) -> bool {
+        let yes = self.plugin.ask_delete(files, bytes, not_same);
+        log!("asked whether to delete the {files} files found the same on the tapes: {}", if yes { "delete" } else { "keep" });
+        yes
     }
     fn tape_failed(&self, barcode: &str, error: &str, left: u64) -> Answer {
         let a = self.plugin.ask_tape_failed(barcode, error, left);
@@ -748,6 +770,40 @@ impl ReadSink for ToSink<'_> {
     fn end(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// The read-ahead buffer typed in the settings, in MB; empty: the default.
+fn read_ahead_value(v: &str) -> io::Result<String> {
+    let v = v.trim();
+    if v.is_empty() {
+        return Ok(String::new());
+    }
+    match v.parse::<u64>() {
+        Ok(n) if n <= place::MAX_READ_AHEAD_MB => Ok(n.to_string()),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, trf("The read-ahead buffer is a number of MB from 0 to {max}.", &[("max", &place::MAX_READ_AHEAD_MB)]))),
+    }
+}
+
+/// The files and folders to offer: those selected in the panel showing a
+/// folder on disk (the active one, else the other), or that folder.
+fn disk_selection(values: &Values) -> Vec<PathBuf> {
+    for (dir, sel) in [("panel", "selected"), ("other", "other_selected")] {
+        let Some(dir) = values.get(dir).map(PathBuf::from).filter(|p| !is_ours(p) && p.is_dir()) else { continue };
+        let items: Vec<PathBuf> = values.get(sel).and_then(|s| decode(s)).unwrap_or_default().into_iter().map(PathBuf::from).filter(|p| !is_ours(p) && p.exists()).collect();
+        return if items.is_empty() { vec![dir] } else { items };
+    }
+    Vec::new()
+}
+
+/// The form's files and folders (where the program can't show the
+/// dialog): those listed and ticked, and a folder typed.
+fn form_items(values: &Values) -> Vec<PathBuf> {
+    let listed: Vec<PathBuf> = values.get("source_items").and_then(|s| decode(s)).unwrap_or_default().into_iter().map(PathBuf::from).collect();
+    let mut out: Vec<PathBuf> = listed.into_iter().enumerate().filter(|(i, _)| values.get(&format!("pick:{i}")).is_some_and(|v| !v.is_empty())).map(|(_, p)| p).collect();
+    if let Some(f) = values.get("folder").map(|f| f.trim()).filter(|f| !f.is_empty()) {
+        out.push(PathBuf::from(f));
+    }
+    out
 }
 
 /// The barcodes of the tapes selected in the panel (or under the cursor),
@@ -1001,66 +1057,135 @@ impl LtoCatalog {
         Ok(Reply::Form(Form { title: tr("Format tapes"), ok: tr("Format"), command: "format_do".into(), fields }))
     }
 
-    /// The folder to back up (the other panel's, when it shows a folder on
-    /// disk), what to take, the Archive attribute, and the LTFS tapes in
-    /// the libraries and drives to tick (those selected in the panel ticked).
+    /// Back up or archive: the dialog (the files and folders selected in a
+    /// panel on disk, or its folder; the LTFS tapes in the libraries and
+    /// drives, those selected in the panel ticked), then the job. Where the
+    /// program can't show it, a form.
     fn cmd_backup_form(&self, values: &Values) -> io::Result<Reply> {
         let chosen = chosen_tapes(values);
-        let choice = |id: &str, label: String| (id.to_owned(), label);
-        let folder = values.get("other").map(PathBuf::from).filter(|p| !is_ours(p) && p.is_dir()).map(|p| p.display().to_string()).unwrap_or_default();
-        let mut fields = vec![
-            field("folder", tr("Folder to back up"), FieldKind::Folder, &folder),
-            field("what", tr("Back up"), FieldKind::Choice(vec![choice("all", tr("everything")), choice("archive", tr("only files with the Archive attribute"))]), "all"),
-            field("clear", tr("Clear the Archive attribute of the files backed up"), FieldKind::Check, "1"),
-            note(tr("Tapes to use, filled in barcode order:")),
-        ];
+        let mut setup = backupwin::Setup { items: disk_selection(values), ..Default::default() };
         let a = self.archive();
         match a.inventory(false) {
             Ok(_) => {
                 let tapes = a.catalog.lock().unwrap().tapes().map_err(|e| io::Error::other(e.to_string()))?;
                 let usable: Vec<&Tape> = tapes.iter().filter(|t| t.in_library() && t.is_ltfs() && !is_cleaning(&t.barcode)).collect();
                 if usable.is_empty() {
-                    fields.push(note(tr("No LTFS tape is in a library or drive now: new tapes are asked for.")));
+                    setup.tapes_note = Some(tr("No LTFS tape is in a library or drive now: new tapes are asked for."));
                 }
-                for t in usable {
-                    let ticked = if chosen.contains(&t.barcode.to_uppercase()) { "1" } else { "" };
-                    fields.push(field(&format!("tape:{}", t.barcode), tape_label(t), FieldKind::Check, ticked));
-                }
+                setup.tapes = usable.iter().map(|t| (t.barcode.clone(), tape_label(t), chosen.contains(&t.barcode.to_uppercase()))).collect();
             }
-            Err(e) => fields.push(note(io_err(e).to_string())),
+            Err(e) => setup.tapes_note = Some(io_err(e).to_string()),
         }
-        fields.push(note(tr("The backup goes into a folder \"Backup <date> <time>\" on each tape. When the tapes are full, a new tape is asked for; a blank one is formatted after you confirm. A file larger than a whole tape is left out.")));
-        Ok(Reply::Form(Form { title: tr("Back up a folder"), ok: tr("Back up"), command: "backup_do".into(), fields }))
+        drop(a);
+        let look = self.look.lock().unwrap().clone();
+        self.say(tr("choosing what to back up…"));
+        match backupwin::ask(&self.asks, look, setup.clone()) {
+            Some(Some(choice)) => self.run_backup(choice),
+            Some(None) => {
+                log!("backup: cancelled in the dialog");
+                Ok(Reply::Done)
+            }
+            None => Ok(Self::backup_form(&setup)),
+        }
     }
 
+    /// The dialog as a form, where the program can't show it.
+    fn backup_form(setup: &backupwin::Setup) -> Reply {
+        let choice = |id: &str, label: String| (id.to_owned(), label);
+        let names: Vec<String> = setup.items.iter().map(|p| p.display().to_string()).collect();
+        let mut fields = vec![
+            field("mode", tr("Do"), FieldKind::Choice(vec![choice("backup", tr("Back up: the files stay on disk")), choice("archive", tr("Archive: the files will be deleted from their original location once they are on the tapes"))]), "backup"),
+            field("name", tr("Name of the folder on the tapes (empty: Backup or Archive)"), FieldKind::Text, ""),
+            field("dated", tr("Append the date and time"), FieldKind::Check, "1"),
+            field("what", tr("Options"), FieldKind::Choice(vec![choice("all", tr("All files")), choice("archive", tr("Only files with the Archive attribute"))]), "all"),
+            field("clear", tr("Clear the Archive attribute of the files backed up"), FieldKind::Check, "1"),
+            field("verify", tr("Check the data right after it is written: each tape's files are read back and compared with the files on disk"), FieldKind::Check, ""),
+            field(
+                "delete",
+                tr("Delete"),
+                FieldKind::Choice(vec![
+                    choice(backupwin::DeleteMode::Auto.key(), tr("Delete without asking, as soon as the files are on the tapes")),
+                    choice(backupwin::DeleteMode::AutoChecked.key(), tr("Delete without asking, once the data is checked (turns Check the data on)")),
+                    choice(backupwin::DeleteMode::Ask.key(), tr("Ask before deleting, once everything is written")),
+                ]),
+                backupwin::DeleteMode::Ask.key(),
+            ),
+            note(tr("Deleted for good, not moved to the Recycle Bin, and so are the folders left empty. A file that wasn't read back the same, or changed meanwhile, stays.")),
+            note(tr("Files and folders")),
+            field("source_items", String::new(), FieldKind::Hidden, &sal_plugin_api::ui::encode(&names)),
+        ];
+        for (i, p) in setup.items.iter().enumerate() {
+            fields.push(field(&format!("pick:{i}"), p.display().to_string(), FieldKind::Check, "1"));
+        }
+        fields.push(field("folder", tr("Browse…"), FieldKind::Folder, ""));
+        fields.push(note(tr("Tapes to use, filled in barcode order:")));
+        if let Some(n) = &setup.tapes_note {
+            fields.push(note(n.clone()));
+        }
+        for (barcode, label, on) in &setup.tapes {
+            fields.push(field(&format!("tape:{barcode}"), label.clone(), FieldKind::Check, if *on { "1" } else { "" }));
+        }
+        fields.push(note(tr("When the tapes are full, a new tape is asked for; a blank one is formatted after you confirm. A file larger than a whole tape is left out. Without the date, a later backup of the same name goes into the same folder and replaces its files of the same name.")));
+        Reply::Form(Form { title: tr("Back up or archive"), ok: tr("Start"), command: "backup_do".into(), fields })
+    }
+
+    /// The form's answer.
     fn cmd_backup(&self, values: &Values) -> io::Result<Reply> {
-        let folder = values.get("folder").map(|f| f.trim()).unwrap_or("");
-        if folder.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, tr("Choose the folder to back up.")));
+        let on = |k: &str| values.get(k).is_some_and(|v| !v.is_empty());
+        let choice = backupwin::Choice {
+            archive: values.get("mode").is_some_and(|m| m == "archive"),
+            archive_only: values.get("what").is_some_and(|w| w == "archive"),
+            clear: on("clear"),
+            verify: on("verify"),
+            delete: backupwin::DeleteMode::from_key(values.get("delete").map(String::as_str).unwrap_or("")),
+            name: values.get("name").cloned().unwrap_or_default(),
+            // not in the answer: on, as the form starts
+            dated: values.get("dated").is_none_or(|v| !v.is_empty()),
+            items: form_items(values),
+            tapes: values.iter().filter(|(k, v)| k.starts_with("tape:") && !v.is_empty()).map(|(k, _)| k[5..].to_uppercase()).collect(),
+        };
+        self.run_backup(choice)
+    }
+
+    /// Back up or archive what was chosen: a folder alone whole (its content
+    /// in "Backup <date> <time>\<folder>"), else the items, in
+    /// "Backup <date> <time>\<their folder>" (from several folders: in the
+    /// dated folder). It ends with its report.
+    fn run_backup(&self, c: backupwin::Choice) -> io::Result<Reply> {
+        if c.items.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, tr("Choose the files and folders to back up.")));
         }
-        let src = PathBuf::from(folder);
-        if folder.chars().any(char::is_control) || is_ours(&src) || !src.is_dir() {
-            let shown: String = folder.chars().filter(|c| !c.is_control()).take(200).collect();
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, trf("\"{folder}\" isn't a folder on disk.", &[("folder", &shown)])));
+        for p in &c.items {
+            let text = p.to_string_lossy();
+            if text.chars().any(char::is_control) || is_ours(p) || !p.exists() {
+                let shown: String = text.chars().filter(|c| !c.is_control()).take(200).collect();
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, trf("\"{path}\" isn't a file or folder on disk.", &[("path", &shown)])));
+            }
         }
-        let list: Vec<String> = values.iter().filter(|(k, v)| k.starts_with("tape:") && !v.is_empty()).map(|(k, _)| k[5..].to_uppercase()).collect();
-        if let Some(bad) = list.iter().find(|b| !barcode_ok(b)) {
+        if let Some(bad) = c.tapes.iter().find(|b| !barcode_ok(b)) {
             return Err(bad_barcode(bad));
         }
-        let opts = BackupOptions {
-            archive_only: values.get("what").is_some_and(|w| w == "archive"),
-            clear_archive: values.get("clear").is_some_and(|c| !c.is_empty()),
-            interim_index: InterimIndex::from_key(&self.settings.lock().unwrap().backup_index),
+        let opts = {
+            let s = self.settings.lock().unwrap();
+            c.options(InterimIndex::from_key(&s.backup_index), s.read_ahead_mb() << 20)
         };
-        let set = lto_archive::backup_set_name(&src);
+        // the folder on the tapes: the name (Backup or Archive), dated
+        let top = backupwin::folder_name(&c.name, c.archive).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let top = if c.dated { lto_archive::dated(&top) } else { top };
+        let set = backupwin::target(&top, &c.items);
+        let whole = (c.items.len() == 1 && c.items[0].is_dir()).then(|| c.items[0].clone());
         let ui = self.command_ui();
-        // the backup ends with its report, whatever happened; one that
-        // couldn't start says why the same way
-        match self.archive().backup(&src, &set, &list, opts, &ui) {
+        // the job ends with its report, whatever happened; one that couldn't
+        // start says why the same way
+        let r = match &whole {
+            Some(d) => self.archive().backup(d, &set, &c.tapes, opts, &ui),
+            None => self.archive().backup_items(&c.items, &set, &c.tapes, opts, &ui),
+        };
+        match r {
             Ok(r) => {
                 // a summary that fits the screen, green or red, with the full
                 // report to save; a message where the window can't be shown
-                let report = report::backup(&r, opts, &src);
+                let report = report::backup(&r, opts, &c.items);
                 let look = self.look.lock().unwrap().clone();
                 if report::show(&self.asks, look, report.clone()) {
                     Ok(Reply::Done)
@@ -1271,6 +1396,8 @@ impl LtoCatalog {
                     InterimIndex::from_key(&s.backup_index).key(),
                 ),
                 note(tr("At the end of each tape the index is always written into both partitions. After a failure, the newest index is at the end of the data; this plugin and IBM LTFS find it there.")),
+                field("read_ahead", trf("While writing onto tapes, read ahead from disk (MB, 0 to {max}; 0: off)", &[("max", &place::MAX_READ_AHEAD_MB)]), FieldKind::Text, &s.read_ahead_mb().to_string()),
+                note(tr("While the tape writes, the next files are read from disk into this buffer, so a slow disk (a network share, many small files) doesn't stop the tape. For backups, archives and copies onto a tape; it takes as much memory while they run.")),
                 field("log", trf("Write a detailed log ({file})", &[("file", &place::log_file(&self.data).display())]), FieldKind::Check, if s.log_on() { "1" } else { "" }),
             ],
         })
@@ -1282,6 +1409,7 @@ impl LtoCatalog {
             drives: values.get("drives").cloned().unwrap_or_default(),
             catalog: values.get("catalog").cloned().unwrap_or_default(),
             backup_index: InterimIndex::from_key(values.get("backup_index").map(String::as_str).unwrap_or("")).key().to_owned(),
+            read_ahead: read_ahead_value(values.get("read_ahead").map(String::as_str).unwrap_or(""))?,
             log: if values.get("log").is_some_and(|v| !v.is_empty()) { String::new() } else { "off".into() },
         };
         if Path::new(s.catalog.trim()) == place::default_catalog(&self.data) {
@@ -1557,7 +1685,7 @@ impl FolderPlugin for LtoCatalog {
             c("import", tr("Import tapes…")),
             c("status", tr("Library status")),
             c("format", tr("Format tapes…")),
-            c("backup", tr("Back up a folder…")),
+            c("backup", tr("Back up or archive…")),
             c("verify", tr("Check tapes…")),
             c("eject", tr("Eject a tape…")),
             c("unload", tr("Unload tapes from drives")),

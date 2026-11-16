@@ -711,7 +711,9 @@ fn a_backup_spans_tapes_and_asks_for_new_ones() {
     let cap = 24 * 1024 * 1024;
     let ui = BackupUi::new(&sim, vec![lto_sim::Cart::new("NEW001L5", cap), lto_sim::Cart::new("NEW002L5", cap)]);
     let set = "Backup T\\span";
-    let r = a.backup(&src, set, &["LTO002L5".into(), "lto001l5".into()], BackupOptions { archive_only: false, clear_archive: true, ..Default::default() }, &ui).unwrap();
+    // read ahead (4 MB): a tape full in the middle of a file starts it again
+    let opts = BackupOptions { archive_only: false, clear_archive: true, read_ahead: 4 << 20, ..Default::default() };
+    let r = a.backup(&src, set, &["LTO002L5".into(), "lto001l5".into()], opts, &ui).unwrap();
     assert!(!r.cancelled && r.too_big.is_empty() && r.unreadable.is_empty(), "{r:?}");
     assert_eq!(r.written(), (12, 12 * 2 * 1024 * 1024));
     let order: Vec<&str> = r.tapes.iter().map(|t| t.barcode.as_str()).collect();
@@ -832,7 +834,7 @@ fn a_backup_writes_its_interim_index_where_chosen() {
     for interim_index in [InterimIndex::DataPartition, InterimIndex::BothPartitions] {
         let (sim, a) = small_library();
         let before = sim.count(LOCATE16);
-        let r = a.backup(&src, "Backup I\\interim", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: false, interim_index }, &NoUi).unwrap();
+        let r = a.backup(&src, "Backup I\\interim", &["LTO001L5".into()], BackupOptions { archive_only: false, clear_archive: false, interim_index, ..Default::default() }, &NoUi).unwrap();
         assert_eq!(r.written().0, 6, "{r:?}");
         locates.push(sim.count(LOCATE16) - before);
         // the catalog's index is the tape's, and the files read back
@@ -1186,4 +1188,128 @@ fn a_drive_asking_for_cleaning_is_said() {
     let n = a.take_notices();
     assert_eq!(n.iter().map(|n| n.flag).collect::<Vec<_>>(), [20], "{n:?}");
     assert!(condition(&a, "LTO001L5").is_empty(), "cleaning is the drive's");
+}
+
+/// Answers an archive's question about deleting, and changes a file on
+/// disk once its tape is being read back (`spoil`).
+struct ArchiveUi {
+    delete: bool,
+    asked: Mutex<Vec<(u64, u64, u64)>>,
+    spoil: Option<PathBuf>,
+}
+
+impl Ui for ArchiveUi {
+    fn step(&self, s: Step) {
+        if let (Step::Verifying { .. }, Some(p)) = (s, &self.spoil) {
+            if fs::read(p).is_ok_and(|d| d[0] != 0xFF) {
+                let mut d = fs::read(p).unwrap();
+                d[0] = 0xFF;
+                fs::write(p, d).unwrap();
+            }
+        }
+    }
+    fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool, _: &Places) -> Answer {
+        Answer::Cancel
+    }
+    fn confirm_delete(&self, files: u64, bytes: u64, not_same: u64) -> bool {
+        self.asked.lock().unwrap().push((files, bytes, not_same));
+        self.delete
+    }
+}
+
+/// Items selected in a folder are archived: each is read back from the
+/// tape and compared with the disk, then (after the question) deleted with
+/// the folders left empty; what wasn't selected stays.
+#[test]
+fn an_archive_checks_and_deletes_the_items_selected() {
+    let (_sim, a) = small_library();
+    let src = backup_source("archive-items", 4, 3000);
+    fs::write(src.join("top.txt"), b"top").unwrap();
+    fs::write(src.join("other.txt"), b"not selected").unwrap();
+    let opts = BackupOptions { verify: true, delete: DeleteSource::Ask, ..Default::default() };
+    let ui = ArchiveUi { delete: true, asked: Mutex::new(Vec::new()), spoil: None };
+    let set = "Archive A\\items";
+    let r = a.backup_items(&[src.join("top.txt"), src.join("sub")], set, &["LTO001L5".into()], opts, &ui).unwrap();
+    assert!(r.error.is_none() && r.verify_failed.is_empty(), "{r:?}");
+    assert_eq!(r.verified_size(), (5, 4 * 3000 + 3));
+    assert_eq!(*ui.asked.lock().unwrap(), [(5, 12003, 0)]);
+    let names: Vec<String> = backed_up(&a, &["LTO001L5"], set).into_iter().map(|(p, _)| p).collect();
+    assert_eq!(names, ["sub\\f00.bin", "sub\\f01.bin", "sub\\f02.bin", "sub\\f03.bin", "top.txt"]);
+    let d = r.deleted.as_ref().unwrap();
+    assert_eq!((d.files, d.bytes, d.folders), (5, 12003, 1), "{d:?}");
+    assert!(!src.join("sub").exists() && !src.join("top.txt").exists());
+    assert!(src.join("other.txt").exists() && src.join("empty").is_dir(), "not selected: kept");
+    // nothing: refused
+    assert!(a.backup_items(&[], set, &["LTO001L5".into()], opts, &ui).is_err());
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// Items from different folders: each under its own name in the set, two
+/// of the same name made different; deleted without asking and without
+/// the check, every file on the tapes goes, the folders they were in stay.
+#[test]
+fn items_from_anywhere_are_archived_without_the_check() {
+    let (_sim, a) = small_library();
+    let one = backup_source("anywhere-1", 2, 1000);
+    let two = backup_source("anywhere-2", 1, 500);
+    let opts = BackupOptions { verify: false, delete: DeleteSource::Auto, ..Default::default() };
+    let ui = ArchiveUi { delete: false, asked: Mutex::new(Vec::new()), spoil: None };
+    let set = "Archive D\\anywhere";
+    let r = a.backup_items(&[one.join("sub"), two.join("sub"), two.join("empty")], set, &["LTO001L5".into()], opts, &ui).unwrap();
+    assert!(r.error.is_none() && r.verified.is_empty() && !r.checked, "{r:?}");
+    assert!(ui.asked.lock().unwrap().is_empty(), "not asked");
+    let names: Vec<String> = backed_up(&a, &["LTO001L5"], set).into_iter().map(|(p, _)| p).collect();
+    assert_eq!(names, ["sub (2)\\f00.bin", "sub\\f00.bin", "sub\\f01.bin"]);
+    assert!(a.catalog.lock().unwrap().entry("LTO001L5", &format!("{set}\\empty")).unwrap().is_some());
+    let d = r.deleted.as_ref().unwrap();
+    assert_eq!((d.files, d.bytes), (3, 2500), "{d:?}");
+    assert!(!one.join("sub").exists() && !two.join("sub").exists() && !two.join("empty").exists());
+    assert!(one.join("empty").is_dir() && one.is_dir() && two.is_dir(), "not taken: kept");
+    let _ = fs::remove_dir_all(&one);
+    let _ = fs::remove_dir_all(&two);
+}
+
+/// A backup checked after writing finds a file that isn't the same on the
+/// tape as on disk; an archive whose question is answered No deletes
+/// nothing.
+#[test]
+fn a_check_finds_a_file_that_differs_and_no_keeps_everything() {
+    let (_sim, a) = small_library();
+    let src = backup_source("archive-differs", 3, 3000);
+    let spoiled = src.join("sub\\f01.bin");
+    let opts = BackupOptions { verify: true, delete: DeleteSource::Ask, ..Default::default() };
+    let ui = ArchiveUi { delete: false, asked: Mutex::new(Vec::new()), spoil: Some(spoiled.clone()) };
+    let r = a.backup(&src, "Archive B\\differs", &["LTO001L5".into()], opts, &ui).unwrap();
+    assert_eq!(r.verified.len(), 2, "{r:?}");
+    assert_eq!(r.verify_failed.len(), 1);
+    assert_eq!(r.verify_failed[0].0, spoiled);
+    assert_eq!(*ui.asked.lock().unwrap(), [(2, 6000, 1)]);
+    assert!(r.deleted.is_none());
+    assert!((0..3).all(|i| src.join(format!("sub\\f{i:02}.bin")).exists()), "kept");
+    // a backup without the check reads nothing back
+    let plain = a.backup(&src, "Backup C\\plain", &["LTO001L5".into()], BackupOptions::default(), &NoUi).unwrap();
+    assert!(plain.verified.is_empty() && plain.verify_failed.is_empty() && plain.deleted.is_none());
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// A copy onto a tape with read ahead: every file reads back whole, also
+/// files larger than the buffer, an empty one and one of exactly a record.
+#[test]
+fn a_copy_reads_ahead_and_every_file_comes_back_whole() {
+    let (_sim, a) = small_library();
+    let src = backup_source("copy-ahead", 4, 700_000);
+    fs::write(src.join("sub\\zero.bin"), b"").unwrap();
+    fs::write(src.join("sub\\record.bin"), vec![9u8; prefetch::CHUNK]).unwrap();
+    a.set_read_ahead(1 << 20);
+    a.write("LTO001L5", &[(src.join("sub"), "copied".into())], &NoUi, &mut |_, _| true).unwrap();
+    let mut g = Got::default();
+    a.read(&["LTO001L5\\copied".into()], &mut g, &NoUi).unwrap();
+    let mut names: Vec<&str> = g.files.iter().map(|(n, _)| n.rsplit('\\').next().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, ["f00.bin", "f01.bin", "f02.bin", "f03.bin", "record.bin", "zero.bin"]);
+    for (n, data) in &g.files {
+        let name = n.rsplit('\\').next().unwrap();
+        assert_eq!(*data, fs::read(src.join("sub").join(name)).unwrap(), "{name}");
+    }
+    let _ = fs::remove_dir_all(&src);
 }

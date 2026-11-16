@@ -1,9 +1,9 @@
 # Builds the release and puts what to install into target\release\dist:
-#   dist\plugins\ltocatalog\ltocatalog.spl + lang\ + ltocat.exe   (copy the plugins folder next to
-#                                                       rustysalamander.exe; ltocat is in the plugin's folder,
-#                                                       so the program's plugin updates bring it too)
-#   dist\ltocatalog-<version>.zip                      (that, for the library machine; README and CHANGELOG
-#                                                       renamed -ltocatalog so they don't overwrite the program's)
+#   dist\plugins\ltocatalog\ltocatalog.spl + lang\ + ltocat.exe + README.md, CHANGELOG.md, SIMULATOR.md
+#                                                      (copy the plugins folder next to rustysalamander.exe;
+#                                                       ltocat and the documents are in the plugin's folder,
+#                                                       so the program's plugin updates bring them too)
+#   dist\ltocatalog-<version>.zip                      (that, for the library machine)
 # Usage: .\package.ps1
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
@@ -18,10 +18,9 @@ New-Item -ItemType Directory -Force "$plugin\lang" | Out-Null
 Copy-Item target\release\sal_plugin_ltocatalog.dll "$plugin\ltocatalog.spl"
 Copy-Item plugin\lang\*.toml "$plugin\lang\"
 Copy-Item target\release\ltocat.exe $plugin
-# renamed: unpacked into the program's folder, they mustn't overwrite its README and CHANGELOG
-Copy-Item README.md "$dist\README-ltocatalog.md"
-Copy-Item CHANGELOG.md "$dist\CHANGELOG-ltocatalog.md"
-Compress-Archive -Path "$dist\plugins", "$dist\README-ltocatalog.md", "$dist\CHANGELOG-ltocatalog.md" -DestinationPath "$dist\ltocatalog-$version.zip"
+# the documents in the plugin's folder: updated with it, and the program shows its CHANGELOG
+Copy-Item README.md, CHANGELOG.md, SIMULATOR.md $plugin
+Compress-Archive -Path "$dist\plugins" -DestinationPath "$dist\ltocatalog-$version.zip"
 # the plugin folder alone, for RustySalamander's update check (Plugin::UPDATES): <id>-<version>-api<interface>.zip
 $api = (Select-String -Path ..\RustySalamander\crates\sal-plugin-api\src\abi.rs -Pattern 'pub const VERSION: u32 = (\d+)').Matches[0].Groups[1].Value
 Compress-Archive -Path $plugin -DestinationPath "$dist\ltocatalog-$version-api$api.zip"

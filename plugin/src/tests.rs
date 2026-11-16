@@ -13,6 +13,7 @@ static SIM_ENV: Mutex<()> = Mutex::new(());
 fn plugin(asker: Option<Asker>) -> (SimLibrary, LtoCatalog, PathBuf) {
     let sim = SimLibrary::new(&Config::default());
     let archive = Archive::new(Box::new(sim.clone()), Catalog::in_memory().unwrap(), "test");
+    archive.set_read_ahead(Settings::default().read_ahead_mb() << 20);
     static N: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!("ltocatalog-plugin-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
     fs::create_dir_all(&dir).unwrap();
@@ -209,7 +210,7 @@ fn starts_through_the_program() {
 #[test]
 fn language_files_match_the_code() {
     // each source up to its tests
-    let code: Vec<&str> = [include_str!("lib.rs"), include_str!("ask.rs"), include_str!("report.rs")].iter().map(|f| f.split("#[cfg(test)]").next().unwrap()).collect();
+    let code: Vec<&str> = [include_str!("lib.rs"), include_str!("ask.rs"), include_str!("report.rs"), include_str!("backupwin.rs")].iter().map(|f| f.split("#[cfg(test)]").next().unwrap()).collect();
     let code = code.join("\n");
     let code = code.as_str();
     let mut used = std::collections::BTreeSet::new();
@@ -555,7 +556,8 @@ fn a_folder_is_backed_up_through_the_form() {
     let other = sal_plugin_api::ui::path_value(&src);
     let Reply::Form(f) = p.run("backup", &vals(&[("other", &other)])).unwrap() else { panic!("no form") };
     assert_eq!(f.command, "backup_do");
-    assert_eq!(f.fields.iter().find(|f| f.id == "folder").unwrap().value, src.display().to_string(), "the other panel's folder");
+    let pick = f.fields.iter().find(|f| f.id == "pick:0").unwrap();
+    assert_eq!((pick.label.as_str(), pick.value.as_str()), (src.display().to_string().as_str(), "1"), "the other panel's folder");
     let tapes: Vec<&str> = f.fields.iter().filter(|f| f.id.starts_with("tape:")).map(|f| f.label.as_str()).collect();
     assert_eq!(tapes.len(), 2, "only LTFS tapes: {tapes:?}");
     assert!(tapes.iter().any(|l| l.contains("LTO002L5") && l.contains("Note: shelf 3") && l.contains("free")), "{tapes:?}");
@@ -571,6 +573,57 @@ fn a_folder_is_backed_up_through_the_form() {
     // archive-only, attributes cleared: nothing left
     let Reply::Message(m) = p.run("backup_do", &vals(&[("folder", &folder), ("what", "archive"), ("clear", "1"), ("tape:LTO002L5", "1")])).unwrap() else { panic!() };
     assert!(m.contains("Nothing to back up"), "{m}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Archive the items selected in the panel: the form lists them ticked;
+/// an unticked one stays; the rest is written, read back and deleted
+/// without asking; ticking none is refused.
+#[test]
+fn the_items_selected_are_archived_through_the_form() {
+    let (_sim, p, dir) = plugin(None);
+    p.run("inventory", &Values::new()).unwrap();
+    p.run("format_do", &vals(&[("tape:LTO001L5", "1"), ("confirm", "ERASE")])).unwrap();
+    let src = dir.join("projekty");
+    fs::create_dir_all(src.join("hotovo")).unwrap();
+    fs::write(src.join("hotovo\\a.txt"), b"alpha").unwrap();
+    fs::write(src.join("b.txt"), b"beta").unwrap();
+    fs::write(src.join("c.txt"), b"gamma").unwrap();
+    let pv = |p: &Path| sal_plugin_api::ui::path_value(p);
+    let selected = sal_plugin_api::ui::encode(&[pv(&src.join("hotovo")), pv(&src.join("b.txt")), pv(&src.join("c.txt"))]);
+    let Reply::Form(f) = p.run("backup", &vals(&[("panel", &pv(&src)), ("selected", &selected)])).unwrap() else { panic!("no form") };
+    let get = |id: &str| f.fields.iter().find(|f| f.id == id).unwrap_or_else(|| panic!("{id}")).clone();
+    assert_eq!(get("folder").value, "", "Browse… adds one");
+    let picks: Vec<(String, String)> = f.fields.iter().filter(|f| f.id.starts_with("pick:")).map(|f| (f.label.clone(), f.value.clone())).collect();
+    let want: Vec<(String, String)> = ["hotovo", "b.txt", "c.txt"].iter().map(|n| (src.join(n).display().to_string(), "1".to_string())).collect();
+    assert_eq!(picks, want, "the active panel's selection");
+    let mut v: Vec<(String, String)> = f.fields.iter().map(|f| (f.id.clone(), f.value.clone())).collect();
+    let set = |v: &mut Vec<(String, String)>, k: &str, val: &str| {
+        v.retain(|(id, _)| id != k);
+        v.push((k.into(), val.into()));
+    };
+    set(&mut v, "mode", "archive");
+    set(&mut v, "delete", "checked");
+    set(&mut v, "tape:LTO001L5", "1");
+    // none ticked: refused
+    let mut none = v.clone();
+    for i in 0..3 {
+        set(&mut none, &format!("pick:{i}"), "");
+    }
+    fn refs(v: &[(String, String)]) -> Vec<(&str, &str)> {
+        v.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect()
+    }
+    assert_eq!(p.run("backup_do", &vals(&refs(&none))).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    // c.txt left out
+    set(&mut v, "pick:2", "");
+    let Reply::Message(m) = p.run("backup_do", &vals(&refs(&v))).unwrap() else { panic!() };
+    assert!(m.contains("the same as on disk: 2 files") && m.contains("Deleted from disk: 2 files"), "{m}");
+    let on_tape = p.archive().catalog.lock().unwrap().files_under("LTO001L5", "").unwrap();
+    let names: Vec<&str> = on_tape.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.iter().all(|n| n.starts_with("Archive ") && n.contains("\\projekty\\")), "{names:?}");
+    assert!(!src.join("hotovo").exists() && !src.join("b.txt").exists(), "archived: gone");
+    assert!(src.join("c.txt").exists(), "unticked: kept");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -596,6 +649,21 @@ fn the_interim_index_is_a_library_setting() {
     // anything else is the default
     p.run("settings_do", &vals(&[("changer", ""), ("drives", ""), ("catalog", &cat), ("backup_index", "nonsense")])).unwrap();
     assert_eq!(Settings::load(&dir.join("settings")).backup_index, "data");
+    // the read-ahead buffer: 256 MB unless set; a number up to the most
+    let read_ahead = |p: &LtoCatalog| {
+        let Reply::Form(f) = p.run("settings", &Values::new()).unwrap() else { panic!("no form") };
+        f.fields.iter().find(|f| f.id == "read_ahead").unwrap().value.clone()
+    };
+    assert_eq!(read_ahead(&p), "256");
+    p.run("settings_do", &vals(&[("changer", ""), ("drives", ""), ("catalog", &cat), ("read_ahead", " 1024 ")])).unwrap();
+    assert_eq!(read_ahead(&p), "1024");
+    assert_eq!(Settings::load(&dir.join("settings")).read_ahead_mb(), 1024);
+    for bad in ["-1", "lots", "9000"] {
+        let e = p.run("settings_do", &vals(&[("changer", ""), ("drives", ""), ("catalog", &cat), ("read_ahead", bad)])).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad}");
+    }
+    p.run("settings_do", &vals(&[("changer", ""), ("drives", ""), ("catalog", &cat), ("read_ahead", "0")])).unwrap();
+    assert_eq!(read_ahead(&p), "0");
     drop(p);
     unsafe { std::env::remove_var("LTOCATALOG_SIM") };
     let _ = fs::remove_dir_all(&dir);

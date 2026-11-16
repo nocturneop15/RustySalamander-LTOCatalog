@@ -19,6 +19,11 @@ pub const PROGRAM_EXE: &str = "rustysalamander.exe";
 /// Next to the program: settings live in each user's `%APPDATA%`.
 pub const MULTI_USER_FILE: &str = "multiuser.toml";
 
+/// Megabytes read ahead of the tape when not set.
+pub const DEFAULT_READ_AHEAD_MB: u64 = 256;
+/// The most that can be set.
+pub const MAX_READ_AHEAD_MB: u64 = 8192;
+
 /// The plugin's settings (Plugins → Library settings…).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
@@ -31,6 +36,9 @@ pub struct Settings {
     /// Where a backup writes its index along the way: `data` (the data
     /// partition only; also when empty) or `both` (the index partition too).
     pub backup_index: String,
+    /// Megabytes a backup reads from disk ahead of the tape; empty: the
+    /// default ([`Settings::read_ahead_mb`]).
+    pub read_ahead: String,
     /// The detailed log (`ltocatalog.log` in the data folder): `off`, or
     /// on (anything else, also empty).
     pub log: String,
@@ -49,6 +57,7 @@ impl Settings {
                     "drives" => s.drives = v.clone(),
                     "catalog" => s.catalog = v.clone(),
                     "backup_index" => s.backup_index = v.clone(),
+                    "read_ahead" => s.read_ahead = v.clone(),
                     "log" => s.log = v.clone(),
                     _ => {}
                 }
@@ -58,11 +67,17 @@ impl Settings {
     }
 
     pub fn save(&self, file: &Path) -> io::Result<()> {
-        let parts = ["changer", &self.changer, "drives", &self.drives, "catalog", &self.catalog, "backup_index", &self.backup_index, "log", &self.log];
+        let parts = ["changer", &self.changer, "drives", &self.drives, "catalog", &self.catalog, "backup_index", &self.backup_index, "read_ahead", &self.read_ahead, "log", &self.log];
         if let Some(d) = file.parent() {
             fs::create_dir_all(d)?;
         }
         fs::write(file, encode(&parts))
+    }
+
+    /// Megabytes a backup reads from disk ahead of the tape: as set (at
+    /// most [`MAX_READ_AHEAD_MB`]; 0: none), else [`DEFAULT_READ_AHEAD_MB`].
+    pub fn read_ahead_mb(&self) -> u64 {
+        self.read_ahead.trim().parse::<u64>().map(|n| n.min(MAX_READ_AHEAD_MB)).unwrap_or(DEFAULT_READ_AHEAD_MB)
     }
 
     /// Whether the detailed log is written.
@@ -210,7 +225,7 @@ mod tests {
         assert!(data.ends_with(Path::new("RustySalamander").join("plugins").join("ltocatalog")), "{}", data.display());
         assert!(!data.starts_with(&program));
         // settings saved by the plugin are read back, a chosen catalog wins
-        let s = Settings { changer: "scsi:1:0:3:1".into(), drives: String::new(), catalog: r"\\nas\tapes\catalog.sqlite".into(), backup_index: "both".into(), log: "off".into() };
+        let s = Settings { changer: "scsi:1:0:3:1".into(), drives: String::new(), catalog: r"\\nas\tapes\catalog.sqlite".into(), backup_index: "both".into(), read_ahead: "1024".into(), log: "off".into() };
         let file = settings_file(&t.join("data"));
         s.save(&file).unwrap();
         let back = Settings::load(&file);
