@@ -294,7 +294,7 @@ struct Mark {
 }
 
 /// Bytes a second, once there is something to go by.
-fn speed(bytes: u64, took: std::time::Duration) -> Option<u64> {
+pub(crate) fn speed(bytes: u64, took: std::time::Duration) -> Option<u64> {
     let s = took.as_secs_f64();
     (bytes > 0 && s > 0.0).then(|| (bytes as f64 / s) as u64)
 }

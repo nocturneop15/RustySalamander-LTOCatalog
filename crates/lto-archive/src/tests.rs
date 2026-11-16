@@ -1110,8 +1110,12 @@ fn a_check_finds_the_files_that_cannot_be_read() {
     struct Count<'a>(&'a Mutex<u32>);
     impl Ui for Count<'_> {
         fn step(&self, s: Step) {
-            if matches!(s, Step::Verifying { .. }) {
+            if let Step::Verifying { speed, .. } = s {
                 *self.0.lock().unwrap() += 1;
+                // with the average speed once data was read
+                if speed.is_some() {
+                    *self.0.lock().unwrap() += 1000;
+                }
             }
         }
         fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool, _: &Places) -> Answer {
@@ -1121,7 +1125,8 @@ fn a_check_finds_the_files_that_cannot_be_read() {
     let r = a.verify(&["LTO001L5".into()], &Count(&steps)).unwrap();
     assert_eq!((r[0].files, r[0].bad.len()), (3, 1), "{r:?}");
     assert!(r[0].bad[0].0.ends_with("f01.bin"), "{:?}", r[0].bad);
-    assert!(*steps.lock().unwrap() >= 4);
+    let steps = *steps.lock().unwrap();
+    assert!(steps % 1000 >= 4 && steps >= 1000, "{steps}");
     let cond = condition(&a, "LTO001L5");
     assert!(cond.contains(&C::Read) && cond.contains(&C::Unreadable(1)) && cond.contains(&C::Alert(5)), "{cond:?}");
     // the place is good again (another drive read it): cleared

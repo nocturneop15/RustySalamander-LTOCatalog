@@ -208,8 +208,10 @@ fn starts_through_the_program() {
 /// `cs.toml` translates every one of them.
 #[test]
 fn language_files_match_the_code() {
-    let code = include_str!("lib.rs").to_string() + include_str!("ask.rs");
-    let code = code.split("#[cfg(test)]").next().unwrap();
+    // each source up to its tests
+    let code: Vec<&str> = [include_str!("lib.rs"), include_str!("ask.rs"), include_str!("report.rs")].iter().map(|f| f.split("#[cfg(test)]").next().unwrap()).collect();
+    let code = code.join("\n");
+    let code = code.as_str();
     let mut used = std::collections::BTreeSet::new();
     for marker in ["tr(\"", "trf(\"", "n_(\""] {
         let mut rest = code;

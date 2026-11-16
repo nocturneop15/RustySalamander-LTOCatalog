@@ -9,6 +9,7 @@
 //! ([`ltfs::names`]).
 
 mod ask;
+mod report;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -19,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lto_archive::{Answer, Archive, BackupOptions, BackupReport, IndexWarning, InterimIndex, NewTapeProblem, ReadSink, Step, Ui, VerifyReport};
+use lto_archive::{Answer, Archive, BackupOptions, IndexWarning, InterimIndex, NewTapeProblem, ReadSink, Step, Ui, VerifyReport};
 use lto_catalog::{Catalog, Condition, Tape};
 use lto_scsi::library::Devices;
 use lto_scsi::log;
@@ -100,7 +101,8 @@ fn step_text(step: Step) -> String {
         Step::Backup { tape, files, bytes, speed: None } => trf("{barcode}: backing up, {n} of {total} files, {done} of {all}…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1))]),
         Step::Backup { tape, files, bytes, speed: Some(s) } => trf("{barcode}: backing up, {n} of {total} files, {done} of {all}, average {speed}/s…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1)), ("speed", &size_text(s))]),
         Step::NewTape => tr("waiting for a new tape in the mail slot…"),
-        Step::Verifying { tape, files, bytes } => trf("{barcode}: checking, {n} of {total} files, {done} of {all}…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1))]),
+        Step::Verifying { tape, files, bytes, speed: Some(s) } => trf("{barcode}: checking, {n} of {total} files, {done} of {all}, average {speed}/s…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1)), ("speed", &size_text(s))]),
+        Step::Verifying { tape, files, bytes, speed: None } => trf("{barcode}: checking, {n} of {total} files, {done} of {all}…", &[("barcode", &tape), ("n", &files.0), ("total", &files.1), ("done", &size_text(bytes.0)), ("all", &size_text(bytes.1))]),
     }
 }
 
@@ -771,40 +773,6 @@ fn chosen_tapes(values: &Values) -> Vec<String> {
     out
 }
 
-/// What a backup did, for people: the first lines of each kind of problem.
-fn backup_report(r: &BackupReport, opts: BackupOptions) -> String {
-    if r.total_files == 0 && r.total_folders == 0 && opts.archive_only {
-        return tr("Nothing to back up: no file in the folder has the Archive attribute set.");
-    }
-    let (files, bytes) = r.written();
-    let mut lines = vec![if let Some(e) = &r.error {
-        trf("The backup stopped: {error}\n{files} of {total} files ({size}) were backed up into \"{set}\" before; they are on the tapes.", &[("error", e), ("files", &files), ("total", &r.total_files), ("size", &size_text(bytes)), ("set", &r.set)])
-    } else if r.cancelled {
-        trf("Cancelled. {files} of {total} files ({size}) were backed up into \"{set}\" before; they are on the tapes.", &[("files", &files), ("total", &r.total_files), ("size", &size_text(bytes)), ("set", &r.set)])
-    } else {
-        trf("{files} files ({size}) backed up into \"{set}\".", &[("files", &files), ("size", &size_text(bytes)), ("set", &r.set)])
-    }];
-    for t in &r.tapes {
-        lines.push(trf("{barcode}: {files} files, {size}", &[("barcode", &t.barcode), ("files", &t.files), ("size", &size_text(t.bytes))]));
-    }
-    let mut list = |title: String, items: Vec<String>| {
-        if items.is_empty() {
-            return;
-        }
-        lines.push(String::new());
-        lines.push(title);
-        lines.extend(items.iter().take(20).cloned());
-        if items.len() > 20 {
-            lines.push(trf("… and {n} more", &[("n", &(items.len() - 20))]));
-        }
-    };
-    list(trf("Tapes that failed, noted as damaged in the catalog ({n}):", &[("n", &r.failed_tapes.len())]), r.failed_tapes.iter().map(|(b, why)| format!("{b}: {why}")).collect());
-    list(trf("Left out, larger than a whole tape ({n}):", &[("n", &r.too_big.len())]), r.too_big.iter().map(|p| p.display().to_string()).collect());
-    list(trf("Couldn't be read ({n}):", &[("n", &r.unreadable.len())]), r.unreadable.iter().map(|(p, why)| format!("{}: {why}", p.display())).collect());
-    list(trf("Archive attribute left set: changed while backed up, or it can't be changed ({n}):", &[("n", &r.not_cleared.len())]), r.not_cleared.iter().map(|p| p.display().to_string()).collect());
-    lines.join("\n")
-}
-
 /// What a check of tapes found, for people.
 fn verify_report(reports: &[VerifyReport]) -> String {
     let mut lines = Vec::new();
@@ -1089,7 +1057,17 @@ impl LtoCatalog {
         // the backup ends with its report, whatever happened; one that
         // couldn't start says why the same way
         match self.archive().backup(&src, &set, &list, opts, &ui) {
-            Ok(r) => Ok(Reply::Message(backup_report(&r, opts))),
+            Ok(r) => {
+                // a summary that fits the screen, green or red, with the full
+                // report to save; a message where the window can't be shown
+                let report = report::backup(&r, opts, &src);
+                let look = self.look.lock().unwrap().clone();
+                if report::show(&self.asks, look, report.clone()) {
+                    Ok(Reply::Done)
+                } else {
+                    Ok(Reply::Message(report.short()))
+                }
+            }
             Err(e) => Ok(Reply::Message(trf("The backup didn't start: {error}", &[("error", &io_err(e).to_string())]))),
         }
     }

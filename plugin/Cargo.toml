@@ -23,6 +23,10 @@ lto-catalog.workspace = true
 lto-archive.workspace = true
 lto-sim.workspace = true
 
+[target."cfg(windows)".dependencies]
+# the Save dialog for a backup's full report
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Controls_Dialogs", "Win32_UI_WindowsAndMessaging"] }
+
 [dev-dependencies]
 # the hostile inputs every field is tested with
 sal-core = { path = "../../RustySalamander/crates/sal-core" }

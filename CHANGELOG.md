@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.2-alpha (2026-11-16)
+
+- **The backup report fits on the screen:** it opens in a window of its own (modal from RustySalamander 0.9.10) with the result on top, **in green when everything was backed up and in red when not** (the backup stopped, was cancelled, or files were left out or couldn't be read). Below it: what was found (folders, files, size), each tape written with its files and data, the tapes that failed with why, and how many files were left out, couldn't be read or kept their Archive attribute, without their names. Before, the report listed the names of up to 20 files of each kind and could run far off the bottom of the screen. A tape that failed while the backup went on with another one is listed but doesn't make the result red: everything is on the tapes.
+- **Save full report…** in that window saves the whole report as a text file, where you choose: the folder backed up, the folder on the tapes, the options, the result, every tape, and the name of every file that was left out, couldn't be read or kept its Archive attribute. The name offered is the backup's (`Backup 2026-11-16 10.00 - Documents - report.txt`).
+- Where the program can't show the plugin's windows (before RustySalamander 0.9.4), the summary comes as a message, as before but shorter.
+- **Check tapes logs every file it read** in `ltocatalog.log` (`verify LTO001L5: "path" 123456 bytes read`; one that isn't whole, too), and the average reading speed of each tape at its end. Before, only the files that couldn't be read were logged.
+- **Check tapes shows the average speed** in the status bar, as a backup does: data read so far over the time spent reading it (loading the tape not counted).
+
 ## 0.4.1-alpha (2026-11-15)
 
 - **A tape whose index can't be read in one partition is still read:** LTFS keeps the index (and the label) in both partitions; when one can't be read, the other is used, and a warning says so before the job goes on. The tape is used read-only. Before, the tape couldn't be used at all. The warning is a modal window from RustySalamander 0.9.10. If the copy used is older than what the catalog lists, the catalog isn't set back, and the warning says which files can't be read from the tape.

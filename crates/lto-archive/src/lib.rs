@@ -79,8 +79,10 @@ pub enum Step<'a> {
     Backup { tape: &'a str, files: (u64, u64), bytes: (u64, u64), speed: Option<u64> },
     /// Waiting for a new tape for a backup to show up in a mail slot.
     NewTape,
-    /// Checking this tape: (done, of) files and bytes read.
-    Verifying { tape: &'a str, files: (u64, u64), bytes: (u64, u64) },
+    /// Checking this tape: (done, of) files and bytes read, and the average
+    /// speed of reading its data so far, bytes a second (loading the tape
+    /// not counted; None before any data was read).
+    Verifying { tape: &'a str, files: (u64, u64), bytes: (u64, u64), speed: Option<u64> },
 }
 
 /// One partition's label or index of a tape couldn't be read: the other
@@ -920,28 +922,39 @@ impl Archive {
         report.total_files = files.len() as u64;
         report.total_bytes = files.values().map(|f| f.length).sum();
         let barcode = report.barcode.clone();
+        // time spent reading the files' data, for the average speed
+        let mut reading = Duration::ZERO;
         for (path, f) in in_tape_order(files) {
             if ui.cancelled() {
                 return Err(Error::Cancelled);
             }
-            ui.step(Step::Verifying { tape: &barcode, files: (report.files, report.total_files), bytes: (report.bytes, report.total_bytes) });
+            ui.step(Step::Verifying { tape: &barcode, files: (report.files, report.total_files), bytes: (report.bytes, report.total_bytes), speed: backup::speed(report.bytes, reading) });
             let mut read = 0u64;
-            let mut shown = Instant::now();
+            let began = Instant::now();
+            let mut shown = began;
             let r = v.read_file(&f, &mut |b| {
                 read += b.len() as u64;
                 if shown.elapsed() >= Duration::from_secs(1) {
                     shown = Instant::now();
-                    ui.step(Step::Verifying { tape: &barcode, files: (report.files, report.total_files), bytes: (report.bytes + read, report.total_bytes) });
+                    let speed = backup::speed(report.bytes + read, reading + began.elapsed());
+                    ui.step(Step::Verifying { tape: &barcode, files: (report.files, report.total_files), bytes: (report.bytes + read, report.total_bytes), speed });
                 }
                 Ok(!ui.cancelled())
             });
+            reading += began.elapsed();
             report.bytes += read;
             match r {
-                Ok(()) => report.files += 1,
+                Ok(()) => {
+                    log!("verify {barcode}: \"{path}\" {read} bytes read");
+                    report.files += 1;
+                }
                 Err(ltfs::Error::Cancelled) => return Err(Error::Cancelled),
                 // the tape couldn't be read there, or the data isn't all
                 // there: noted, and on with the next file
-                Err(e @ ltfs::Error::Corrupt(_)) => report.bad.push((path, e.to_string())),
+                Err(e @ ltfs::Error::Corrupt(_)) => {
+                    log!("verify {barcode}: \"{path}\" isn't whole: {e}");
+                    report.bad.push((path, e.to_string()));
+                }
                 Err(ltfs::Error::Scsi(e)) if e.is_medium() => {
                     log!("verify {barcode}: \"{path}\" can't be read: {e}");
                     report.bad.push((path, e.to_string()));
@@ -950,6 +963,7 @@ impl Archive {
                 Err(e) => return Err(e.into()),
             }
         }
+        log!("verify {barcode}: {} read in {:.1} s: {}/s on average", lto_scsi::log::bytes(report.bytes), reading.as_secs_f64(), lto_scsi::log::or_unknown(backup::speed(report.bytes, reading).map(lto_scsi::log::bytes)));
         Ok(())
     }
 

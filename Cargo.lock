@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "ltfs"
-version = "0.4.1-alpha"
+version = "0.4.2-alpha"
 dependencies = [
  "lto-scsi",
  "lto-sim",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "lto-archive"
-version = "0.4.1-alpha"
+version = "0.4.2-alpha"
 dependencies = [
  "ltfs",
  "lto-catalog",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "lto-catalog"
-version = "0.4.1-alpha"
+version = "0.4.2-alpha"
 dependencies = [
  "ltfs",
  "lto-scsi",
@@ -326,21 +326,21 @@ dependencies = [
 
 [[package]]
 name = "lto-scsi"
-version = "0.4.1-alpha"
+version = "0.4.2-alpha"
 dependencies = [
  "windows-sys",
 ]
 
 [[package]]
 name = "lto-sim"
-version = "0.4.1-alpha"
+version = "0.4.2-alpha"
 dependencies = [
  "lto-scsi",
 ]
 
 [[package]]
 name = "ltocat"
-version = "0.4.1-alpha"
+version = "0.4.2-alpha"
 dependencies = [
  "ltfs",
  "lto-archive",
@@ -477,7 +477,7 @@ version = "0.9.10-beta"
 
 [[package]]
 name = "sal-plugin-ltocatalog"
-version = "0.4.1-alpha"
+version = "0.4.2-alpha"
 dependencies = [
  "ltfs",
  "lto-archive",
@@ -488,6 +488,7 @@ dependencies = [
  "sal-plugin-api",
  "sal-ui",
  "sal-window",
+ "windows-sys",
 ]
 
 [[package]]

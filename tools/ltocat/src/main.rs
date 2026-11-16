@@ -267,7 +267,14 @@ impl Ui for Console {
                 speed.map(|s| format!(", average {}/s", size(s))).unwrap_or_default()
             ),
             S::NewTape => "waiting for a new tape in the mail slot".to_owned(),
-            S::Verifying { tape, files, bytes } => format!("{tape}: checking, {} of {} files, {} of {}", files.0, files.1, size(bytes.0), size(bytes.1)),
+            S::Verifying { tape, files, bytes, speed } => format!(
+                "{tape}: checking, {} of {} files, {} of {}{}",
+                files.0,
+                files.1,
+                size(bytes.0),
+                size(bytes.1),
+                speed.map(|s| format!(", average {}/s", size(s))).unwrap_or_default()
+            ),
         };
         eprintln!("... {text}");
     }
