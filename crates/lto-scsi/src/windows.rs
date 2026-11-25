@@ -2,12 +2,22 @@
 //! (`\\.\Tape0`), a changer with a driver (`\\.\Changer0`), or a changer
 //! without one, addressed through its host adapter (`\\.\Scsi2:` with path,
 //! target and LUN). Needs administrator rights.
+//!
+//! The changers and drives a [`Site`](crate::site::Site) uses belong to one
+//! process at a time ([`WindowsDevices`] claims them): the plugin and
+//! `ltocat` (or two copies of the program) never move tapes or the drives'
+//! position under each other's feet. Windows itself doesn't stop another
+//! process opening a tape device; the claim is a named object every
+//! program of this project respects.
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::io;
 use std::mem::{offset_of, size_of, zeroed};
+use std::sync::{Arc, Mutex, Weak};
 
-use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
@@ -279,6 +289,91 @@ impl Transport for AdapterTransport {
     }
 }
 
+/// A device held by this process: a named object (`Global\RustySalamander
+/// LTO Catalog <device>`) that exists while it is held. Another process
+/// finding it there leaves the device alone.
+struct Claim(HANDLE);
+
+unsafe impl Send for Claim {}
+unsafe impl Sync for Claim {}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// The devices this process holds, by key: opened again within the
+/// process (a second job, a new look for devices), they are the same claim.
+static HELD: Mutex<BTreeMap<String, Weak<Claim>>> = Mutex::new(BTreeMap::new());
+
+/// Hold the device `key` for this process; an error when another process
+/// holds it.
+fn claim(key: &str) -> io::Result<Arc<Claim>> {
+    let mut held = HELD.lock().unwrap();
+    if let Some(c) = held.get(key).and_then(Weak::upgrade) {
+        return Ok(c);
+    }
+    // Global: seen from every session and user. Nothing else: a claim
+    // that can't be made there (the object belongs to a process of another
+    // user, or this one may not make global objects) is a device that can't
+    // be used, never a claim of this session only that others don't see
+    let name: Vec<u16> = claim_name(key).encode_utf16().chain(Some(0)).collect();
+    let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if h.is_null() {
+        let e = io::Error::last_os_error();
+        let busy = e.kind() == io::ErrorKind::PermissionDenied;
+        return Err(io::Error::new(
+            if busy { io::ErrorKind::ResourceBusy } else { e.kind() },
+            format!("it can't be claimed for this program ({e}): it may be in use by LTO Catalog run by another user, or this program doesn't run as administrator"),
+        ));
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(h) };
+        return Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            "it is in use by another program of LTO Catalog (the plugin in another RustySalamander window, or ltocat): one program at a time drives a library and its drives. Close the other one (or its connection to the library), then try again",
+        ));
+    }
+    let c = Arc::new(Claim(h));
+    held.retain(|_, w| w.strong_count() > 0);
+    held.insert(key.to_owned(), Arc::downgrade(&c));
+    Ok(c)
+}
+
+/// The name of the object that claims the device `key`.
+fn claim_name(key: &str) -> String {
+    let safe: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
+    format!("Global\\RustySalamander.LTOCatalog.{safe}")
+}
+
+/// A device held for this process while the transport lives.
+struct Owned {
+    t: Box<dyn Transport>,
+    _claim: Arc<Claim>,
+}
+
+impl Transport for Owned {
+    fn exec(&mut self, cdb: &[u8], data: Data<'_>, timeout_s: u32) -> io::Result<Reply> {
+        self.t.exec(cdb, data, timeout_s)
+    }
+    fn describe(&self) -> String {
+        self.t.describe()
+    }
+}
+
+/// `t` (a changer or a drive, `kind`) held for this process: known by its
+/// serial number (however it was reached), else by its name.
+fn owned(kind: &str, mut t: Box<dyn Transport>) -> io::Result<Box<dyn Transport>> {
+    let name = t.describe();
+    let key = match crate::serial_number(&mut *t) {
+        Ok(s) if !s.trim().is_empty() => format!("{kind}-{}", s.trim()),
+        _ => format!("{kind}-{name}"),
+    };
+    let c = claim(&key).map_err(|e| io::Error::new(e.kind(), format!("{name}: {e}")))?;
+    Ok(Box::new(Owned { t, _claim: c }))
+}
+
 /// Parse `scsi:<port>:<path>:<target>:<lun>`.
 pub fn parse_address(s: &str) -> Option<Address> {
     let rest = s.strip_prefix("scsi:")?;
@@ -385,9 +480,10 @@ impl Devices for WindowsDevices {
     /// drives only).
     fn open_changers(&self) -> io::Result<Vec<Box<dyn Transport>>> {
         if !self.changers.is_empty() {
-            return self.changers.iter().map(|c| open_any(c)).collect();
+            return self.changers.iter().map(|c| owned("changer", open_any(c)?)).collect();
         }
-        Ok(self.find_changers().0.iter().filter_map(|n| open_any(n).ok()).collect())
+        // one held by another process: an error, not a library gone missing
+        self.find_changers().0.iter().filter_map(|n| open_any(n).ok()).map(|t| owned("changer", t)).collect()
     }
 
     fn open_drives(&self) -> io::Result<Vec<Box<dyn Transport>>> {
@@ -395,7 +491,7 @@ impl Devices for WindowsDevices {
         let mut out: Vec<Box<dyn Transport>> = Vec::new();
         for n in names {
             match DeviceTransport::open(&n) {
-                Ok(t) => out.push(Box::new(t)),
+                Ok(t) => out.push(owned("drive", Box::new(t))?),
                 Err(e) if !self.drives.is_empty() => return Err(e),
                 Err(_) => {}
             }
@@ -419,6 +515,28 @@ mod tests {
         assert_eq!(offset_of!(ScsiPassThroughDirect, data_buffer), 24);
         assert_eq!(offset_of!(ScsiPassThroughDirect, cdb), 36);
         assert_eq!(size_of::<ScsiAddress>(), 8);
+    }
+
+    /// A device held by this process is held once more within it, and
+    /// freed when the last holder goes; a named object another process made
+    /// keeps it from being claimed.
+    #[test]
+    fn claims_are_per_process() {
+        let key = format!("test-{}", std::process::id());
+        let a = claim(&key).unwrap();
+        let b = claim(&key).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        drop((a, b));
+        assert!(HELD.lock().unwrap().get(&key).and_then(Weak::upgrade).is_none());
+        // another process's: made here by hand, as it would be
+        let other = format!("test-other-{}", std::process::id());
+        let name: Vec<u16> = claim_name(&other).encode_utf16().chain(Some(0)).collect();
+        let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        assert!(!h.is_null());
+        let e = claim(&other).err().expect("held elsewhere");
+        assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
+        unsafe { CloseHandle(h) };
+        assert!(claim(&other).is_ok(), "free once the other lets go");
     }
 
     #[test]

@@ -8,6 +8,10 @@ license.workspace = true
 authors.workspace = true
 publish = false
 
+[target."cfg(windows)".dependencies]
+# whether the catalog is on a network share (GetDriveTypeW)
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
 [dependencies]
 ltfs.workspace = true
 # TapeAlert flags, said in words
@@ -15,4 +19,4 @@ lto-scsi.workspace = true
 # the plugin's settings format, shared with ltocat (place.rs)
 sal-plugin-api.workspace = true
 # SQLite built in (with the MinGW gcc), no DLL to ship
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }

@@ -172,7 +172,7 @@ impl Prefetch {
         if let Err(e) = spawned {
             // no thread: an empty queue, each file then fails to open and
             // the backup notes it; can't happen in practice
-            log!("backup: no thread to read ahead: {e}");
+            log!("write: no thread to read ahead: {e}");
             queue.done = true;
         }
         Prefetch { how: How::Ahead(queue) }

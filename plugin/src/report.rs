@@ -55,7 +55,9 @@ impl Report {
 pub fn backup(r: &BackupReport, opts: BackupOptions, items: &[PathBuf]) -> Report {
     let file_name = format!("{} - {}.txt", r.set.replace(['\\', '/'], " - "), tr("report"));
     let taken: Vec<String> = items.iter().map(|p| format!("  {}", p.display())).collect();
-    if r.total_files == 0 && r.total_folders == 0 && opts.archive_only {
+    // nothing changed, and everything could be looked at (what couldn't
+    // may have changed: the full report says so, in red)
+    if r.total_files == 0 && r.total_folders == 0 && opts.archive_only && r.unreadable.is_empty() {
         let headline = tr("Nothing to back up: no file has the Archive attribute set.");
         let mut full = vec![tr("LTO Catalog: backup report"), trf("Files and folders ({n}):", &[("n", &items.len())])];
         full.extend(taken);
@@ -66,7 +68,7 @@ pub fn backup(r: &BackupReport, opts: BackupOptions, items: &[PathBuf]) -> Repor
     // checked: every file written read back the same; deleted (when the
     // person didn't keep them): every one of them
     let checked_ok = !opts.verify || (r.verify_failed.is_empty() && r.verified.len() as u64 >= files);
-    let deleted_ok = r.deleted.as_ref().is_none_or(|d| d.failed.is_empty() && d.changed.is_empty());
+    let deleted_ok = r.deleted.as_ref().is_none_or(|d| d.failed.is_empty() && d.changed.is_empty() && d.stopped.is_none());
     let ok = r.error.is_none() && !r.cancelled && r.unreadable.is_empty() && r.too_big.is_empty() && files >= r.total_files && checked_ok && deleted_ok;
     let headline = if let Some(e) = &r.error {
         trf("The backup stopped: {error}\n{files} of {total} files ({size}) were backed up into \"{set}\" before; they are on the tapes.", &[("error", e), ("files", &files), ("total", &r.total_files), ("size", &size_text(bytes)), ("set", &r.set)])
@@ -121,7 +123,12 @@ pub fn backup(r: &BackupReport, opts: BackupOptions, items: &[PathBuf]) -> Repor
         after.push(trf("Read back from the tapes, the same as on disk: {files} files ({size}).", &[("files", &checked), ("size", &size_text(checked_bytes))]));
     }
     match &r.deleted {
-        Some(d) => after.push(trf("Deleted from disk: {files} files ({size}), {folders} folders.", &[("files", &d.files), ("size", &size_text(d.bytes)), ("folders", &d.folders)])),
+        Some(d) => {
+            after.push(trf("Deleted from disk: {files} files ({size}), {folders} folders.", &[("files", &d.files), ("size", &size_text(d.bytes)), ("folders", &d.folders)]));
+            if let Some(left) = d.stopped {
+                after.push(trf("Deleting was stopped: {n} more files stay on disk (they are on the tapes too), and the folders left empty weren't all removed.", &[("n", &left)]));
+            }
+        }
         None if deleting && deletable > 0 && !r.cancelled => after.push(tr("Nothing was deleted from disk: you chose to keep the files.")),
         None if deleting => after.push(tr("Nothing was deleted from disk.")),
         None => {}
@@ -217,6 +224,7 @@ struct ReportWin {
     saved: Option<(String, bool)>,
     /// The window was made a fixed dialog.
     dialog_set: bool,
+    opened: crate::ask::Opened,
 }
 
 impl Content for ReportWin {
@@ -226,6 +234,7 @@ impl Content for ReportWin {
 
     fn show(&mut self, ctx: &egui::Context) -> bool {
         use sal_ui::layout::{GAP, MARGIN};
+        self.opened.shown();
         if let Some(rx) = &self.saving {
             if let Ok(done) = rx.try_recv() {
                 self.saving = None;
@@ -359,8 +368,10 @@ fn pick_save(_: &str, _: &str, _: &str) -> Option<PathBuf> {
 /// program can't show the plugin's windows.
 pub fn show(windows: &Windows, look: Values, report: Report) -> bool {
     let title = trf("Backup report: {set}", &[("set", &report.file_name.trim_end_matches(".txt"))]);
-    let make: sal_window::Make = Box::new(move || Box::new(ReportWin { title, report, saving: None, saved: None, dialog_set: false }));
-    windows.open_modal(make, look).is_ok()
+    let (opened, shown) = crate::ask::Opened::new();
+    let make: sal_window::Make = Box::new(move || Box::new(ReportWin { title, report, saving: None, saved: None, dialog_set: false, opened }));
+    // refused by the program after all: the report goes into a message
+    windows.open_modal(make, look).is_ok() && crate::ask::Opened::wait(&shown)
 }
 
 #[cfg(test)]
@@ -379,7 +390,7 @@ mod tests {
     fn an_archive_reports_the_check_and_what_was_deleted() {
         use lto_archive::{DeleteReport, FileDone};
         let opts = BackupOptions { verify: true, delete: DeleteSource::Ask, ..opts() };
-        let verified = |n: usize| (0..n).map(|i| FileDone { path: PathBuf::from(format!("D:\\Data\\v{i}")), length: 100, modified: None }).collect::<Vec<_>>();
+        let verified = |n: usize| (0..n).map(|i| FileDone { path: PathBuf::from(format!("D:\\Data\\v{i}")), length: 100, modified: None, id: None }).collect::<Vec<_>>();
         let r = BackupReport {
             set: "Archive 2026-11-16 10.00\\Data".into(),
             tapes: vec![TapeDone { barcode: "LTO001L5".into(), files: 3, bytes: 300 }],
@@ -468,7 +479,7 @@ mod tests {
         };
         for (report, dark) in [(backup(&r, opts(), &[PathBuf::from("D:\\Data")]), true), (backup(&BackupReport { unreadable: Vec::new(), ..r.clone() }, opts(), &[PathBuf::from("D:\\Data")]), false)] {
             let ok = report.ok;
-            let mut w = ReportWin { title: "Backup report".into(), report, saving: None, saved: None, dialog_set: false };
+            let mut w = ReportWin { title: "Backup report".into(), report, saving: None, saved: None, dialog_set: false, opened: crate::ask::Opened::new().0 };
             let ctx = egui::Context::default();
             ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
             sal_ui::layout::apply(&ctx);

@@ -17,7 +17,10 @@ fn plugin(asker: Option<Asker>) -> (SimLibrary, LtoCatalog, PathBuf) {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!("ltocatalog-plugin-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
     fs::create_dir_all(&dir).unwrap();
-    (sim, LtoCatalog::with(dir.clone(), Settings::default(), archive, asker), dir)
+    let mut p = LtoCatalog::with(dir.clone(), Settings::default(), archive, asker);
+    // the tapes formatted are new ones, put in by the person
+    p.format_answer = Some(true);
+    (sim, p, dir)
 }
 
 fn root() -> PathBuf {
@@ -296,7 +299,8 @@ fn standalone_drive_in_the_plugin() {
     let archive = Archive::new(Box::new(drive.clone()), Catalog::in_memory().unwrap(), "test");
     let dir = std::env::temp_dir().join(format!("ltocatalog-plugin-sd-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let p = LtoCatalog::with(dir.clone(), Settings::default(), archive, None);
+    let mut p = LtoCatalog::with(dir.clone(), Settings::default(), archive, None);
+    p.format_answer = Some(true);
     drive.insert_drive(0, lto_sim::Cart::new("SD0001L5", Config::default().capacity)).unwrap();
     let mut v = Values::new();
     v.insert("barcode".into(), "SD0001L5".into());

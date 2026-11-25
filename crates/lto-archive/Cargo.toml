@@ -12,6 +12,8 @@ publish = false
 lto-scsi.workspace = true
 ltfs.workspace = true
 lto-catalog.workspace = true
+# the SHA-256 of each file written, kept on the tape (digest.rs)
+sha2 = "0.10"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }

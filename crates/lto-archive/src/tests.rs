@@ -101,8 +101,8 @@ fn write_read_across_tapes() {
     let t = std::env::temp_dir().join(format!("lto-archive-{}", std::process::id()));
     let src = t.join("src");
     tree(&src);
-    a.format("LTO001L5", "one", &NoUi).unwrap();
-    a.format("LTO002L5", "two", &NoUi).unwrap();
+    a.format("LTO001L5", "one", &NewTape).unwrap();
+    a.format("LTO002L5", "two", &NewTape).unwrap();
     let mut last = (0, 0);
     a.write("LTO001L5", &[(src.clone(), "backup".into())], &NoUi, &mut |d, t| {
         last = (d, t);
@@ -153,8 +153,8 @@ fn write_read_across_tapes() {
 #[test]
 fn missing_tapes_are_asked_for() {
     let (sim, a) = archive();
-    a.format("LTO003L5", "", &NoUi).unwrap();
-    a.format("LTO004L5", "", &NoUi).unwrap();
+    a.format("LTO003L5", "", &NewTape).unwrap();
+    a.format("LTO004L5", "", &NewTape).unwrap();
     let t = std::env::temp_dir().join(format!("lto-archive-m-{}", std::process::id()));
     fs::create_dir_all(&t).unwrap();
     fs::write(t.join("f.txt"), b"f").unwrap();
@@ -185,7 +185,7 @@ fn missing_tapes_are_asked_for() {
 #[test]
 fn a_stale_catalog_refuses_changes() {
     let (_sim, a) = archive();
-    a.format("LTO005L5", "", &NoUi).unwrap();
+    a.format("LTO005L5", "", &NewTape).unwrap();
     // another program changed the tape since: the catalog holds generation 1, the tape 2
     {
         let site = a.site().unwrap();
@@ -213,7 +213,7 @@ fn not_enough_space() {
     cfg.capacity = 64 * 1024 * 1024;
     let sim = SimLibrary::new(&cfg);
     let a = Archive::new(Box::new(sim), Catalog::in_memory().unwrap(), "test");
-    a.format("LTO001L5", "", &NoUi).unwrap();
+    a.format("LTO001L5", "", &NewTape).unwrap();
     let t = std::env::temp_dir().join(format!("lto-archive-s-{}", std::process::id()));
     fs::create_dir_all(&t).unwrap();
     fs::write(t.join("big.bin"), vec![1u8; 70 * 1024 * 1024]).unwrap();
@@ -255,7 +255,7 @@ fn standalone_drive_without_a_library() {
 
     // a brand-new tape (no barcode in its memory, no LTFS) is taken by Format
     drive.insert_drive(0, lto_sim::Cart::new("NEW001L5", lto_sim::Config::default().capacity)).unwrap();
-    a.format("NEW001L5", "neu", &NoUi).unwrap();
+    a.format("NEW001L5", "neu", &NewTape).unwrap();
     let t = one_file("sd");
     a.write("NEW001L5", &[(t.join("f.txt"), "f.txt".into())], &NoUi, &mut |_, _| true).unwrap();
     assert_eq!(a.catalog.lock().unwrap().tape("NEW001L5").unwrap().unwrap().location, format!("drive {name}"));
@@ -289,7 +289,7 @@ fn the_wrong_tape_is_ejected_to_make_room() {
     let a = Archive::new(Box::new(drive.clone()), Catalog::in_memory().unwrap(), "test");
     for b in ["AAA001L5", "BBB001L5"] {
         drive.insert_drive(0, lto_sim::Cart::new(b, lto_sim::Config::default().capacity)).unwrap();
-        a.format(b, "", &NoUi).unwrap();
+        a.format(b, "", &NewTape).unwrap();
         a.mkdir(b, "d", &NoUi).unwrap();
         a.site().unwrap().eject(b, &|| false).unwrap();
         *SHELF.lock().unwrap() = Some(drive.take_drive(0).unwrap());
@@ -330,7 +330,7 @@ fn tapes_without_a_barcode_are_known_by_their_volume() {
 
     // seen before: found by the UUID of its volume
     drive.insert_drive(0, lto_sim::Cart::new("UUI001L5", lto_sim::Config::default().capacity)).unwrap();
-    a.format("UUI001L5", "", &NoUi).unwrap();
+    a.format("UUI001L5", "", &NewTape).unwrap();
     strip(&drive, "UUI001L5");
     a.reopen_if_idle();
     a.inventory(false).unwrap();
@@ -388,7 +388,7 @@ fn two_libraries_and_a_standalone_drive() {
     // a tape of each library, by its own robot
     let t = one_file("site");
     for b in ["LTO001L5", "LT2001L5"] {
-        a.format(b, "", &NoUi).unwrap();
+        a.format(b, "", &NewTape).unwrap();
         a.write(b, &[(t.join("f.txt"), "f.txt".into())], &NoUi, &mut |_, _| true).unwrap();
     }
     let loc = |b: &str| a.catalog.lock().unwrap().tape(b).unwrap().unwrap().location;
@@ -434,8 +434,8 @@ fn two_libraries_and_a_standalone_drive() {
 #[test]
 fn the_wrong_tape_in_a_drive_is_left_alone() {
     let (sim, a) = archive();
-    a.format("LTO001L5", "one", &NoUi).unwrap();
-    a.format("LTO002L5", "two", &NoUi).unwrap();
+    a.format("LTO001L5", "one", &NewTape).unwrap();
+    a.format("LTO002L5", "two", &NewTape).unwrap();
     let d1 = (0..2).find(|&i| sim.drive_tape(i).as_deref() == Some("LTO001L5")).expect("in a drive");
     let d2 = 1 - d1;
     assert_eq!(sim.drive_tape(d2).as_deref(), Some("LTO002L5"));
@@ -444,13 +444,13 @@ fn the_wrong_tape_in_a_drive_is_left_alone() {
     sim.insert_drive(d1, c2).unwrap();
     sim.insert_drive(d2, c1).unwrap();
     // formatting "LTO001L5" would hit LTO002L5: refused
-    let e = a.format("LTO001L5", "again", &NoUi).unwrap_err();
+    let e = a.format("LTO001L5", "again", &NewTape).unwrap_err();
     assert!(matches!(&e, Error::WrongTape { wanted, found, .. } if wanted == "LTO001L5" && found.starts_with("LTO002L5")), "{e}");
     // LTO002L5 is untouched
     a.import("LTO002L5", &NoUi).unwrap();
     assert_eq!(a.catalog.lock().unwrap().tape("LTO002L5").unwrap().unwrap().name, "two");
     // the inventory was read again: now the right tape is formatted
-    a.format("LTO001L5", "again", &NoUi).unwrap();
+    a.format("LTO001L5", "again", &NewTape).unwrap();
     assert_eq!(a.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap().name, "again");
     a.import("LTO002L5", &NoUi).unwrap();
     assert_eq!(a.catalog.lock().unwrap().tape("LTO002L5").unwrap().unwrap().name, "two");
@@ -503,10 +503,10 @@ fn a_drive_seen_twice_is_one_drive() {
     drop(site);
     // jobs go to drive 2, and to the tape asked for
     let a = Archive::new(Box::new(Seen { sim: sim.clone(), drives: vec![1, 1] }), Catalog::in_memory().unwrap(), "test");
-    a.format("LTO001L5", "one", &NoUi).unwrap();
+    a.format("LTO001L5", "one", &NewTape).unwrap();
     assert_eq!(sim.drive_tape(1).as_deref(), Some("LTO001L5"));
     assert_eq!(sim.drive_tape(0), None, "drive 1 isn't used");
-    a.format("LTO002L5", "two", &NoUi).unwrap();
+    a.format("LTO002L5", "two", &NewTape).unwrap();
     assert_eq!(sim.drive_tape(1).as_deref(), Some("LTO002L5"));
     a.import("LTO001L5", &NoUi).unwrap();
     assert_eq!(a.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap().name, "one");
@@ -518,7 +518,7 @@ fn a_drive_seen_twice_is_one_drive() {
 #[test]
 fn retry_before_the_library_has_read_its_mail_slot() {
     let (sim, a) = archive();
-    a.format("LTO001L5", "one", &NoUi).unwrap();
+    a.format("LTO001L5", "one", &NewTape).unwrap();
     a.site().unwrap().eject("LTO001L5", &|| false).unwrap();
     let cart = sim.take().expect("in the mail slot");
     let s2 = sim.clone();
@@ -549,8 +549,8 @@ fn retry_before_the_library_has_read_its_mail_slot() {
 fn a_unit_attention_or_a_busy_mail_slot_does_not_stop_eject() {
     use lto_scsi::sense::{key, Sense};
     let (sim, a) = archive();
-    a.format("LTO001L5", "one", &NoUi).unwrap();
-    a.format("LTO002L5", "two", &NoUi).unwrap();
+    a.format("LTO001L5", "one", &NewTape).unwrap();
+    a.format("LTO002L5", "two", &NewTape).unwrap();
     let site = a.site().unwrap();
     site.eject("LTO001L5", &|| false).unwrap();
     // taken out of the mail slot: the next inventory meets the news
@@ -580,7 +580,7 @@ fn a_unit_attention_or_a_busy_mail_slot_does_not_stop_eject() {
 #[test]
 fn after_retry_the_tape_is_looked_for_a_while() {
     let (sim, a) = archive();
-    a.format("LTO001L5", "one", &NoUi).unwrap();
+    a.format("LTO001L5", "one", &NewTape).unwrap();
     a.site().unwrap().eject("LTO001L5", &|| false).unwrap();
     let cart = sim.take().expect("in the mail slot");
     let s2 = sim.clone();
@@ -603,8 +603,8 @@ fn after_retry_the_tape_is_looked_for_a_while() {
 fn small_library() -> (SimLibrary, Archive) {
     let sim = SimLibrary::new(&Config { capacity: 24 * 1024 * 1024, ..Config::default() });
     let a = Archive::new(Box::new(sim.clone()), Catalog::in_memory().unwrap(), "test");
-    a.format("LTO001L5", "one", &NoUi).unwrap();
-    a.format("LTO002L5", "two", &NoUi).unwrap();
+    a.format("LTO001L5", "one", &NewTape).unwrap();
+    a.format("LTO002L5", "two", &NewTape).unwrap();
     (sim, a)
 }
 
@@ -786,7 +786,7 @@ fn a_file_larger_than_a_tape_is_left_out() {
 fn a_new_tape_with_data_is_refused() {
     let (sim, a) = small_library();
     // LTO003L5 holds a file and lies in the mail slot
-    a.format("LTO003L5", "three", &NoUi).unwrap();
+    a.format("LTO003L5", "three", &NewTape).unwrap();
     let t = std::env::temp_dir().join(format!("lto-backup-{}-data.txt", std::process::id()));
     fs::write(&t, b"keep me").unwrap();
     a.write("LTO003L5", &[(t.clone(), "keep.txt".into())], &NoUi, &mut |_, _| true).unwrap();
@@ -875,11 +875,15 @@ fn a_backup_onto_a_tape_the_catalog_is_behind() {
     let _ = (fs::remove_dir_all(&src), fs::remove_file(&t));
 }
 
+/// The log is one for the process: the tests that write one take turns.
+static LOG: Mutex<()> = Mutex::new(());
+
 /// The detailed log of a backup: the SCSI commands (data records summed
 /// up), what mount found in each partition, the catalog compared with the
 /// tape, each file with its block, and each index written.
 #[test]
 fn a_backup_is_in_the_detailed_log() {
+    let _log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     let (_sim, a) = small_library();
     let src = backup_source("logged", 3, 1000);
     let file = std::env::temp_dir().join(format!("lto-backup-{}-detail.log", std::process::id()));
@@ -920,6 +924,7 @@ fn a_backup_is_in_the_detailed_log() {
 /// now and then (every 100 GB on real tapes), written either way.
 #[test]
 fn a_backup_fills_three_ticked_tapes_in_one_drive() {
+    let _log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     let file = std::env::temp_dir().join(format!("lto-backup-{}-three.log", std::process::id()));
     let _ = fs::remove_file(&file);
     lto_scsi::log::open(&file).unwrap();
@@ -929,7 +934,7 @@ fn a_backup_fills_three_ticked_tapes_in_one_drive() {
             let sim = SimLibrary::new(&Config { capacity: cap, drives, ..Config::default() });
             let a = Archive::new(Box::new(sim.clone()), Catalog::in_memory().unwrap(), "test");
             for b in ["LTO001L5", "LTO002L5", "LTO003L5"] {
-                a.format(b, b, &NoUi).unwrap();
+                a.format(b, b, &NewTape).unwrap();
             }
             backup::TEST_COMMIT_EVERY.with(|c| c.set(Some(3 * 1024 * 1024)));
             let src = backup_source(&format!("three-{drives}-{interim_index:?}"), 13, 2 * 1024 * 1024);
@@ -1245,10 +1250,11 @@ fn an_archive_checks_and_deletes_the_items_selected() {
 }
 
 /// Items from different folders: each under its own name in the set, two
-/// of the same name made different; deleted without asking and without
-/// the check, every file on the tapes goes, the folders they were in stay.
+/// of the same name made different; deleted without asking. An archive
+/// asked for without the check is checked anyway (only what was read back
+/// the same is deleted); the folders the items were in stay.
 #[test]
-fn items_from_anywhere_are_archived_without_the_check() {
+fn items_from_anywhere_are_archived_and_always_checked() {
     let (_sim, a) = small_library();
     let one = backup_source("anywhere-1", 2, 1000);
     let two = backup_source("anywhere-2", 1, 500);
@@ -1256,7 +1262,8 @@ fn items_from_anywhere_are_archived_without_the_check() {
     let ui = ArchiveUi { delete: false, asked: Mutex::new(Vec::new()), spoil: None };
     let set = "Archive D\\anywhere";
     let r = a.backup_items(&[one.join("sub"), two.join("sub"), two.join("empty")], set, &["LTO001L5".into()], opts, &ui).unwrap();
-    assert!(r.error.is_none() && r.verified.is_empty() && !r.checked, "{r:?}");
+    assert!(r.error.is_none() && r.checked && r.verified.len() == 3 && r.verify_failed.is_empty(), "{r:?}");
+    assert_eq!((opts.job(), BackupOptions::default().job()), ("archive", "backup"));
     assert!(ui.asked.lock().unwrap().is_empty(), "not asked");
     let names: Vec<String> = backed_up(&a, &["LTO001L5"], set).into_iter().map(|(p, _)| p).collect();
     assert_eq!(names, ["sub (2)\\f00.bin", "sub\\f00.bin", "sub\\f01.bin"]);
@@ -1311,5 +1318,368 @@ fn a_copy_reads_ahead_and_every_file_comes_back_whole() {
         let name = n.rsplit('\\').next().unwrap();
         assert_eq!(*data, fs::read(src.join("sub").join(name)).unwrap(), "{name}");
     }
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// An archive keeps a file that has data the tape doesn't hold (an
+/// alternate data stream), and one replaced by another file of the same
+/// size and time after it was read back.
+#[cfg(windows)]
+#[test]
+fn an_archive_keeps_files_with_streams_and_files_replaced() {
+    let (_sim, a) = small_library();
+    let src = backup_source("archive-streams", 3, 2000);
+    let streamed = src.join(r"sub\f00.bin");
+    fs::write(format!("{}:Zone.Identifier", streamed.display()), b"[ZoneTransfer]").unwrap();
+    // f01 is swapped for another file of the same size and time once the
+    // archive asks about deleting (after it was read back)
+    let swapped = src.join(r"sub\f01.bin");
+    struct SwapUi(PathBuf);
+    impl Ui for SwapUi {
+        fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool, _: &Places) -> Answer {
+            Answer::Cancel
+        }
+        fn confirm_delete(&self, _: u64, _: u64, _: u64) -> bool {
+            let m = fs::metadata(&self.0).unwrap();
+            let data = fs::read(&self.0).unwrap();
+            fs::remove_file(&self.0).unwrap();
+            fs::write(&self.0, &data).unwrap();
+            fs::File::options().write(true).open(&self.0).unwrap().set_modified(m.modified().unwrap()).unwrap();
+            true
+        }
+    }
+    let opts = BackupOptions { verify: true, delete: DeleteSource::Ask, ..Default::default() };
+    let r = a.backup(&src, r"Archive S\streams", &["LTO001L5".into()], opts, &SwapUi(swapped.clone())).unwrap();
+    assert_eq!(r.verified.len(), 3, "{r:?}");
+    let d = r.deleted.as_ref().unwrap();
+    assert_eq!(d.files, 1, "{d:?}");
+    assert!(streamed.exists() && d.failed.iter().any(|(p, why)| *p == streamed && why.contains("Zone.Identifier")), "{d:?}");
+    assert!(swapped.exists() && d.changed == [swapped.clone()], "{d:?}");
+    assert!(!src.join(r"sub\f02.bin").exists());
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// The tape gives an older generation of its volume than the catalog
+/// recorded (its newest index gone from both partitions): the tape is
+/// taken as damaged, read-only; the catalog keeps its newer listing and
+/// nothing is written.
+#[test]
+fn a_tape_rolled_back_behind_the_catalog_is_damaged() {
+    let (sim, a) = small_library();
+    let src = backup_source("rolled-back", 2, 1000);
+    a.write("LTO001L5", &[(src.join(r"sub\f00.bin"), "first.bin".into())], &NoUi, &mut |_, _| true).unwrap();
+    let before = sim.cart("LTO001L5").unwrap().parts.clone();
+    a.write("LTO001L5", &[(src.join(r"sub\f01.bin"), "second.bin".into())], &NoUi, &mut |_, _| true).unwrap();
+    let newest = a.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap().generation;
+    sim.with_cart("LTO001L5", |c| c.parts = before).unwrap();
+    let r = a.write("LTO001L5", &[(src.join(r"sub\f01.bin"), "third.bin".into())], &NoUi, &mut |_, _| true);
+    assert!(matches!(r, Err(Error::Ltfs(ltfs::Error::ReadOnly(_)))), "{r:?}");
+    let t = a.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap();
+    assert_eq!(t.generation, newest, "the catalog isn't set back");
+    assert!(a.catalog.lock().unwrap().entry("LTO001L5", "second.bin").unwrap().is_some());
+    assert!(t.condition.iter().any(|c| matches!(c, lto_catalog::Condition::Index(_))), "{:?}", t.condition);
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// Says yes when Format can't show the cartridge to be the tape (a new,
+/// blank tape), as a person who put it in would.
+struct NewTape;
+
+impl Ui for NewTape {
+    fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool, _: &Places) -> Answer {
+        Answer::Cancel
+    }
+    fn confirm_format_unidentified(&self, _: &str, _: &str, _: &str) -> bool {
+        true
+    }
+}
+
+/// Format formats only a cartridge shown to be the tape: a known tape
+/// holding its own volume without asking; a blank one only once the
+/// person confirms (the drive named); never one holding another tape's
+/// volume, or another volume than the catalog's.
+#[test]
+fn format_needs_the_tape_shown_or_confirmed() {
+    #[derive(Default)]
+    struct Asked(Mutex<Vec<(String, String, String)>>, bool);
+    impl Ui for Asked {
+        fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool, _: &Places) -> Answer {
+            Answer::Cancel
+        }
+        fn confirm_format_unidentified(&self, barcode: &str, drive: &str, why: &str) -> bool {
+            self.0.lock().unwrap().push((barcode.into(), drive.into(), why.into()));
+            self.1
+        }
+    }
+    let sim = SimLibrary::new(&Config::default());
+    let a = Archive::new(Box::new(sim.clone()), Catalog::in_memory().unwrap(), "test");
+    // blank: asked; No leaves it alone
+    let no = Asked::default();
+    let e = a.format("LTO001L5", "one", &no).unwrap_err();
+    assert!(matches!(e, Error::Refused(_)), "{e}");
+    let asked = no.0.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].2.contains("blank") && !asked[0].1.is_empty(), "{asked:?}");
+    assert!(a.catalog.lock().unwrap().tape("LTO001L5").unwrap().is_none_or(|t| !t.is_ltfs()));
+    // Yes formats it
+    let yes = Asked { 1: true, ..Asked::default() };
+    let first = a.format("LTO001L5", "one", &yes).unwrap().volume_uuid;
+    // formatted again: its own volume (and its barcode in its memory): not asked
+    let quiet = Asked::default();
+    let second = a.format("LTO001L5", "again", &quiet).unwrap().volume_uuid;
+    assert!(quiet.0.lock().unwrap().is_empty());
+    assert_ne!(first, second);
+    // the catalog has another volume for it than the tape holds: refused
+    let on_tape = a.import("LTO001L5", &NoUi).unwrap().unwrap();
+    let other = ltfs::Index { volume_uuid: "11111111-2222-3333-4444-555555555555".into(), generation: 9, ..on_tape.clone() };
+    a.catalog.lock().unwrap().import("LTO001L5", &other, None, None, false).unwrap();
+    let e = a.format("LTO001L5", "x", &yes).unwrap_err();
+    assert!(matches!(e, Error::OtherVolume { .. }), "{e}");
+    // another tape's volume: refused, whatever the person would say
+    {
+        let mut cat = a.catalog.lock().unwrap();
+        cat.forget("LTO001L5").unwrap();
+        cat.import("LTO009L5", &on_tape, None, None, false).unwrap();
+    }
+    let e = a.format("LTO001L5", "x", &yes).unwrap_err();
+    assert!(matches!(&e, Error::OtherVolume { belongs_to: Some(b), .. } if b == "LTO009L5"), "{e}");
+}
+
+/// A second backup into a folder a tape already holds is refused before
+/// anything is written, unless replacing was asked for (a name without the
+/// date); the name has the seconds, so two backups a minute apart differ.
+#[test]
+fn a_backup_never_replaces_another_by_chance() {
+    let (_sim, a) = small_library();
+    let src = backup_source("same-name", 2, 1000);
+    let set = r"Backup X\same";
+    a.backup(&src, set, &["LTO001L5".into()], BackupOptions::default(), &NoUi).unwrap();
+    let e = a.backup(&src, set, &["LTO001L5".into()], BackupOptions::default(), &NoUi).unwrap_err();
+    assert!(matches!(&e, Error::Refused(m) if m.contains("already holds")), "{e}");
+    let r = a.backup(&src, set, &["LTO001L5".into()], BackupOptions { replace: true, ..Default::default() }, &NoUi).unwrap();
+    assert!(r.error.is_none() && r.written().0 == 2, "{r:?}");
+    let stamp = dated("Backup");
+    assert_eq!(stamp.len(), "Backup 2026-11-25 10.30.21".len(), "{stamp}");
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// Each file written keeps its SHA-256 on the tape; Check tapes compares
+/// it, and tells a file whose data came back different (read without an
+/// error) from one that can't be read.
+#[test]
+fn check_tapes_compares_the_checksums() {
+    let (sim, a) = small_library();
+    let src = backup_source("checksums", 3, 5000);
+    a.write("LTO001L5", &[(src.join("sub"), "sub".into())], &NoUi, &mut |_, _| true).unwrap();
+    let r = &a.verify(&["LTO001L5".into()], &NoUi).unwrap()[0];
+    assert_eq!((r.files, r.checksum_ok, r.no_checksum), (3, 3, 0), "{r:?}");
+    assert!(r.bad.is_empty() && r.checksum_bad.is_empty());
+    // a byte of f01 changes on the tape; the drive reads it without fault
+    let block = {
+        let mut start = None;
+        a.with_volume("LTO001L5", &NoUi, |v| {
+            if let Some(Node::File(f)) = v.index.find(r"sub\f01.bin") {
+                start = Some(f.extents[0].start_block as usize);
+            }
+            Ok(())
+        })
+        .unwrap();
+        start.unwrap()
+    };
+    sim.with_cart("LTO001L5", |c| {
+        if let lto_sim::Rec::Data(d) = &mut c.parts[1][block] {
+            d[10] ^= 0xFF;
+        }
+    })
+    .unwrap();
+    let r = &a.verify(&["LTO001L5".into()], &NoUi).unwrap()[0];
+    assert!(r.bad.is_empty(), "read without an error: {r:?}");
+    assert_eq!(r.checksum_bad.len(), 1, "{r:?}");
+    assert!(r.checksum_bad[0].0.ends_with("f01.bin"));
+    assert_eq!(r.checksum_ok, 2);
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// Partition a's label overwritten (no LTFS label there any more), or
+/// unreadable: import uses partition b's and keeps the tape's listing, and
+/// Format still recognises the volume from it.
+#[test]
+fn a_damaged_label_in_partition_a_keeps_the_listing() {
+    let (sim, a) = small_library();
+    let src = backup_source("label-a", 1, 1000);
+    a.write("LTO001L5", &[(src.join(r"sub\f00.bin"), "kept.bin".into())], &NoUi, &mut |_, _| true).unwrap();
+    let uuid = a.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap().uuid;
+    sim.with_cart("LTO001L5", |c| c.parts[0][2] = lto_sim::Rec::Data(b"not a label at all".to_vec())).unwrap();
+    a.import("LTO001L5", &NoUi).unwrap().expect("still LTFS");
+    let t = a.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap();
+    assert!(t.is_ltfs() && t.uuid == uuid, "{t:?}");
+    assert!(a.catalog.lock().unwrap().entry("LTO001L5", "kept.bin").unwrap().is_some());
+    assert!(t.condition.iter().any(|c| matches!(c, lto_catalog::Condition::Index('a'))), "{:?}", t.condition);
+    // Format knows it by partition b's label: its own volume, not asked
+    let quiet = AskedFormat::default();
+    a.format("LTO001L5", "again", &quiet).unwrap();
+    assert!(quiet.0.lock().unwrap().is_empty());
+    // unreadable instead: the same
+    a.write("LTO001L5", &[(src.join(r"sub\f00.bin"), "kept.bin".into())], &NoUi, &mut |_, _| true).unwrap();
+    sim.damage("LTO001L5", 0, 2);
+    a.import("LTO001L5", &NoUi).unwrap().expect("still LTFS");
+    assert!(a.catalog.lock().unwrap().entry("LTO001L5", "kept.bin").unwrap().is_some());
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// Records Format's questions about cartridges it can't identify; says no.
+#[derive(Default)]
+struct AskedFormat(Mutex<Vec<String>>);
+
+impl Ui for AskedFormat {
+    fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool, _: &Places) -> Answer {
+        Answer::Cancel
+    }
+    fn confirm_format_unidentified(&self, barcode: &str, _: &str, _: &str) -> bool {
+        self.0.lock().unwrap().push(barcode.into());
+        false
+    }
+}
+
+/// A folder left empty by an archive goes, unless it has a named data
+/// stream of its own (NTFS folders can): the tape doesn't hold that.
+#[cfg(windows)]
+#[test]
+fn an_archive_keeps_a_folder_with_a_stream() {
+    let (_sim, a) = small_library();
+    let src = backup_source("folder-stream", 1, 500);
+    fs::create_dir_all(src.join("plain")).unwrap();
+    fs::write(src.join(r"plain\p.bin"), b"plain").unwrap();
+    fs::write(format!("{}:note", src.join("sub").display()), b"only on disk").unwrap();
+    let opts = BackupOptions { verify: true, delete: DeleteSource::Auto, ..Default::default() };
+    let r = a.backup(&src, r"Archive F\streams", &["LTO001L5".into()], opts, &NoUi).unwrap();
+    let d = r.deleted.as_ref().unwrap();
+    assert_eq!(d.files, 2, "{d:?}");
+    assert!(!src.join("plain").exists(), "an empty folder without streams goes");
+    assert!(src.join("sub").is_dir(), "its stream isn't on the tape");
+    assert_eq!(fs::read(format!("{}:note", src.join("sub").display())).unwrap(), b"only on disk");
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// With the check, a file's Archive attribute is cleared only once it was
+/// read back the same: one the tape can't give back keeps it, so the next
+/// "only Archive" backup takes it again.
+#[cfg(windows)]
+#[test]
+fn the_archive_attribute_waits_for_the_check() {
+    let (sim, a) = small_library();
+    let src = backup_source("attr-check", 2, 3000);
+    // where f01 lands on a freshly formatted tape: the same on both
+    let opts = BackupOptions { clear_archive: true, verify: true, ..Default::default() };
+    for i in 0..2 {
+        set_archive(&src.join(format!(r"sub\f{i:02}.bin"))).unwrap();
+    }
+    a.backup(&src, r"Backup P\probe", &["LTO002L5".into()], BackupOptions { clear_archive: false, ..Default::default() }, &NoUi).unwrap();
+    let mut block = None;
+    a.with_volume("LTO002L5", &NoUi, |v| {
+        if let Some(Node::File(f)) = v.index.find(r"Backup P\probe\sub\f01.bin") {
+            block = Some(f.extents[0].start_block as usize);
+        }
+        Ok(())
+    })
+    .unwrap();
+    // damaged once written, as read back starts
+    struct DamageOnCheck(SimLibrary, usize);
+    impl Ui for DamageOnCheck {
+        fn step(&self, s: Step) {
+            if matches!(s, Step::Verifying { .. }) {
+                self.0.damage("LTO001L5", 1, self.1);
+            }
+        }
+        fn missing_tape(&self, _: &str, _: Option<&Tape>, _: bool, _: &Places) -> Answer {
+            Answer::Cancel
+        }
+    }
+    let r = a.backup(&src, r"Backup P\probe", &["LTO001L5".into()], opts, &DamageOnCheck(sim.clone(), block.unwrap())).unwrap();
+    assert_eq!(r.verified.len(), 1, "{r:?}");
+    assert_eq!(r.verify_failed.len(), 1, "{r:?}");
+    assert!(!archive_set(&src.join(r"sub\f00.bin")).unwrap(), "read back the same: cleared");
+    assert!(archive_set(&src.join(r"sub\f01.bin")).unwrap(), "not read back: still set");
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// A copy out of a tape checks each file against its SHA-256 before the
+/// file is finished: data that came back different (read without an error)
+/// never replaces the file on disk.
+#[test]
+fn a_restore_never_finishes_a_file_that_differs() {
+    let (sim, a) = small_library();
+    let src = backup_source("restore-sum", 1, 5000);
+    a.write("LTO001L5", &[(src.join(r"sub\f00.bin"), "f.bin".into())], &NoUi, &mut |_, _| true).unwrap();
+    let mut block = None;
+    a.with_volume("LTO001L5", &NoUi, |v| {
+        if let Some(Node::File(f)) = v.index.find("f.bin") {
+            block = Some(f.extents[0].start_block as usize);
+        }
+        Ok(())
+    })
+    .unwrap();
+    let out = std::env::temp_dir().join(format!("lto-restore-sum-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&out);
+    fs::create_dir_all(out.join("LTO001L5")).unwrap();
+    fs::write(out.join(r"LTO001L5\f.bin"), b"good copy").unwrap();
+    sim.with_cart("LTO001L5", |c| {
+        if let lto_sim::Rec::Data(d) = &mut c.parts[1][block.unwrap()] {
+            d[0] ^= 0xFF;
+        }
+    })
+    .unwrap();
+    let mut sink = restore::ToFolder::new(&out, restore::Overwrite::Replace).unwrap();
+    let e = a.read(&[r"LTO001L5\f.bin".into()], &mut sink, &NoUi).unwrap_err();
+    drop(sink);
+    assert!(matches!(e, Error::Checksum(_)), "{e}");
+    assert_eq!(fs::read(out.join(r"LTO001L5\f.bin")).unwrap(), b"good copy");
+    assert_eq!(fs::read_dir(out.join("LTO001L5")).unwrap().count(), 1, "no partial file left");
+    let _ = fs::remove_dir_all(&out);
+    let _ = fs::remove_dir_all(&src);
+}
+
+/// Import never gives a barcode another volume than the catalog has for
+/// it (nor throws its listing away for a cartridge without LTFS): the
+/// listing stays until the tape is forgotten, on purpose.
+#[test]
+fn import_keeps_the_identity_until_the_tape_is_forgotten() {
+    let (_sim, a) = small_library();
+    let on_tape = a.import("LTO001L5", &NoUi).unwrap().unwrap();
+    let recorded = ltfs::Index { volume_uuid: "11111111-2222-3333-4444-555555555555".into(), ..on_tape.clone() };
+    a.catalog.lock().unwrap().import("LTO001L5", &recorded, None, None, false).unwrap();
+    let e = a.import("LTO001L5", &NoUi).unwrap_err();
+    assert!(matches!(e, Error::OtherVolume { belongs_to: None, .. }), "{e}");
+    assert_eq!(a.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap().uuid, recorded.volume_uuid, "kept");
+    // another tape's volume: refused too
+    a.catalog.lock().unwrap().forget("LTO001L5").unwrap();
+    a.catalog.lock().unwrap().import("LTO002L5", &on_tape, None, None, false).unwrap();
+    let e = a.import("LTO001L5", &NoUi).unwrap_err();
+    assert!(matches!(&e, Error::OtherVolume { belongs_to: Some(b), .. } if b == "LTO002L5"), "{e}");
+    // forgotten on purpose: imported
+    a.catalog.lock().unwrap().forget("LTO002L5").unwrap();
+    a.import("LTO001L5", &NoUi).unwrap().unwrap();
+    assert_eq!(a.catalog.lock().unwrap().tape("LTO001L5").unwrap().unwrap().uuid, on_tape.volume_uuid);
+    // a blank cartridge where the catalog has a volume: its listing stays
+    let blank = ltfs::Index { volume_uuid: "99999999-2222-3333-4444-555555555555".into(), ..on_tape };
+    a.catalog.lock().unwrap().import("LTO003L5", &blank, None, None, false).unwrap();
+    let e = a.import("LTO003L5", &NoUi).unwrap_err();
+    assert!(matches!(&e, Error::Refused(m) if m.contains("Forget")), "{e}");
+    assert!(a.catalog.lock().unwrap().tape("LTO003L5").unwrap().unwrap().is_ltfs());
+}
+
+/// Deleting stopped (Cancel) deletes nothing more: no more files, and no
+/// folder, not even one left empty; the report says how many weren't
+/// reached.
+#[test]
+fn deleting_stops_at_cancel() {
+    let (_sim, a) = small_library();
+    let src = backup_source("delete-stop", 3, 700);
+    let r = a.backup(&src, r"Backup D\stop", &["LTO001L5".into()], BackupOptions { verify: true, ..Default::default() }, &NoUi).unwrap();
+    assert_eq!(r.verified.len(), 3, "{r:?}");
+    let d = delete_source(&r, &mut |done, _| done < 1);
+    assert_eq!((d.files, d.folders, d.stopped), (1, 0, Some(2)), "{d:?}");
+    assert!(src.join("empty").is_dir(), "no folder removed once stopped");
+    assert_eq!(fs::read_dir(src.join("sub")).unwrap().count(), 2);
     let _ = fs::remove_dir_all(&src);
 }

@@ -39,8 +39,11 @@ use lto_scsi::tape::{attr, TapeDrive};
 use ltfs::{File, Index, Node, Time, Times, Volume};
 
 mod backup;
+pub mod digest;
 mod prefetch;
+pub mod restore;
 pub use backup::{
+    FileId,
     archive_set, archive_set_name, backup_set_name, clear_archive, dated, delete_source, set_folder, set_archive, BackupOptions, BackupReport, DeleteReport, DeleteSource, FileDone, InterimIndex, NewTapeProblem, TapeDone, COMMIT_EVERY,
 };
 
@@ -130,6 +133,14 @@ pub struct VerifyReport {
     pub bytes: u64,
     /// Files that couldn't be read: (path on the tape, why).
     pub bad: Vec<(String, String)>,
+    /// Files read whole whose data isn't what was written: its SHA-256
+    /// differs from the one kept with the file (path on the tape, why).
+    pub checksum_bad: Vec<(String, String)>,
+    /// Files read whole and found the same as written (by their SHA-256).
+    pub checksum_ok: u64,
+    /// Files read whole that have no SHA-256 kept with them (written by
+    /// another program, or before this one kept it): only shown readable.
+    pub no_checksum: u64,
     /// One partition's label or index couldn't be read.
     pub damaged_index: bool,
     /// Skipped at the person's word (it wasn't put in).
@@ -174,6 +185,14 @@ pub trait Ui {
     /// says nothing.
     fn index_damaged(&self, warning: &IndexWarning) {
         let _ = warning;
+    }
+    /// Format was asked for `barcode`, but the cartridge in the drive
+    /// `drive` can't be shown to be that tape (`why`: it is blank, or what it
+    /// says doesn't settle it): true formats the tape in that drive. The
+    /// default doesn't.
+    fn confirm_format_unidentified(&self, barcode: &str, drive: &str, why: &str) -> bool {
+        let _ = (barcode, drive, why);
+        false
     }
     /// An archive's files are on the tapes: `files` (`bytes`) to delete
     /// from disk (read back the same, when they were checked; `not_same`
@@ -222,6 +241,10 @@ pub enum Error {
     NoSpace(u64, u64),
     /// Not possible (writing at the top level, a name in use…).
     Refused(String),
+    /// A file read whole from a tape isn't what was written there: its
+    /// SHA-256 differs from the one kept with it. It wasn't finished on
+    /// disk.
+    Checksum(String),
     /// The drive that was to hold `wanted` holds a cartridge that says it is
     /// `found` (the library's drives matched to the wrong tape devices, or
     /// tapes moved outside this program); nothing was done to it.
@@ -249,6 +272,7 @@ impl std::fmt::Display for Error {
             Error::Skipped(b) => write!(f, "tapes skipped: {}", b.join(", ")),
             Error::NoSpace(need, free) => write!(f, "not enough space on the tape: {need} bytes needed, {free} free"),
             Error::Refused(m) => write!(f, "{m}"),
+            Error::Checksum(p) => write!(f, "\"{p}\" was read from the tape, but its data isn't what was written (its SHA-256 differs); it wasn't copied"),
             Error::WrongTape { wanted, found, drive } => write!(
                 f,
                 "drive {drive} was to hold tape {wanted}, but the cartridge in it says it is {found}; nothing was done to it. The library's drives may be matched to the wrong tape devices, or tapes were moved outside this program: run an inventory, and check `ltocat selftest`"
@@ -258,7 +282,7 @@ impl std::fmt::Display for Error {
                 if let Some(b) = belongs_to {
                     write!(f, " (the volume in the drive is tape {b}'s)")?;
                 }
-                write!(f, "; nothing was done to it and the catalog wasn't changed. Run an inventory; if the tape was formatted again by another program, import it")
+                write!(f, "; nothing was done to it and the catalog wasn't changed. Run an inventory; if the tape was formatted again by another program, forget it (take it out of the catalog), then import it")
             }
             Error::Cancelled => write!(f, "cancelled"),
             Error::Library(e) => write!(f, "{e}"),
@@ -702,11 +726,20 @@ impl Archive {
         let mut lease = self.acquire(&site, barcode, ui, false, false)?.expect("no skip");
         let drive = lease.drive();
         if ltfs::probe(drive)?.is_none() {
+            // the catalog has a volume for this barcode: the cartridge in
+            // the drive may not be that tape; its listing isn't thrown away
+            if let Err(e) = self.same_identity(barcode, None) {
+                drop(lease);
+                return Err(e);
+            }
             let wp = drive.write_protected().unwrap_or(false);
             self.catalog.lock().unwrap().mark_not_ltfs(barcode, wp)?;
             return Ok(None);
         }
         let r = self.mount(drive, barcode, ui).and_then(|mut v| {
+            // another volume than the catalog has for the barcode, or
+            // another tape's: never recorded in its place
+            self.same_identity(barcode, Some(&v.index.volume_uuid))?;
             if v.damage.is_empty() || !self.catalog_is_newer(&v)? {
                 self.record(&mut v)?;
             }
@@ -714,6 +747,40 @@ impl Archive {
         });
         self.after_use(&mut lease, barcode, r.as_ref().err());
         r
+    }
+
+    /// Whether the cartridge mounted as `barcode`, holding the LTFS volume
+    /// `uuid` (`None`: none), may be recorded as that tape: the catalog has
+    /// no other volume for the barcode, and the volume isn't another
+    /// tape's. Giving a barcode another volume is done on purpose: the tape
+    /// is forgotten first (Forget tape), then imported.
+    fn same_identity(&self, barcode: &str, uuid: Option<&str>) -> Result<()> {
+        let cat = self.catalog.lock().unwrap();
+        let known = cat.tape(barcode)?.map(|t| t.uuid).filter(|u| !u.is_empty());
+        match uuid {
+            Some(u) => {
+                if let Some(o) = cat.tape_by_uuid(u)?.filter(|o| !o.barcode.eq_ignore_ascii_case(barcode)) {
+                    log!("import {barcode}: REFUSED: the cartridge holds tape {}'s volume {u}", o.barcode);
+                    return Err(Error::OtherVolume { barcode: barcode.to_owned(), catalog: known.unwrap_or_default(), tape: u.to_owned(), belongs_to: Some(o.barcode) });
+                }
+                match known {
+                    Some(k) if k != u => {
+                        log!("import {barcode}: REFUSED: the cartridge holds the volume {u}, the catalog has {k}");
+                        Err(Error::OtherVolume { barcode: barcode.to_owned(), catalog: k, tape: u.to_owned(), belongs_to: None })
+                    }
+                    _ => Ok(()),
+                }
+            }
+            None => match known {
+                Some(k) => {
+                    log!("import {barcode}: REFUSED: the cartridge holds no LTFS volume, the catalog has {k}");
+                    Err(Error::Refused(format!(
+                        "the catalog has the LTFS volume {k} for tape {barcode}, but the cartridge in the drive holds none; its listing was kept. If the tape was erased or formatted otherwise, take it out of the catalog first (Forget tape), then import it"
+                    )))
+                }
+                None => Ok(()),
+            },
+        }
     }
 
     /// What the drives said since this was last asked (TapeAlert flags),
@@ -726,10 +793,23 @@ impl Archive {
     /// index can't be read, the person is told ([`Ui::index_damaged`]) and
     /// the catalog notes it.
     fn mount<'d>(&self, drive: &'d mut TapeDrive, barcode: &str, ui: &dyn Ui) -> Result<Volume<'d>> {
-        let v = match Volume::mount(drive, barcode, &self.creator) {
+        let mut v = match Volume::mount(drive, barcode, &self.creator) {
             Err(ltfs::Error::NotLtfs(_)) => return Err(Error::NotLtfs(barcode.to_owned())),
             r => r?,
         };
+        // the catalog recorded a newer generation of this volume than the
+        // tape gives: its newest index is gone from the tape (both copies).
+        // Nothing explains that, so the tape is taken as damaged: read-only,
+        // and the catalog keeps its newer listing
+        if v.damage.is_empty() {
+            let known = self.catalog.lock().unwrap().tape(barcode)?;
+            if let Some(t) = known.filter(|t| t.uuid == v.index.volume_uuid && t.generation > v.index.generation) {
+                let error = format!("its newest index (generation {}, in the catalog) isn't on the tape, which gives generation {}", t.generation, v.index.generation);
+                log!("warning {barcode}: ROLLED BACK: {error}");
+                v.damage.push(ltfs::Damage { partition: v.label.data_partition, label: false, error });
+                v.read_only = Some("the tape's newest index can't be found (it gives an older one than the catalog holds): copy its files onto another tape".into());
+            }
+        }
         if !v.damage.is_empty() {
             let catalog_generation = {
                 let cat = self.catalog.lock().unwrap();
@@ -889,12 +969,27 @@ impl Archive {
                 continue;
             }
             let mut stopped = false;
+            // the data is checked against the SHA-256 kept with the file
+            // before the file is finished (a folder on disk gives it its name
+            // only then)
+            let kept = digest::stored(&f);
+            let mut hash = kept.as_ref().map(|_| digest::Hasher::default());
             v.read_file(&f, &mut |b| {
+                if let Some(h) = &mut hash {
+                    h.update(b);
+                }
                 let go = sink.write(b)? && !ui.cancelled();
                 stopped |= !go;
                 Ok(go)
             })
             .map_err(|e| if stopped { Error::Cancelled } else { e.into() })?;
+            if let (Some(want), Some(h)) = (kept, hash) {
+                let got = h.hex();
+                if got != want {
+                    log!("read {barcode}: \"{path}\" SHA-256 DIFFERS: {got}, written {want}: not finished");
+                    return Err(Error::Checksum(join(barcode, &path)));
+                }
+            }
             sink.end()?;
         }
         Ok(())
@@ -927,14 +1022,23 @@ impl Archive {
                 Ok(()) => {}
             }
             let cat = self.catalog.lock().unwrap();
-            if report.bad.is_empty() && report.error.is_none() && !report.damaged_index && tape_flags.is_empty() {
+            if report.bad.is_empty() && report.checksum_bad.is_empty() && report.error.is_none() && !report.damaged_index && tape_flags.is_empty() {
                 log!("verify {barcode}: all {} files read, nothing wrong", report.files);
                 cat.clear_condition(&barcode)?;
             } else if !report.bad.is_empty() {
                 cat.add_condition(&barcode, &[Condition::Read, Condition::Unreadable(report.bad.len() as u64)])?;
             }
             drop(cat);
-            log!("verify {barcode}: {} of {} files read, {} can't be read{}", report.files, report.total_files, report.bad.len(), report.error.as_deref().map(|e| format!("; stopped: {e}")).unwrap_or_default());
+            log!(
+                "verify {barcode}: {} of {} files read, {} can't be read; checksums: {} the same, {} DIFFERENT, {} files without one{}",
+                report.files,
+                report.total_files,
+                report.bad.len(),
+                report.checksum_ok,
+                report.checksum_bad.len(),
+                report.no_checksum,
+                report.error.as_deref().map(|e| format!("; stopped: {e}")).unwrap_or_default()
+            );
             out.push(report);
         }
         Ok(out)
@@ -962,8 +1066,13 @@ impl Archive {
             let mut read = 0u64;
             let began = Instant::now();
             let mut shown = began;
+            let kept = digest::stored(&f);
+            let mut hash = kept.as_ref().map(|_| digest::Hasher::default());
             let r = v.read_file(&f, &mut |b| {
                 read += b.len() as u64;
+                if let Some(h) = &mut hash {
+                    h.update(b);
+                }
                 if shown.elapsed() >= Duration::from_secs(1) {
                     shown = Instant::now();
                     let speed = backup::speed(report.bytes + read, reading + began.elapsed());
@@ -975,8 +1084,23 @@ impl Archive {
             report.bytes += read;
             match r {
                 Ok(()) => {
-                    log!("verify {barcode}: \"{path}\" {read} bytes read");
                     report.files += 1;
+                    match (kept, hash) {
+                        (Some(want), Some(h)) => {
+                            let got = h.hex();
+                            if got == want {
+                                log!("verify {barcode}: \"{path}\" {read} bytes read, SHA-256 the same as written");
+                                report.checksum_ok += 1;
+                            } else {
+                                log!("verify {barcode}: \"{path}\" {read} bytes read, SHA-256 DIFFERS: {got}, written {want}");
+                                report.checksum_bad.push((path, format!("its data isn't what was written (SHA-256 {got}, written {want})")));
+                            }
+                        }
+                        _ => {
+                            log!("verify {barcode}: \"{path}\" {read} bytes read (no SHA-256 kept with it)");
+                            report.no_checksum += 1;
+                        }
+                    }
                 }
                 Err(ltfs::Error::Cancelled) => return Err(Error::Cancelled),
                 // the tape couldn't be read there, or the data isn't all
@@ -1083,10 +1207,12 @@ impl Archive {
                         _ => return Err(Error::Refused(format!("\"{}\" wasn't read", disk.display()))),
                     };
                     let mut f = prefetch.reader();
-                    let (extents, length) = v.write_data(&mut f, &mut |n| {
+                    let mut hashing = digest::Hashing::new(&mut f);
+                    let (extents, length) = v.write_data(&mut hashing, &mut |n| {
                         done += n;
                         progress(done, total) && !ui.cancelled()
                     })?;
+                    let sum = hashing.attribute(length);
                     let uid = v.index.next_uid();
                     let file = File {
                         name: name.clone(),
@@ -1095,7 +1221,7 @@ impl Archive {
                         open_for_write: false,
                         times: times_of(&meta, now),
                         uid,
-                        xattrs: Vec::new(),
+                        xattrs: sum.into_iter().collect(),
                         extents,
                         symlink: None,
                         extra: Vec::new(),
@@ -1173,12 +1299,28 @@ impl Archive {
     /// Format a tape as an empty LTFS volume. Everything on it is lost.
     /// In a standalone drive, a tape without LTFS and without a barcode in
     /// its memory is taken as `barcode` (a new tape); a tape that is
-    /// another one is never formatted in its place.
+    /// another one is never formatted in its place. The cartridge in the
+    /// drive must be shown to be the tape ([`Self::may_format`]); one that
+    /// can't (blank, or unreadable) is formatted only once the person
+    /// confirms ([`Ui::confirm_format_unidentified`]).
     pub fn format(&self, barcode: &str, name: &str, ui: &dyn Ui) -> Result<Index> {
+        self.format_checked(barcode, name, ui, false)
+    }
+
+    /// [`Self::format`]; `blank_confirmed`: the person already said that
+    /// this very tape, just put in and found without LTFS, is to be
+    /// formatted (a new tape for a backup).
+    pub(crate) fn format_checked(&self, barcode: &str, name: &str, ui: &dyn Ui, blank_confirmed: bool) -> Result<Index> {
         log!("job: format {barcode}, name {name:?}");
         let site = self.site()?;
         let mut lease = self.acquire(&site, barcode, ui, false, true)?.expect("no skip");
         let drive_name = lease.drive_name.clone();
+        if let Err(e) = self.may_format(lease.drive(), barcode, &drive_name, ui, blank_confirmed) {
+            drop(lease);
+            // it may have been taken for this tape only to be formatted
+            site.forget(&drive_name);
+            return Err(e);
+        }
         let drive = lease.drive();
         ui.step(Step::Formatting(barcode));
         let r = ltfs::format(drive, barcode, name, &self.creator);
@@ -1195,6 +1337,57 @@ impl Archive {
         log!("catalog {barcode}: recorded the new volume {}, generation {}", f.index.volume_uuid, f.index.generation);
         self.catalog.lock().unwrap().import(barcode, &f.index, capacity, remaining, false)?;
         Ok(f.index)
+    }
+
+    /// Whether the cartridge in `drive` may be formatted as `barcode`. It
+    /// is that tape when it holds the LTFS volume the catalog has for the
+    /// barcode, or when its memory holds the whole barcode (not only its
+    /// start). It is refused when it holds another tape's volume, or
+    /// another volume than the catalog's. Otherwise (blank, a volume the
+    /// catalog doesn't know, a label that can't be read) the person is
+    /// asked, the drive named.
+    fn may_format(&self, drive: &mut TapeDrive, barcode: &str, drive_name: &str, ui: &dyn Ui, blank_confirmed: bool) -> Result<()> {
+        let want = barcode.trim().to_uppercase();
+        let memory = drive.read_attribute(0, attr::BARCODE).ok().flatten().map(|v| lto_scsi::ascii(&v).trim().to_uppercase()).filter(|b| !b.is_empty());
+        let says_so = memory.as_deref() == Some(want.as_str());
+        let memory_text = match &memory {
+            None => "its memory holds no barcode".to_owned(),
+            Some(m) if says_so => format!("its memory says {m}"),
+            Some(m) => format!("its memory says {m}, not the whole barcode"),
+        };
+        let known_uuid = self.catalog.lock().unwrap().tape(barcode)?.map(|t| t.uuid).filter(|u| !u.is_empty());
+        let unclear = match ltfs::volume::identify(drive) {
+            Ok(Some((_, label))) => {
+                let owner = self.catalog.lock().unwrap().tape_by_uuid(&label.volume_uuid)?;
+                if let Some(o) = owner.filter(|o| !o.barcode.eq_ignore_ascii_case(barcode)) {
+                    log!("format {barcode}: REFUSED: the cartridge in {drive_name} holds tape {}'s volume {}", o.barcode, label.volume_uuid);
+                    return Err(Error::OtherVolume { barcode: barcode.to_owned(), catalog: known_uuid.unwrap_or_default(), tape: label.volume_uuid, belongs_to: Some(o.barcode) });
+                }
+                match known_uuid {
+                    Some(u) if u == label.volume_uuid => {
+                        log!("format {barcode}: the cartridge in {drive_name} holds its volume {u}");
+                        return Ok(());
+                    }
+                    Some(u) => {
+                        log!("format {barcode}: REFUSED: the cartridge in {drive_name} holds the volume {}, the catalog has {u}", label.volume_uuid);
+                        return Err(Error::OtherVolume { barcode: barcode.to_owned(), catalog: u, tape: label.volume_uuid, belongs_to: None });
+                    }
+                    None if says_so => return Ok(()),
+                    None => format!("it holds an LTFS volume the catalog doesn't know ({}), and {memory_text}", label.volume_uuid),
+                }
+            }
+            Ok(None) if says_so || blank_confirmed => return Ok(()),
+            Ok(None) if known_uuid.is_some() => format!("the catalog has an LTFS volume on this tape, but the cartridge holds none, and {memory_text}"),
+            Ok(None) => format!("it is blank (or in another format), and {memory_text}"),
+            Err(e) => format!("its label can't be read ({e}), and {memory_text}"),
+        };
+        let yes = ui.confirm_format_unidentified(barcode, drive_name, &unclear);
+        log!("format {barcode}: the cartridge in {drive_name} isn't shown to be it: {unclear}; asked: {}", if yes { "format it" } else { "no" });
+        if yes {
+            Ok(())
+        } else {
+            Err(Error::Refused(format!("tape {barcode} wasn't formatted: the cartridge in drive {drive_name} can't be shown to be it ({unclear})")))
+        }
     }
 }
 

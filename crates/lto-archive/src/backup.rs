@@ -34,11 +34,32 @@ pub struct BackupOptions {
     /// Bytes of the next files read from disk ahead of the tape, while it
     /// writes (0: each file is read when it is written).
     pub read_ahead: u64,
+    /// The folder on the tapes may already be on a tape: the backup goes
+    /// into it, replacing its files of the same names (a name chosen
+    /// without the date, for that). Otherwise a tape that already holds it
+    /// isn't written: two backups never share a folder by chance.
+    pub replace: bool,
+}
+
+impl BackupOptions {
+    /// What the job is called in the log: `archive` when the files leave
+    /// the disk, else `backup`.
+    pub fn job(&self) -> &'static str {
+        if self.delete == DeleteSource::Keep {
+            "backup"
+        } else {
+            "archive"
+        }
+    }
 }
 
 /// What an archive does with the files on disk once they are on the tapes:
-/// with [`BackupOptions::verify`], those read back the same are deleted;
-/// without, every file a tape's index holds. The folders left empty go too.
+/// those read back the same are deleted (an archive always reads them back:
+/// [`BackupOptions::verify`] is turned on for it), and the folders left
+/// empty. A file is deleted only while it is the very file that was read
+/// back (the same file on the same volume, its size and time unchanged),
+/// and only when the tape holds all of it: a file with alternate data
+/// streams (which LTFS doesn't keep) stays.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DeleteSource {
     /// Kept: a backup.
@@ -147,6 +168,206 @@ pub struct FileDone {
     pub path: PathBuf,
     pub length: u64,
     pub modified: Option<std::time::SystemTime>,
+    /// Which file it was when it was read back (its volume and file
+    /// number): it is deleted only while the path leads to that file.
+    /// `None`: not read back, never deleted.
+    pub id: Option<FileId>,
+}
+
+/// A file's identity on disk: (volume serial number, file number).
+pub type FileId = (u64, u64);
+
+/// The identity of the open file `f`.
+#[cfg(windows)]
+pub(crate) fn file_id(f: &fs::File) -> Option<FileId> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) } == 0 {
+        return None;
+    }
+    Some((info.dwVolumeSerialNumber as u64, (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64))
+}
+
+#[cfg(unix)]
+pub(crate) fn file_id(f: &fs::File) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    f.metadata().ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(any(windows, unix)))]
+pub(crate) fn file_id(_: &fs::File) -> Option<FileId> {
+    None
+}
+
+/// Why a file to delete was kept.
+enum Kept {
+    /// Not the file read back any more (another file, size or time).
+    Changed,
+    /// It can't go: why.
+    Failed(String),
+}
+
+/// The names of the data streams of the open file other than its main one
+/// (`None`: the file system doesn't say, it has none).
+#[cfg(windows)]
+fn other_streams(f: &fs::File) -> io::Result<Vec<String>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED};
+    use windows_sys::Win32::Storage::FileSystem::{FileStreamInfo, GetFileInformationByHandleEx};
+    // FILE_STREAM_INFO entries: next offset (u32), name length (u32), size
+    // (i64), allocation size (i64), the name (UTF-16)
+    let mut buf = vec![0u64; 8192];
+    let ok = unsafe { GetFileInformationByHandleEx(f.as_raw_handle() as _, FileStreamInfo, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32) };
+    if ok == 0 {
+        let e = io::Error::last_os_error();
+        return match e.raw_os_error().map(|c| c as u32) {
+            // no stream at all (a folder without named streams)
+            Some(ERROR_HANDLE_EOF) => Ok(Vec::new()),
+            // a file system that has no named streams (FAT, exFAT): none;
+            // one that has them but didn't list them: nobody knows
+            Some(ERROR_INVALID_PARAMETER | ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED) if !named_streams_possible(f)? => Ok(Vec::new()),
+            _ => Err(e),
+        };
+    }
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), buf.len() * 8) };
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at + 24 <= bytes.len() {
+        let next = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        let end = (at + 24 + len).min(bytes.len());
+        let name: Vec<u16> = bytes[at + 24..end].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        let name = String::from_utf16_lossy(&name);
+        if name != "::$DATA" {
+            out.push(name);
+        }
+        if next == 0 {
+            break;
+        }
+        at += next;
+    }
+    Ok(out)
+}
+
+/// Whether the file system the open file `f` is on can hold named data
+/// streams (NTFS, ReFS…).
+#[cfg(windows)]
+fn named_streams_possible(f: &fs::File) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
+    const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
+    let mut flags = 0u32;
+    if unsafe { GetVolumeInformationByHandleW(f.as_raw_handle() as _, std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(), &mut flags, std::ptr::null_mut(), 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & FILE_NAMED_STREAMS != 0)
+}
+
+/// Remove the empty folder `dir` that went onto the tapes: not a link or
+/// a junction, and only without named data streams (a folder can have
+/// them on NTFS, and the tape doesn't hold them); when its streams can't be
+/// listed, it stays. Removed through the handle it was checked on.
+#[cfg(windows)]
+fn remove_dir_checked(dir: &Path) -> std::result::Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let h = unsafe { CreateFileW(wide.as_ptr(), DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut()) };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    let d = unsafe { fs::File::from_raw_handle(h as _) };
+    let m = d.metadata().map_err(|e| e.to_string())?;
+    if !m.is_dir() || m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("it isn't a folder any more (a link or a junction)".into());
+    }
+    match other_streams(&d) {
+        Ok(s) if s.is_empty() => {}
+        Ok(s) => return Err(format!("it has data streams the tape doesn't hold ({})", s.join(", "))),
+        Err(e) => return Err(format!("its data streams can't be listed: {e}")),
+    }
+    let del = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    // fails when it isn't empty: then it stays
+    if unsafe { SetFileInformationByHandle(d.as_raw_handle() as _, FileDispositionInfo, (&del as *const FILE_DISPOSITION_INFO).cast(), std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32) } == 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn remove_dir_checked(dir: &Path) -> std::result::Result<(), String> {
+    if fs::symlink_metadata(dir).map_err(|e| e.to_string())?.file_type().is_symlink() {
+        return Err("it is a link".into());
+    }
+    fs::remove_dir(dir).map_err(|e| e.to_string())
+}
+
+/// Delete `v`'s file, only while it is the file read back: opened without
+/// following a link, its identity, size and time checked on that handle,
+/// and deleted through it (no other file can take its place meanwhile).
+#[cfg(windows)]
+fn delete_checked(v: &FileDone) -> std::result::Result<(), Kept> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FileBasicInfo, FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_DISPOSITION_INFO,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
+    };
+    let Some(want) = v.id else { return Err(Kept::Failed("it wasn't read back from the tape".into())) };
+    let wide: Vec<u16> = v.path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // no one may write it while it is checked and deleted
+    let h = unsafe { CreateFileW(wide.as_ptr(), DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_DELETE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut()) };
+    if h == INVALID_HANDLE_VALUE {
+        let e = io::Error::last_os_error();
+        return Err(if e.kind() == io::ErrorKind::NotFound { Kept::Changed } else { Kept::Failed(e.to_string()) });
+    }
+    let f = unsafe { fs::File::from_raw_handle(h as _) };
+    let m = f.metadata().map_err(|e| Kept::Failed(e.to_string()))?;
+    if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !m.is_file() || m.len() != v.length || m.modified().ok() != v.modified || file_id(&f) != Some(want) {
+        return Err(Kept::Changed);
+    }
+    // the tape holds the main stream only: one more, and the file stays
+    match other_streams(&f) {
+        Ok(s) if s.is_empty() => {}
+        Ok(s) => return Err(Kept::Failed(format!("it has alternate data streams the tape doesn't hold ({})", s.join(", ")))),
+        Err(e) => return Err(Kept::Failed(format!("its data streams can't be listed: {e}"))),
+    }
+    // a read-only file goes too: it is on the tapes
+    let attrs = m.file_attributes();
+    if attrs & FILE_ATTRIBUTE_READONLY != 0 {
+        let rest = attrs & !FILE_ATTRIBUTE_READONLY;
+        let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        basic.FileAttributes = if rest == 0 { FILE_ATTRIBUTE_NORMAL } else { rest };
+        unsafe { SetFileInformationByHandle(f.as_raw_handle() as _, FileBasicInfo, (&basic as *const FILE_BASIC_INFO).cast(), std::mem::size_of::<FILE_BASIC_INFO>() as u32) };
+    }
+    let del = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    if unsafe { SetFileInformationByHandle(f.as_raw_handle() as _, FileDispositionInfo, (&del as *const FILE_DISPOSITION_INFO).cast(), std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32) } == 0 {
+        return Err(Kept::Failed(io::Error::last_os_error().to_string()));
+    }
+    // gone once the handle is closed
+    drop(f);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn delete_checked(v: &FileDone) -> std::result::Result<(), Kept> {
+    let Some(want) = v.id else { return Err(Kept::Failed("it wasn't read back from the tape".into())) };
+    let f = fs::File::open(&v.path).map_err(|_| Kept::Changed)?;
+    let now = fs::symlink_metadata(&v.path).map_err(|_| Kept::Changed)?;
+    let m = f.metadata().map_err(|e| Kept::Failed(e.to_string()))?;
+    if now.file_type().is_symlink() || !m.is_file() || m.len() != v.length || m.modified().ok() != v.modified || file_id(&f) != Some(want) {
+        return Err(Kept::Changed);
+    }
+    fs::remove_file(&v.path).map_err(|e| Kept::Failed(e.to_string()))
 }
 
 /// What deleting the files on the tapes from disk did.
@@ -159,6 +380,9 @@ pub struct DeleteReport {
     pub changed: Vec<PathBuf>,
     /// Couldn't be deleted, with why.
     pub failed: Vec<(PathBuf, String)>,
+    /// Stopped (Cancel): how many of the files to delete weren't reached.
+    /// They stay, on disk and on the tapes, and no folder was removed.
+    pub stopped: Option<u64>,
 }
 
 /// Delete from disk the files of a backup that are safe on the tapes
@@ -180,7 +404,8 @@ pub fn delete_source(report: &BackupReport, progress: &mut dyn FnMut(u64, u64) -
     let mut folders: BTreeSet<PathBuf> = report.folders.iter().filter(|f| inside(f)).cloned().collect();
     for (i, v) in files.iter().enumerate() {
         if !progress(i as u64, total) {
-            log!("delete: stopped after {} files", out.files);
+            out.stopped = Some(total - i as u64);
+            log!("delete: STOPPED after {} files; {} not reached, and no folder is removed", out.files, total - i as u64);
             break;
         }
         let mut dir = v.path.parent();
@@ -188,41 +413,38 @@ pub fn delete_source(report: &BackupReport, progress: &mut dyn FnMut(u64, u64) -
             folders.insert(d.to_path_buf());
             dir = d.parent();
         }
-        let now = fs::symlink_metadata(&v.path);
-        let same = now.as_ref().is_ok_and(|m| m.is_file() && m.len() == v.length && m.modified().ok() == v.modified);
-        if !same {
-            log!("delete: \"{}\" changed since it was written or checked: kept", v.path.display());
-            out.changed.push(v.path.clone());
-            continue;
-        }
-        // a read-only file goes too: it is on the tapes
-        if let Ok(m) = &now {
-            let mut perm = m.permissions();
-            if perm.readonly() {
-                #[allow(clippy::permissions_set_readonly_false)]
-                perm.set_readonly(false);
-                let _ = fs::set_permissions(&v.path, perm);
-            }
-        }
-        match fs::remove_file(&v.path) {
+        match delete_checked(v) {
             Ok(()) => {
                 log!("delete: \"{}\"", v.path.display());
                 out.files += 1;
                 out.bytes += v.length;
             }
-            Err(e) => {
-                log!("delete: \"{}\" can't be deleted: {e}", v.path.display());
-                out.failed.push((v.path.clone(), e.to_string()));
+            Err(Kept::Changed) => {
+                log!("delete: \"{}\" changed since it was written or checked (or is another file now): kept", v.path.display());
+                out.changed.push(v.path.clone());
+            }
+            Err(Kept::Failed(e)) => {
+                log!("delete: \"{}\" kept: {e}", v.path.display());
+                out.failed.push((v.path.clone(), e));
             }
         }
     }
-    // the deepest first; a folder with anything left in it stays
-    let mut folders: Vec<PathBuf> = folders.into_iter().collect();
+    // the deepest first; a folder with anything left in it stays. Once
+    // stopped, nothing more goes, folders neither
+    let mut folders: Vec<PathBuf> = if out.stopped.is_some() { Vec::new() } else { folders.into_iter().collect() };
     folders.sort_by_key(|f| std::cmp::Reverse(f.components().count()));
     for f in folders {
-        if fs::remove_dir(&f).is_ok() {
-            log!("delete: folder \"{}\"", f.display());
-            out.folders += 1;
+        if !progress(total, total) {
+            out.stopped = Some(0);
+            log!("delete: STOPPED before the folders left empty were all removed");
+            break;
+        }
+        match remove_dir_checked(&f) {
+            Ok(()) => {
+                log!("delete: folder \"{}\"", f.display());
+                out.folders += 1;
+            }
+            Err(why) => log!("delete: folder \"{}\" stays: {why}", f.display()),
         }
     }
     log!("delete done: {} files ({}), {} folders; changed {}, failed {}", out.files, lto_scsi::log::bytes(out.bytes), out.folders, out.changed.len(), out.failed.len());
@@ -240,13 +462,14 @@ impl BackupReport {
         (self.verified.len() as u64, self.verified.iter().map(|v| v.length).sum())
     }
 
-    /// The files an archive deletes from disk: those read back the same
-    /// when they were checked, else those on the tapes.
+    /// The files an archive deletes from disk: those read back the same.
+    /// Without the check, none: being in a tape's index doesn't prove the
+    /// tape gives them back.
     pub fn deletable(&self) -> &[FileDone] {
         if self.checked {
             &self.verified
         } else {
-            &self.on_tapes
+            &[]
         }
     }
 
@@ -285,12 +508,12 @@ fn commit_every() -> u64 {
 }
 
 /// The folder on the tapes for a backup of `src` now:
-/// `Backup YYYY-MM-DD HH.MM\<folder name>` (a drive's root: its letter).
+/// `Backup YYYY-MM-DD HH.MM.SS\<folder name>` (a drive's root: its letter).
 pub fn backup_set_name(src: &Path) -> String {
     set_name("Backup", src)
 }
 
-/// As [`backup_set_name`], for an archive: `Archive YYYY-MM-DD HH.MM\<folder name>`.
+/// As [`backup_set_name`], for an archive: `Archive YYYY-MM-DD HH.MM.SS\<folder name>`.
 pub fn archive_set_name(src: &Path) -> String {
     set_name("Archive", src)
 }
@@ -299,7 +522,7 @@ fn set_name(kind: &str, src: &Path) -> String {
     set_folder(&format!("{kind} {}", local_stamp()), src)
 }
 
-/// `name` with the local date and time: `name YYYY-MM-DD HH.MM`.
+/// `name` with the local date and time: `name YYYY-MM-DD HH.MM.SS`.
 pub fn dated(name: &str) -> String {
     format!("{name} {}", local_stamp())
 }
@@ -315,19 +538,21 @@ pub fn set_folder(top: &str, src: &Path) -> String {
     format!("{top}\\{name}")
 }
 
-/// The local date and time, `YYYY-MM-DD HH.MM` (dots: `:` can't be in a name).
+/// The local date and time to the second, `YYYY-MM-DD HH.MM.SS` (dots:
+/// `:` can't be in a name): two backups started in the same minute get
+/// folders of their own.
 #[cfg(windows)]
 fn local_stamp() -> String {
     let mut t = unsafe { std::mem::zeroed::<windows_sys::Win32::Foundation::SYSTEMTIME>() };
     unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
-    format!("{:04}-{:02}-{:02} {:02}.{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute)
+    format!("{:04}-{:02}-{:02} {:02}.{:02}.{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond)
 }
 
 /// Elsewhere: UTC.
 #[cfg(not(windows))]
 fn local_stamp() -> String {
     let s = Time::now().to_string();
-    format!("{} {}", &s[..10], s[11..16].replace(':', "."))
+    format!("{} {}", &s[..10], s[11..19].replace(':', "."))
 }
 
 /// Whether the file's Archive attribute is set.
@@ -541,7 +766,8 @@ impl Run {
     /// Back to `m`: what was written since isn't in any index on the tape,
     /// so it goes onto the next one.
     fn rewind(&mut self, m: Mark, on_tape: &mut TapeDone) {
-        log!("backup: {} files since the tape's last index go onto the next tape", self.done_files - m.done_files);
+        let job = self.opts.job();
+        log!("{job}: {} files since the tape's last index go onto the next tape", self.done_files - m.done_files);
         self.next = m.next;
         self.done_files = m.done_files;
         self.done_bytes = m.done_bytes;
@@ -578,15 +804,22 @@ impl Run {
     /// and before an error is passed on; the files an index made safe get
     /// their Archive attribute cleared then.
     fn onto(&mut self, a: &Archive, v: &mut Volume, ui: &dyn Ui) -> Result<Ended> {
+        let job = self.opts.job();
         // a backup only adds its own folder to the tape's newest index: a
         // catalog behind the tape (another program wrote to it, or a job
         // was cut short) is brought up to date, not a reason to stop
         if let Err(e) = v.writable() {
-            log!("backup: {} can't be written: {e}", v.barcode);
+            log!("{job}: {} can't be written: {e}", v.barcode);
             return Err(e.into());
         }
         a.sync(v)?;
         let barcode = v.barcode.clone();
+        // the folder already there, from another backup: not mixed into it
+        // (unless asked); this backup's own, from a tape it came back to, is
+        if !self.opts.replace && !self.report.tapes.iter().any(|t| t.barcode == barcode) && v.index.find(&self.report.set).is_some() {
+            log!("{job}: {barcode} already holds \"{}\": not written", self.report.set);
+            return Err(Error::Refused(format!("tape {barcode} already holds the folder \"{}\" of another backup; its files aren't replaced. Choose another name", self.report.set)));
+        }
         let dp = ltfs::volume::part_number(v.label.data_partition) as u8;
         let capacity = v.drive().capacity(dp).ok().and_then(|(_, c)| c);
         let started_empty = v.index.totals().0 == 0;
@@ -636,7 +869,7 @@ impl Run {
             // larger than a whole tape: it can't go anywhere
             if capacity.is_some_and(|c| size > c) {
                 log!(
-                    "backup: \"{rel}\" ({}) is larger than the tape ({}): left out",
+                    "{job}: \"{rel}\" ({}) is larger than the tape ({}): left out",
                     lto_scsi::log::bytes(size),
                     lto_scsi::log::or_unknown(capacity.map(lto_scsi::log::bytes))
                 );
@@ -657,7 +890,7 @@ impl Run {
             let opened = match prefetch.next_file() {
                 Some((i, m)) if i == self.next => m,
                 other => {
-                    log!("backup: read ahead out of step at file {} (got {:?}): started again", self.next, other.map(|(i, _)| i));
+                    log!("{job}: read ahead out of step at file {} (got {:?}): started again", self.next, other.map(|(i, _)| i));
                     prefetch = Prefetch::start(ahead(self), self.opts.read_ahead);
                     match prefetch.next_file() {
                         Some((i, m)) if i == self.next => m,
@@ -668,7 +901,7 @@ impl Run {
             let meta = match opened {
                 Ok(m) => m,
                 Err(e) => {
-                    log!("backup: \"{}\" can't be opened: {e}", disk.display());
+                    log!("{job}: \"{}\" can't be opened: {e}", disk.display());
                     self.report.unreadable.push((disk, e.to_string()));
                     self.next += 1;
                     continue;
@@ -681,7 +914,8 @@ impl Run {
             let began = std::time::Instant::now();
             let mut shown = began;
             let mut f = prefetch.reader();
-            let r = v.write_data(&mut f, &mut |n| {
+            let mut hashing = crate::digest::Hashing::new(&mut f);
+            let r = v.write_data(&mut hashing, &mut |n| {
                 this_file += n;
                 // a large file: the status moves on every second
                 if shown.elapsed() >= std::time::Duration::from_secs(1) {
@@ -694,7 +928,8 @@ impl Run {
             self.writing += began.elapsed();
             match r {
                 Ok((extents, length)) => {
-                    log!("backup: \"{rel}\" {length} bytes at {}", extents.first().map(|e| format!("{}:{}", e.partition, e.start_block)).unwrap_or_else(|| "-".into()));
+                    log!("{job}: \"{rel}\" {length} bytes at {}", extents.first().map(|e| format!("{}:{}", e.partition, e.start_block)).unwrap_or_else(|| "-".into()));
+                    let sum = hashing.attribute(length);
                     let file = File {
                         name,
                         length,
@@ -702,7 +937,7 @@ impl Run {
                         open_for_write: false,
                         times: times_of(&meta, now),
                         uid: v.index.next_uid(),
-                        xattrs: Vec::new(),
+                        xattrs: sum.into_iter().collect(),
                         extents,
                         symlink: None,
                         extra: Vec::new(),
@@ -722,7 +957,7 @@ impl Run {
                     unsaved_bytes += length;
                     self.next += 1;
                     if unsaved_bytes >= commit_every() {
-                        log!("backup: {} since the last index: an interim index ({})", lto_scsi::log::bytes(unsaved_bytes), self.opts.interim_index.key());
+                        log!("{job}: {} since the last index: an interim index ({})", lto_scsi::log::bytes(unsaved_bytes), self.opts.interim_index.key());
                         ui.step(Step::WritingIndex(&barcode));
                         let written = match self.opts.interim_index {
                             InterimIndex::DataPartition => a.sync_index(v),
@@ -754,7 +989,7 @@ impl Run {
                 }
                 // the file on disk couldn't be read to the end: left out
                 Err(ltfs::Error::Io(e)) => {
-                    log!("backup: \"{}\" couldn't be read to the end: {e}", disk.display());
+                    log!("{job}: \"{}\" couldn't be read to the end: {e}", disk.display());
                     self.report.unreadable.push((disk, e.to_string()));
                     self.next += 1;
                 }
@@ -765,13 +1000,13 @@ impl Run {
             }
         }
         // what was written gets an index, whatever stopped it
-        log!("backup: {barcode} stops ({ended:?}, error: {}): its index", failed.as_ref().map_or_else(|| "none".to_owned(), |e| e.to_string()));
+        log!("{job}: {barcode} stops ({ended:?}, error: {}): its index", failed.as_ref().map_or_else(|| "none".to_owned(), |e| e.to_string()));
         ui.step(Step::WritingIndex(&barcode));
         let committed = a.commit(v);
         match &committed {
             Ok(()) => self.cleared(&mut unsaved),
             Err(e) => {
-                log!("backup: {barcode}: its index can't be written: {e}");
+                log!("{job}: {barcode}: its index can't be written: {e}");
                 self.rewind(mark, &mut on_tape);
             }
         }
@@ -806,10 +1041,28 @@ impl Run {
     fn check(&mut self, v: &mut Volume, files: &[(String, PathBuf, Option<std::time::SystemTime>)], ui: &dyn Ui) -> Result<()> {
         use std::io::Read;
         let barcode = v.barcode.clone();
+        // the files are looked for in the index read again from the tape,
+        // as a later mount finds them: not in the one in memory
+        let fresh = match v.index_on_tape() {
+            Ok(ix) if ix.generation == v.index.generation => ix,
+            Ok(ix) => {
+                let why = format!("the tape's index read again is generation {}, not the one written ({})", ix.generation, v.index.generation);
+                log!("check {barcode}: {why}");
+                self.report.verify_failed.extend(files.iter().map(|(_, d, _)| (d.clone(), why.clone())));
+                return Ok(());
+            }
+            Err(ltfs::Error::Cancelled) => return Err(Error::Cancelled),
+            Err(e) => {
+                let why = format!("the tape's index can't be read again: {e}");
+                log!("check {barcode}: {why}");
+                self.report.verify_failed.extend(files.iter().map(|(_, d, _)| (d.clone(), why.clone())));
+                return Ok(());
+            }
+        };
         let mut on_tape: BTreeMap<String, File> = BTreeMap::new();
         let mut disk_of: BTreeMap<String, (PathBuf, Option<std::time::SystemTime>)> = BTreeMap::new();
         for (path, disk, modified) in files {
-            match v.index.find(path) {
+            match fresh.find(path) {
                 Some(Node::File(f)) => {
                     on_tape.insert(path.clone(), f.clone());
                     disk_of.insert(path.clone(), (disk.clone(), *modified));
@@ -833,6 +1086,8 @@ impl Run {
             if let Err(e) = &on_disk {
                 differs = Some(format!("the file on disk can't be opened: {e}"));
             }
+            // the file compared: an archive deletes only this one
+            let id = on_disk.as_ref().ok().and_then(|d| file_id(d.get_ref()));
             let mut buf = Vec::new();
             let mut read = 0u64;
             let began = Instant::now();
@@ -887,7 +1142,15 @@ impl Run {
             match why {
                 None => {
                     log!("check {barcode}: \"{path}\" {read} bytes, the same as on disk");
-                    self.report.verified.push(FileDone { path: disk, length: f.length, modified });
+                    // its Archive attribute is cleared only now, once it is
+                    // known to be on the tape
+                    if self.opts.clear_archive {
+                        let same = fs::metadata(&disk).ok().and_then(|m| m.modified().ok()) == modified;
+                        if !same || clear_archive(&disk).is_err() {
+                            self.report.not_cleared.push(disk.clone());
+                        }
+                    }
+                    self.report.verified.push(FileDone { path: disk, length: f.length, modified, id });
                 }
                 Some(why) => {
                     log!("check {barcode}: \"{path}\" FAILED: {why}");
@@ -905,9 +1168,11 @@ impl Run {
     fn cleared(&mut self, files: &mut Vec<Unsaved>) {
         for (path, modified, length) in files.drain(..) {
             if let Some(length) = length {
-                self.report.on_tapes.push(FileDone { path: path.clone(), length, modified });
+                self.report.on_tapes.push(FileDone { path: path.clone(), length, modified, id: None });
             }
-            if !self.opts.clear_archive {
+            // with the check, a file's attribute is cleared once it was read
+            // back the same ([`Self::check`]), not before
+            if !self.opts.clear_archive || (self.opts.verify && length.is_some()) {
                 continue;
             }
             let same = fs::metadata(&path).ok().and_then(|m| m.modified().ok()) == modified;
@@ -943,7 +1208,13 @@ impl Archive {
     }
 
     /// [`Self::backup`] of the folder `base`, or [`Self::backup_items`].
-    fn backup_from(&self, base: Option<&Path>, items: &[PathBuf], set: &str, tapes: &[String], opts: BackupOptions, ui: &dyn Ui) -> Result<BackupReport> {
+    fn backup_from(&self, base: Option<&Path>, items: &[PathBuf], set: &str, tapes: &[String], mut opts: BackupOptions, ui: &dyn Ui) -> Result<BackupReport> {
+        let job = opts.job();
+        // an archive deletes only what was read back the same
+        if opts.delete != DeleteSource::Keep && !opts.verify {
+            log!("{job}: files are deleted only once read back from the tapes: the check is on");
+            opts.verify = true;
+        }
         // the tapes ticked: LTFS volumes, in barcode order
         let ticked: BTreeSet<String> = tapes.iter().map(|b| b.trim().to_uppercase()).filter(|b| !b.is_empty()).collect();
         for b in &ticked {
@@ -982,8 +1253,18 @@ impl Archive {
         if report.total_files == 0 && report.total_folders == 0 && opts.archive_only {
             return Ok(report);
         }
+        // a tape ticked already holding the folder, from another backup:
+        // refused before anything is written (checked on the tape again)
+        if !opts.replace {
+            let cat = self.catalog.lock().unwrap();
+            for b in &ticked {
+                if cat.entry(b, set)?.is_some() {
+                    return Err(Error::Refused(format!("tape {b} already holds the folder \"{set}\" of another backup; its files aren't replaced. Choose another name")));
+                }
+            }
+        }
         log!(
-            "job: backup {} into \"{set}\", tapes ticked: {}; {}, Archive attribute {}, interim index: {}, read ahead: {}, check after writing: {}, delete from disk: {:?}; {} files, {}, {} folders, {} unreadable",
+            "job: {job} {} into \"{set}\", tapes ticked: {}; {}, Archive attribute {}, interim index: {}, read ahead: {}, check after writing: {}, delete from disk: {:?}; {} files, {}, {} folders, {} unreadable",
             match base {
                 Some(src) => format!("\"{}\"", src.display()),
                 None => format!("the items {}", lto_scsi::log::list(roots.values().map(|p| format!("\"{}\"", p.display())))),
@@ -1006,14 +1287,14 @@ impl Archive {
             Ok(()) => {}
             Err(Error::Cancelled) => run.report.cancelled = true,
             Err(e) => {
-                log!("backup: stopped: {e}");
+                log!("{job}: stopped: {e}");
                 run.report.error = Some(e.to_string());
             }
         }
         let (files, bytes) = run.report.written();
-        log!("backup: {} sent to tapes in {:.1} s of writing: {}/s on average", lto_scsi::log::bytes(run.written), run.writing.as_secs_f64(), lto_scsi::log::or_unknown(speed(run.written, run.writing).map(lto_scsi::log::bytes)));
+        log!("{job}: {} sent to tapes in {:.1} s of writing: {}/s on average", lto_scsi::log::bytes(run.written), run.writing.as_secs_f64(), lto_scsi::log::or_unknown(speed(run.written, run.writing).map(lto_scsi::log::bytes)));
         log!(
-            "backup done: {files} files, {} on {}; too big {}, unreadable {}, attribute left {}, cancelled {}, tapes failed: {}, stopped by: {}",
+            "{job} done: {files} files, {} on {}; too big {}, unreadable {}, attribute left {}, cancelled {}, tapes failed: {}, stopped by: {}",
             lto_scsi::log::bytes(bytes),
             lto_scsi::log::list(run.report.tapes.iter().map(|t| &t.barcode)),
             run.report.too_big.len(),
@@ -1024,7 +1305,7 @@ impl Archive {
             run.report.error.as_deref().unwrap_or("nothing")
         );
         if opts.verify {
-            log!("backup: {} files the same on the tapes as on disk, {} not", run.report.verified.len(), run.report.verify_failed.len());
+            log!("{job}: {} files the same on the tapes as on disk, {} not", run.report.verified.len(), run.report.verify_failed.len());
         }
         // an archive: what is safe on the tapes leaves the disk
         // (not once the person cancelled: nothing is deleted then)
@@ -1032,7 +1313,7 @@ impl Archive {
         let deleting = opts.delete != DeleteSource::Keep && n > 0 && !run.report.cancelled;
         let keep = deleting && opts.delete == DeleteSource::Ask && !ui.confirm_delete(n, b, run.report.verify_failed.len() as u64);
         if keep {
-            log!("backup: the person keeps the files on disk");
+            log!("{job}: the person keeps the files on disk");
         }
         if deleting && !keep {
             let total = n;
@@ -1052,6 +1333,7 @@ impl Archive {
     /// new ones asked for. A tape that fails is left: the person is asked
     /// whether to go on with another.
     fn onto_tapes(&self, run: &mut Run, ticked: &BTreeSet<String>, ui: &dyn Ui) -> Result<()> {
+        let job = run.opts.job();
         let mut queue: Vec<String> = ticked.iter().cloned().collect();
         queue.reverse();
         // tapes of this run, and tapes refused for it
@@ -1064,15 +1346,15 @@ impl Archive {
                 Some(b) => b,
                 None => {
                     let left = run.report.total_bytes.saturating_sub(run.done_bytes);
-                    match self.new_backup_tape(&mut seen, left, ui)? {
+                    match self.new_backup_tape(job, &mut seen, left, ui)? {
                         Some(b) => b,
                         None => return Err(Error::Cancelled),
                     }
                 }
             };
-            log!("backup: onto {barcode}, from file {} of {}", run.done_files, run.report.total_files);
+            log!("{job}: onto {barcode}, from file {} of {}", run.done_files, run.report.total_files);
             let r = self.with_volume(&barcode, ui, |v| run.onto(self, v, ui));
-            log!("backup: {barcode} ended: {}", match &r { Ok(e) => format!("{e:?}"), Err(e) => format!("error: {e}") });
+            log!("{job}: {barcode} ended: {}", match &r { Ok(e) => format!("{e:?}"), Err(e) => format!("error: {e}") });
             match r {
                 Ok(Ended::Done | Ended::Full) => {}
                 Ok(Ended::Cancelled) | Err(Error::Cancelled) => return Err(Error::Cancelled),
@@ -1084,7 +1366,7 @@ impl Archive {
                     }
                     let left = run.report.total_bytes.saturating_sub(run.done_bytes);
                     let answer = ui.tape_failed(&barcode, &e.to_string(), left);
-                    log!("backup: {barcode} failed; asked whether to go on with another tape: {answer:?}");
+                    log!("{job}: {barcode} failed; asked whether to go on with another tape: {answer:?}");
                     if answer != Answer::Retry {
                         return Err(e);
                     }
@@ -1099,7 +1381,7 @@ impl Archive {
     /// checked: an empty LTFS volume is used, a tape with files refused, a
     /// blank one (or one without LTFS) formatted if the person confirms.
     /// `None`: the person stopped the backup.
-    fn new_backup_tape(&self, seen: &mut Vec<String>, left: u64, ui: &dyn Ui) -> Result<Option<String>> {
+    fn new_backup_tape(&self, job: &str, seen: &mut Vec<String>, left: u64, ui: &dyn Ui) -> Result<Option<String>> {
         let mut problem: Option<String> = None;
         let mut nothing_new = false;
         loop {
@@ -1122,8 +1404,8 @@ impl Archive {
             seen.push(b.clone());
             let known = self.catalog.lock().unwrap().tape(&b)?;
             match &known {
-                Some(t) => log!("backup: new tape {b}: in the catalog volume {}, generation {}, {} files", if t.uuid.is_empty() { "(none)" } else { t.uuid.as_str() }, t.generation, t.files),
-                None => log!("backup: new tape {b}: not in the catalog"),
+                Some(t) => log!("{job}: new tape {b}: in the catalog volume {}, generation {}, {} files", if t.uuid.is_empty() { "(none)" } else { t.uuid.as_str() }, t.generation, t.files),
+                None => log!("{job}: new tape {b}: not in the catalog"),
             }
             let files = match known.filter(|t| t.is_ltfs()) {
                 // files on it in the catalog: refused without loading it
@@ -1135,13 +1417,13 @@ impl Archive {
                     None => None,
                 },
             };
-            log!("backup: new tape {b}: {}", files.map_or_else(|| "no LTFS volume on it".to_owned(), |n| format!("{n} files on it")));
+            log!("{job}: new tape {b}: {}", files.map_or_else(|| "no LTFS volume on it".to_owned(), |n| format!("{n} files on it")));
             match files {
                 Some(0) => return Ok(Some(b)),
                 Some(_) => problem = Some(b),
                 None => match ui.confirm_format(&b) {
                     Answer::Retry => {
-                        self.format(&b, &b, ui)?;
+                        self.format_checked(&b, &b, ui, true)?;
                         return Ok(Some(b));
                     }
                     Answer::Skip => {}

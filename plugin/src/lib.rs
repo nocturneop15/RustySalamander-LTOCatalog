@@ -15,7 +15,7 @@ mod report;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -59,6 +59,9 @@ pub struct LtoCatalog {
     /// The program's look, from the last command (for the question windows).
     look: Mutex<Values>,
     asker: Option<Asker>,
+    /// Answers whether to format a cartridge that can't be shown to be the
+    /// tape, in tests (a person put in new tapes).
+    format_answer: Option<bool>,
     /// The command running now (the program shows its step, with Cancel).
     cmd: CommandState,
     /// Catalog searches, by their connection's authority (`search-3`).
@@ -267,6 +270,7 @@ impl LtoCatalog {
             asks: sal_window::Windows::new(sal_ui::icon::program, [ask::WIDTH, 160.0]),
             look: Mutex::new(Values::new()),
             asker,
+            format_answer: None,
             cmd: CommandState::default(),
             searches: Mutex::new(BTreeMap::new()),
             next_search: std::sync::atomic::AtomicUsize::new(0),
@@ -499,6 +503,17 @@ impl LtoCatalog {
         }
     }
 
+    /// Format was asked for `barcode`, but the cartridge in `drive` can't
+    /// be shown to be it: whether to format it all the same.
+    fn ask_format_unidentified(&self, barcode: &str, drive: &str, why: &str) -> bool {
+        if let Some(a) = self.format_answer {
+            return a;
+        }
+        let text = trf("The cartridge in drive {drive} can't be shown to be tape {barcode}: {why}. Format the cartridge in that drive as {barcode}? Anything on it is erased.", &[("drive", &drive), ("barcode", &barcode), ("why", &why)]);
+        let look = self.look.lock().unwrap().clone();
+        ask::ask(&self.asks, look, tr("Format a tape"), text, String::new(), vec![tr("Format it"), tr("Leave it")], 1, 1) == Some(0)
+    }
+
     fn ask_format(&self, barcode: &str) -> Answer {
         let text = trf("Tape {barcode} isn't an LTFS volume: it is blank, or in another format. Format it for this backup? Anything on it is erased.", &[("barcode", &barcode)]);
         let look = self.look.lock().unwrap().clone();
@@ -607,6 +622,11 @@ impl Ui for JobUi<'_> {
         log!("asked whether to format {barcode}: {a:?}");
         a
     }
+    fn confirm_format_unidentified(&self, barcode: &str, drive: &str, why: &str) -> bool {
+        let yes = self.plugin.ask_format_unidentified(barcode, drive, why);
+        log!("asked whether to format the cartridge in {drive} as {barcode}: {}", if yes { "format" } else { "leave it" });
+        yes
+    }
     fn missing_tape(&self, barcode: &str, tape: Option<&Tape>, skip: bool, places: &Places) -> Answer {
         let a = self.plugin.ask_tape(barcode, tape, skip, places);
         if a == Answer::Cancel {
@@ -670,7 +690,7 @@ fn io_err(e: lto_archive::Error) -> io::Error {
             K::InvalidData,
             match belongs_to {
                 Some(other) => trf("The tape loaded as {barcode} holds tape {other}'s LTFS volume. Nothing was written and the catalog wasn't changed. Run Inventory the libraries and drives, and check which tape is where.", &[("barcode", &barcode), ("other", &other)]),
-                None => trf("The tape loaded as {barcode} holds another LTFS volume than the catalog has for it. Nothing was written and the catalog wasn't changed. Run Inventory the libraries and drives; if the tape was formatted by another program, import it.", &[("barcode", &barcode)]),
+                None => trf("The tape loaded as {barcode} holds another LTFS volume than the catalog has for it. Nothing was written and the catalog wasn't changed. Run Inventory the libraries and drives; if the tape was formatted again by another program, take it out of the catalog first (Forget tape), then import it.", &[("barcode", &barcode)]),
             },
         ),
         E::Missing(list) => (K::NotFound, trf("Not on the tape: {items}", &[("items", &list.iter().map(|p| to_inner(p)).collect::<Vec<_>>().join(", "))])),
@@ -681,6 +701,7 @@ fn io_err(e: lto_archive::Error) -> io::Error {
             let text = trf("Drive {drive} was to hold tape {wanted}, but the cartridge in it says it is {found}. Nothing was done to it. The library's drives may be matched to the wrong tape devices, or tapes were moved at the library's panel: run Inventory and try again; if it happens again, send the output of \"ltocat selftest\".", &[("drive", &drive), ("wanted", &wanted), ("found", &found)]);
             (K::InvalidData, text)
         }
+        E::Checksum(p) => (K::InvalidData, trf("{path} was read from the tape, but its data isn't what was written (its checksum differs). It wasn't copied; the copy stopped there.", &[("path", &to_inner(&p))])),
         E::Io(e) => return e,
         E::Ltfs(ltfs::Error::Full) => (K::StorageFull, tr("The tape is full. The files copied before it filled up are on it.")),
         E::Ltfs(ltfs::Error::ReadOnly(m)) => (K::PermissionDenied, trf("The tape can't be written: {reason}", &[("reason", &m)])),
@@ -693,10 +714,13 @@ fn refused(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, tr(msg))
 }
 
-/// Writes files read from tapes into a folder on disk.
+/// Writes files read from tapes into a folder on disk (the program's
+/// folder for the copy): each file whole or not at all, never through a
+/// link or a junction ([`lto_archive::restore`]). A file already there is
+/// replaced once the new one is whole: the program asks about replacing
+/// before it moves the files on.
 struct ToDisk<'a> {
-    out: &'a Path,
-    file: Option<(fs::File, Time)>,
+    out: lto_archive::restore::ToFolder,
     done: &'a Cell<u64>,
     total: u64,
     /// The operation's progress (done, total); false: cancel.
@@ -705,12 +729,12 @@ struct ToDisk<'a> {
 }
 
 impl ToDisk<'_> {
-    fn target(&self, path: &str) -> io::Result<PathBuf> {
-        let inner = to_inner(path);
-        if !safe_relative(&inner) {
+    /// A name on the tape that can't be used on disk, said so.
+    fn check(path: &str) -> io::Result<()> {
+        if !safe_relative(&to_inner(path)) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, trf("A name on the tape can't be used on disk: {name}", &[("name", &path)])));
         }
-        Ok(self.out.join(inner))
+        Ok(())
     }
 
     fn report(&mut self) -> bool {
@@ -724,26 +748,25 @@ impl ToDisk<'_> {
 
 impl ReadSink for ToDisk<'_> {
     fn dir(&mut self, path: &str, _: Time) -> io::Result<()> {
-        fs::create_dir_all(self.target(path)?)
+        Self::check(path)?;
+        self.out.make_dir(path).map(|_| ())
     }
-    fn begin(&mut self, path: &str, _size: u64, modified: Time) -> io::Result<bool> {
-        let t = self.target(path)?;
-        if let Some(p) = t.parent() {
-            fs::create_dir_all(p)?;
+    fn begin(&mut self, path: &str, size: u64, modified: Time) -> io::Result<bool> {
+        Self::check(path)?;
+        self.out.begin_file(path, size, modified)?;
+        let go = self.report();
+        if !go {
+            self.out.abandon();
         }
-        self.file = Some((fs::File::create(&t)?, modified));
-        Ok(self.report())
+        Ok(go)
     }
     fn write(&mut self, data: &[u8]) -> io::Result<bool> {
-        self.file.as_mut().expect("begun").0.write_all(data)?;
+        self.out.write_data(data)?;
         self.done.set(self.done.get() + data.len() as u64);
         Ok(self.report())
     }
     fn end(&mut self) -> io::Result<()> {
-        if let Some((f, m)) = self.file.take() {
-            let _ = f.set_modified(m.to_system());
-        }
-        Ok(())
+        self.out.finish().map(|_| ())
     }
 }
 
@@ -840,9 +863,20 @@ fn verify_report(reports: &[VerifyReport]) -> String {
             lines.push(trf("{barcode}: skipped, it wasn't put in.", &[("barcode", &r.barcode)]));
             continue;
         }
-        if r.bad.is_empty() && r.error.is_none() {
+        if r.bad.is_empty() && r.checksum_bad.is_empty() && r.error.is_none() {
             lines.push(trf("{barcode}: all {n} files read ({size}); nothing is wrong.", &[("barcode", &r.barcode), ("n", &r.files), ("size", &size_text(r.bytes))]));
-        } else if !r.bad.is_empty() {
+        }
+        if !r.checksum_bad.is_empty() {
+            lines.push(trf("{barcode}: {bad} files were read, but their data isn't what was written (its checksum differs). Don't rely on these copies.", &[("barcode", &r.barcode), ("bad", &r.checksum_bad.len())]));
+            lines.extend(r.checksum_bad.iter().take(20).map(|(p, why)| format!("  {}: {why}", to_inner(p))));
+            if r.checksum_bad.len() > 20 {
+                lines.push(trf("… and {n} more", &[("n", &(r.checksum_bad.len() - 20))]));
+            }
+        }
+        if r.no_checksum > 0 && r.files > 0 {
+            lines.push(trf("{barcode}: {n} files have no checksum on the tape (written by another program, or by an earlier version): they were only shown to be readable.", &[("barcode", &r.barcode), ("n", &r.no_checksum)]));
+        }
+        if !r.bad.is_empty() {
             lines.push(trf("{barcode}: {bad} of {total} files can't be read; the others were read. Copy what can be read onto another tape.", &[("barcode", &r.barcode), ("bad", &r.bad.len()), ("total", &r.total_files)]));
             lines.extend(r.bad.iter().take(20).map(|(p, why)| format!("  {}: {why}", to_inner(p))));
             if r.bad.len() > 20 {
@@ -1082,7 +1116,7 @@ impl LtoCatalog {
         match backupwin::ask(&self.asks, look, setup.clone()) {
             Some(Some(choice)) => self.run_backup(choice),
             Some(None) => {
-                log!("backup: cancelled in the dialog");
+                log!("back up or archive: cancelled in the dialog");
                 Ok(Reply::Done)
             }
             None => Ok(Self::backup_form(&setup)),
@@ -1104,9 +1138,8 @@ impl LtoCatalog {
                 "delete",
                 tr("Delete"),
                 FieldKind::Choice(vec![
-                    choice(backupwin::DeleteMode::Auto.key(), tr("Delete without asking, as soon as the files are on the tapes")),
-                    choice(backupwin::DeleteMode::AutoChecked.key(), tr("Delete without asking, once the data is checked (turns Check the data on)")),
-                    choice(backupwin::DeleteMode::Ask.key(), tr("Ask before deleting, once everything is written")),
+                    choice(backupwin::DeleteMode::AutoChecked.key(), tr("Delete without asking, once the data is checked")),
+                    choice(backupwin::DeleteMode::Ask.key(), tr("Ask before deleting, once everything is written and checked")),
                 ]),
                 backupwin::DeleteMode::Ask.key(),
             ),
@@ -1548,7 +1581,7 @@ impl FolderPlugin for LtoCatalog {
         let report = |d, t| (progress.borrow_mut())(d, t);
         // while a tape is fetched, the copy's Cancel is asked through its progress
         let poll = || report(done.get(), total);
-        let mut sink = ToDisk { out, file: None, done: &done, total, progress: &report, cancelled: &cancelled };
+        let mut sink = ToDisk { out: lto_archive::restore::ToFolder::new(out, lto_archive::restore::Overwrite::Replace)?, done: &done, total, progress: &report, cancelled: &cancelled };
         let r = a.read(&paths, &mut sink, &JobUi::polling(self, &cancelled, &poll));
         report(done.get().max(total), total.max(done.get()));
         self.show_notices();

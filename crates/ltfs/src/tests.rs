@@ -189,6 +189,55 @@ fn an_index_in_the_data_partition_only_counts() {
     assert_eq!(read(&mut v, "t.txt"), b"committed");
 }
 
+/// The writing of an index into the data partition cut short (power gone
+/// halfway): the newest whole index before it is found there, not the
+/// index partition's older one; writing goes on after it.
+#[test]
+fn an_index_cut_short_leaves_the_one_before() {
+    let (sim, lib) = lib();
+    let mut l = lib.acquire("LTO003L5", &|| false).unwrap();
+    format(l.drive(), "LTO003L5", "", "test").unwrap();
+    {
+        let mut v = Volume::mount(l.drive(), "LTO003L5", "test").unwrap();
+        let (extents, length) = v.write_data(&mut &b"synced"[..], &mut |_| true).unwrap();
+        let now = Time::now();
+        let uid = v.index.next_uid();
+        let f = File { name: "s.txt".into(), length, readonly: false, open_for_write: false, times: Times::all(now), uid, xattrs: vec![], extents, symlink: None, extra: vec![] };
+        v.index.put("", Node::File(f), now).unwrap();
+        v.sync().unwrap();
+        assert_eq!(v.index.generation, 2);
+    }
+    // more file data, then the next index begun and cut short; and before
+    // it, a copy of the whole index in a place it doesn't say (file data
+    // that happens to be one), and after it bytes that aren't text
+    sim.with_cart("LTO003L5", |c| {
+        let marks: Vec<usize> = c.parts[1].iter().enumerate().filter(|(_, r)| **r == Rec::Mark).map(|(i, _)| i).collect();
+        let index: Vec<Rec> = c.parts[1][marks[marks.len() - 2] + 1..marks[marks.len() - 1]].to_vec();
+        c.parts[1].push(Rec::Data(vec![0xAB; 4096]));
+        c.parts[1].push(Rec::Mark);
+        c.parts[1].extend(index);
+        c.parts[1].push(Rec::Mark);
+        c.parts[1].push(Rec::Data(vec![0xCD; 4096]));
+        c.parts[1].push(Rec::Mark);
+        c.parts[1].push(Rec::Data(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ltfsindex version=\"2.4.0\"><creator>cut".to_vec()));
+        c.parts[1].push(Rec::Mark);
+        c.parts[1].push(Rec::Data(vec![b'<', 0xFF, 0xFE, 0x00, 0xC3]));
+    })
+    .unwrap();
+    {
+        let mut v = Volume::mount(l.drive(), "LTO003L5", "test").unwrap();
+        assert_eq!(v.index.generation, 2, "the data partition's whole index, not the index partition's generation 1");
+        assert!(v.damage.is_empty() && v.read_only.is_none());
+        assert_eq!(read(&mut v, "s.txt"), b"synced");
+        write(&mut v, &[("t.txt", b"after".to_vec())]);
+        assert_eq!(v.index.generation, 3);
+    }
+    let mut v = Volume::mount(l.drive(), "LTO003L5", "test").unwrap();
+    assert_eq!(v.index.generation, 3);
+    assert_eq!(read(&mut v, "s.txt"), b"synced");
+    assert_eq!(read(&mut v, "t.txt"), b"after");
+}
+
 /// One partition's index damaged: the other partition's is used, the
 /// volume is read-only and says what couldn't be read; its files still read,
 /// and a damaged place in a file fails that file only.

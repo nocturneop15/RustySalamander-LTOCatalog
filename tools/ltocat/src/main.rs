@@ -67,6 +67,12 @@ files:
                              confirm; --yes: without asking), and the folders left empty;
                              --keep-source: only check them
 
+exit status: 0 done, everything as asked (an 'only Archive' backup with nothing changed
+  too); 1 failed (an error stopped it before or while it ran); 2 a wrong command line; 3 not
+  complete: cancelled (also at its question, before it began), files left out, files that
+  can't be read or aren't what was written, tapes that failed, files kept that were to be
+  deleted, tapes not imported or checked whole
+
 options:
   --program <folder> the RustySalamander folder (with rustysalamander.exe): use the plugin's
                      catalog and library settings, wherever the program keeps them (its folder,
@@ -107,6 +113,7 @@ struct Opts {
     check: bool,
     keep_source: bool,
     no_date: bool,
+    overwrite: bool,
     interim_index: Option<lto_archive::InterimIndex>,
     read_ahead_mb: Option<u64>,
     log: Option<PathBuf>,
@@ -134,6 +141,7 @@ fn parse() -> Result<Opts, String> {
         check: false,
         keep_source: false,
         no_date: false,
+        overwrite: false,
         interim_index: None,
         read_ahead_mb: None,
         log: None,
@@ -159,6 +167,7 @@ fn parse() -> Result<Opts, String> {
             "--check" => o.check = true,
             "--keep-source" => o.keep_source = true,
             "--no-date" => o.no_date = true,
+            "--overwrite" => o.overwrite = true,
             "--log" => o.log = Some(PathBuf::from(val("--log")?)),
             "--read-ahead" => {
                 let n: u64 = val("--read-ahead")?.parse().map_err(|_| "--read-ahead needs a number of MB")?;
@@ -385,6 +394,10 @@ impl Ui for Console {
             Answer::Skip
         }
     }
+    fn confirm_format_unidentified(&self, barcode: &str, drive: &str, why: &str) -> bool {
+        println!("The cartridge in drive {drive} can't be shown to be tape {barcode}: {why}.");
+        ask(&format!("Type {barcode} again to format the cartridge in {drive} as {barcode} (ERASES it), anything else to leave it:")).eq_ignore_ascii_case(barcode)
+    }
 }
 
 /// What the drives reported during the job (TapeAlert).
@@ -411,48 +424,30 @@ fn size(b: u64) -> String {
     }
 }
 
-/// Writes files read from tape under a folder.
+/// Writes files read from tape under a folder ([`lto_archive::restore`]):
+/// each file whole or not at all, never through a link or a junction.
 struct ToFolder {
-    root: PathBuf,
-    file: Option<(fs::File, PathBuf, Time)>,
+    out: lto_archive::restore::ToFolder,
     done: u64,
     started: Instant,
 }
 
-impl ToFolder {
-    fn target(&self, path: &str) -> io::Result<PathBuf> {
-        let rel: Vec<String> = ltfs::index::split(path).into_iter().map(ltfs::names::to_windows).collect();
-        let rel = rel.join("\\");
-        if !ltfs::names::safe_relative(&rel) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unsafe path on tape: {path}")));
-        }
-        Ok(self.root.join(rel))
-    }
-}
-
 impl ReadSink for ToFolder {
     fn dir(&mut self, path: &str, _: Time) -> io::Result<()> {
-        fs::create_dir_all(self.target(path)?)
+        self.out.make_dir(path).map(|_| ())
     }
     fn begin(&mut self, path: &str, len: u64, modified: Time) -> io::Result<bool> {
-        let t = self.target(path)?;
-        if let Some(p) = t.parent() {
-            fs::create_dir_all(p)?;
-        }
         println!("  {path} ({})", size(len));
-        self.file = Some((fs::File::create(&t)?, t, modified));
+        self.out.begin_file(path, len, modified)?;
         Ok(true)
     }
     fn write(&mut self, data: &[u8]) -> io::Result<bool> {
-        self.file.as_mut().unwrap().0.write_all(data)?;
+        self.out.write_data(data)?;
         self.done += data.len() as u64;
         Ok(true)
     }
     fn end(&mut self) -> io::Result<()> {
-        if let Some((f, _, m)) = self.file.take() {
-            let _ = f.set_modified(m.to_system());
-        }
-        Ok(())
+        self.out.finish().map(|_| ())
     }
 }
 
@@ -482,6 +477,42 @@ fn print_tapes(tapes: &[Tape]) {
             println!("           DAMAGED{when}: {}", t.condition.iter().map(|c| c.text()).collect::<Vec<_>>().join("; "));
         }
     }
+}
+
+/// Exit statuses, for scripts.
+const EXIT_FAILED: i32 = 1;
+const EXIT_USAGE: i32 = 2;
+const EXIT_INCOMPLETE: i32 = 3;
+
+/// Why the job that ran isn't complete (cancelled, files left out or not
+/// what was written, tapes that failed…): exit status 3.
+static INCOMPLETE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn incomplete(why: impl Into<String>) {
+    INCOMPLETE.lock().unwrap().push(why.into());
+}
+
+/// What made a backup or archive incomplete, if anything.
+fn backup_incomplete(r: &lto_archive::BackupReport) -> Vec<String> {
+    let mut why = Vec::new();
+    let mut note = |n: usize, what: &str| {
+        if n > 0 {
+            why.push(format!("{n} {what}"));
+        }
+    };
+    note(r.cancelled as usize, "cancelled");
+    note(r.error.is_some() as usize, "stopped by an error");
+    note(r.failed_tapes.len(), "tapes failed");
+    note(r.too_big.len(), "files left out, larger than a tape");
+    note(r.unreadable.len(), "files or folders that couldn't be read");
+    note(r.verify_failed.len(), "files not read back the same");
+    if let Some(d) = &r.deleted {
+        note(d.changed.len() + d.failed.len(), "files that were to be deleted were kept");
+        if d.stopped.is_some() {
+            why.push("deleting was stopped".into());
+        }
+    }
+    why
 }
 
 fn run(o: &Opts) -> Result<(), String> {
@@ -642,7 +673,10 @@ fn run(o: &Opts) -> Result<(), String> {
                         println!("{b}: generation {}, {n} files, {}", ix.generation, size(s));
                     }
                     Ok(None) => println!("{b}: no LTFS volume"),
-                    Err(err) => println!("{b}: {err}"),
+                    Err(err) => {
+                        println!("{b}: {err}");
+                        incomplete(format!("{b} wasn't imported"));
+                    }
                 }
             }
             print_notices(&a);
@@ -693,8 +727,9 @@ fn run(o: &Opts) -> Result<(), String> {
         "get" => {
             need(o, 2, "get <barcode>\\<path> <folder>")?;
             let a = archive(o)?;
-            let mut sink = ToFolder { root: PathBuf::from(&o.args[2]), file: None, done: 0, started: Instant::now() };
-            fs::create_dir_all(&sink.root).map_err(|e| e.to_string())?;
+            let overwrite = if o.overwrite { lto_archive::restore::Overwrite::Replace } else { lto_archive::restore::Overwrite::Never };
+            let out = lto_archive::restore::ToFolder::new(Path::new(&o.args[2]), overwrite).map_err(|e| e.to_string())?;
+            let mut sink = ToFolder { out, done: 0, started: Instant::now() };
             let r = a.read(&[o.args[1].clone()], &mut sink, &Console);
             print_notices(&a);
             r.map_err(e)?;
@@ -772,6 +807,8 @@ fn run(o: &Opts) -> Result<(), String> {
             let set = lto_archive::set_folder(&top, &src);
             let delete = archiving && !o.keep_source;
             if delete && !confirm(o, &format!("The files of {} found the same on the tapes will be DELETED from disk.", src.display())) {
+                println!("Nothing was done.");
+                incomplete("the archive wasn't started: not confirmed");
                 return Ok(());
             }
             let opts = lto_archive::BackupOptions {
@@ -782,13 +819,19 @@ fn run(o: &Opts) -> Result<(), String> {
                 read_ahead: o.read_ahead_mb.unwrap_or(place::DEFAULT_READ_AHEAD_MB) << 20,
                 // asked above, before the job
                 delete: if delete { lto_archive::DeleteSource::Auto } else { lto_archive::DeleteSource::Keep },
+                // a name without the date is meant to be backed up into again
+                replace: o.no_date,
             };
             let a = archive(o)?;
             let r = a.backup(&src, &set, &tapes, opts, &Console);
             print_notices(&a);
             let r = r.map_err(e)?;
-            if r.total_files == 0 && opts.archive_only {
-                println!("Nothing to back up: no file in {} has the Archive attribute set.", src.display());
+            // nothing at all to write (as the job decides: no file and no
+            // folder with the Archive attribute), and everything could be
+            // looked at: done, there was nothing to do. What couldn't be
+            // read may have changed: the report below says so (status 3)
+            if r.total_files == 0 && r.total_folders == 0 && opts.archive_only && r.unreadable.is_empty() {
+                println!("Nothing to back up: no file or folder in {} has the Archive attribute set.", src.display());
                 return Ok(());
             }
             let (files, bytes) = r.written();
@@ -826,6 +869,12 @@ fn run(o: &Opts) -> Result<(), String> {
                 for (p, why) in &d.failed {
                     println!("couldn't be deleted: {}: {why}", p.display());
                 }
+                if let Some(left) = d.stopped {
+                    println!("Deleting was stopped: {left} more files stay on disk (on the tapes too); the folders left empty weren't all removed.");
+                }
+            }
+            for why in backup_incomplete(&r) {
+                incomplete(why);
             }
             Ok(())
         }
@@ -834,7 +883,10 @@ fn run(o: &Opts) -> Result<(), String> {
             let a = archive(o)?;
             let reports = a.verify(&o.args[1..], &Console);
             print_notices(&a);
-            for r in reports.map_err(e)? {
+            let reports = reports.map_err(e)?;
+            // anything wrong makes the exit status say so, for scripts
+            let wrong = reports.iter().filter(|r| r.skipped || r.error.is_some() || r.damaged_index || !r.bad.is_empty() || !r.checksum_bad.is_empty()).count();
+            for r in reports {
                 if r.skipped {
                     println!("{}: skipped", r.barcode);
                     continue;
@@ -843,12 +895,19 @@ fn run(o: &Opts) -> Result<(), String> {
                 for (p, why) in &r.bad {
                     println!("  can't be read: {p}: {why}");
                 }
+                println!("  checksums: {} the same as written, {} DIFFERENT, {} files without one (only shown readable)", r.checksum_ok, r.checksum_bad.len(), r.no_checksum);
+                for (p, why) in &r.checksum_bad {
+                    println!("  NOT what was written: {p}: {why}");
+                }
                 if let Some(err) = &r.error {
                     println!("  the check stopped: {err}");
                 }
                 if r.damaged_index {
                     println!("  one copy of its index can't be read");
                 }
+            }
+            if wrong > 0 {
+                incomplete(format!("{wrong} of the tapes weren't checked whole, or have files that can't be read or aren't what was written"));
             }
             Ok(())
         }
@@ -881,7 +940,7 @@ fn main() {
         Ok(o) => o,
         Err(m) => {
             eprintln!("ltocat: {m}");
-            std::process::exit(2);
+            std::process::exit(EXIT_USAGE);
         }
     };
     if let Some(file) = &o.log {
@@ -899,7 +958,14 @@ fn main() {
     if let Err(m) = r {
         lto_scsi::log!("ltocat failed: {m}");
         eprintln!("ltocat: {m}");
-        std::process::exit(1);
+        std::process::exit(EXIT_FAILED);
+    }
+    let why = std::mem::take(&mut *INCOMPLETE.lock().unwrap());
+    if !why.is_empty() {
+        let why = why.join("; ");
+        lto_scsi::log!("ltocat done, NOT complete: {why}");
+        eprintln!("ltocat: not complete: {why}");
+        std::process::exit(EXIT_INCOMPLETE);
     }
     lto_scsi::log!("ltocat done");
 }

@@ -55,14 +55,12 @@ pub fn target(top: &str, items: &[PathBuf]) -> String {
 }
 
 /// How an archive deletes the files from disk once they are on the tapes.
+/// Either way only those read back the same go: an archive always checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteMode {
-    /// Without asking, as soon as they are on the tapes (with the check,
-    /// those read back the same).
-    Auto,
-    /// Without asking, once they were read back the same: the check is on.
+    /// Without asking, once they were read back the same.
     AutoChecked,
-    /// After the person confirms, once everything is written (and checked).
+    /// After the person confirms, once everything is written and checked.
     Ask,
 }
 
@@ -70,17 +68,16 @@ impl DeleteMode {
     /// As the form's fallback keeps it.
     pub fn key(self) -> &'static str {
         match self {
-            DeleteMode::Auto => "auto",
             DeleteMode::AutoChecked => "checked",
             DeleteMode::Ask => "ask",
         }
     }
 
-    /// From the form's fallback; anything else asks.
+    /// From the form's fallback (`auto`, of earlier versions, deleted
+    /// without the check: now once checked); anything else asks.
     pub fn from_key(k: &str) -> DeleteMode {
         match k {
-            "auto" => DeleteMode::Auto,
-            "checked" => DeleteMode::AutoChecked,
+            "auto" | "checked" => DeleteMode::AutoChecked,
             _ => DeleteMode::Ask,
         }
     }
@@ -114,15 +111,16 @@ pub struct Choice {
 }
 
 impl Choice {
-    /// The job's options. Deleting once checked turns the check on.
+    /// The job's options. An archive turns the check on.
     pub fn options(&self, interim_index: InterimIndex, read_ahead: u64) -> BackupOptions {
         let delete = match (self.archive, self.delete) {
             (false, _) => DeleteSource::Keep,
             (true, DeleteMode::Ask) => DeleteSource::Ask,
             (true, _) => DeleteSource::Auto,
         };
-        let verify = self.verify || (self.archive && self.delete == DeleteMode::AutoChecked);
-        BackupOptions { archive_only: self.archive_only, clear_archive: self.clear, interim_index, verify, delete, read_ahead }
+        let verify = self.verify || self.archive;
+        // a name without the date is meant to be backed up into again
+        BackupOptions { archive_only: self.archive_only, clear_archive: self.clear, interim_index, verify, delete, read_ahead, replace: !self.dated }
     }
 }
 
@@ -147,6 +145,9 @@ struct BackupWin {
     browsing: Option<Receiver<Option<PathBuf>>>,
     tx: Option<Sender<Option<Choice>>>,
     dialog_set: bool,
+    /// It was on the screen: going away without an answer is Cancel. One
+    /// the program couldn't show answers nothing, and the form is used.
+    shown: bool,
 }
 
 impl BackupWin {
@@ -168,6 +169,7 @@ impl BackupWin {
             browsing: None,
             tx: Some(tx),
             dialog_set: false,
+            shown: false,
         }
     }
 
@@ -188,7 +190,7 @@ impl BackupWin {
             archive: self.archive,
             archive_only: self.archive_only,
             clear: self.clear,
-            verify: self.verify || (self.archive && self.delete == DeleteMode::AutoChecked),
+            verify: self.verify || self.archive,
             delete: self.delete,
             name: self.name.clone(),
             dated: self.dated,
@@ -212,8 +214,11 @@ impl BackupWin {
 
 impl Drop for BackupWin {
     /// Closed by Esc or the close button, or the plugin stopped: nothing.
+    /// Never shown (the program couldn't open it): no answer at all.
     fn drop(&mut self) {
-        self.answer(None);
+        if self.shown {
+            self.answer(None);
+        }
     }
 }
 
@@ -235,6 +240,7 @@ impl Content for BackupWin {
 
     fn show(&mut self, ctx: &egui::Context) -> bool {
         use sal_ui::layout::{GAP_SMALL, MARGIN};
+        self.shown = true;
         if let Some(rx) = &self.browsing {
             if let Ok(chosen) = rx.try_recv() {
                 self.browsing = None;
@@ -297,8 +303,9 @@ impl Content for BackupWin {
                             ui.radio_value(&mut self.archive_only, true, tr("Only files with the Archive attribute"));
                         });
                         ui.checkbox(&mut self.clear, tr("Clear the Archive attribute of the files backed up"));
-                        // deleting once checked needs the check: on, and stays on
-                        let forced = self.archive && self.delete == DeleteMode::AutoChecked;
+                        // an archive deletes only what was read back the same:
+                        // the check is on, and stays on
+                        let forced = self.archive;
                         if forced {
                             self.verify = true;
                         }
@@ -306,9 +313,8 @@ impl Content for BackupWin {
                     });
                     section(ui, &tr("Delete"), |ui| {
                         ui.add_enabled_ui(self.archive, |ui| {
-                            ui.radio_value(&mut self.delete, DeleteMode::Auto, tr("Delete without asking, as soon as the files are on the tapes"));
-                            ui.radio_value(&mut self.delete, DeleteMode::AutoChecked, tr("Delete without asking, once the data is checked (turns Check the data on)"));
-                            ui.radio_value(&mut self.delete, DeleteMode::Ask, tr("Ask before deleting, once everything is written"));
+                            ui.radio_value(&mut self.delete, DeleteMode::AutoChecked, tr("Delete without asking, once the data is checked"));
+                            ui.radio_value(&mut self.delete, DeleteMode::Ask, tr("Ask before deleting, once everything is written and checked"));
                             ui.add_space(GAP_SMALL);
                             ui.label(RichText::new(tr("Deleted for good, not moved to the Recycle Bin, and so are the folders left empty. A file that wasn't read back the same, or changed meanwhile, stays.")).weak());
                         });
@@ -451,7 +457,9 @@ pub fn ask(windows: &Windows, look: Values, setup: Setup) -> Option<Option<Choic
     let title = tr("Back up or archive");
     let make: sal_window::Make = Box::new(move || Box::new(BackupWin::new(title, setup, tx)));
     windows.open_modal(make, look).ok()?;
-    Some(rx.recv().ok().flatten())
+    // no answer at all (not even Cancel): the program couldn't show the
+    // window after all, so the form is shown instead
+    rx.recv().ok()
 }
 
 #[cfg(test)]
@@ -471,17 +479,16 @@ mod tests {
         (open, out)
     }
 
-    /// Deleting once checked turns the check on; a backup keeps the files
-    /// whatever the delete choice says.
+    /// An archive always checks, however it deletes; a backup keeps the
+    /// files whatever the delete choice says.
     #[test]
     fn the_options_follow_the_choice() {
         let c = Choice { archive: true, archive_only: false, clear: true, verify: false, delete: DeleteMode::AutoChecked, name: String::new(), dated: true, items: vec![], tapes: vec![] };
         let o = c.options(InterimIndex::DataPartition, 0);
         assert!(o.verify && o.delete == DeleteSource::Auto);
-        let o = Choice { delete: DeleteMode::Auto, ..c.clone() }.options(InterimIndex::DataPartition, 0);
-        assert!(!o.verify && o.delete == DeleteSource::Auto);
-        let o = Choice { delete: DeleteMode::Ask, verify: true, ..c.clone() }.options(InterimIndex::DataPartition, 0);
+        let o = Choice { delete: DeleteMode::Ask, ..c.clone() }.options(InterimIndex::DataPartition, 0);
         assert!(o.verify && o.delete == DeleteSource::Ask);
+        assert_eq!(DeleteMode::from_key("auto"), DeleteMode::AutoChecked, "deleting unchecked is gone");
         let o = Choice { archive: false, ..c }.options(InterimIndex::DataPartition, 0);
         assert!(!o.verify && o.delete == DeleteSource::Keep);
     }
@@ -549,11 +556,17 @@ mod tests {
         assert!(size.y <= 768.0 - 80.0, "{size:?}");
     }
 
-    /// Closing it is Cancel.
+    /// Closing it is Cancel; one the program never showed answers
+    /// nothing (the form is used instead).
     #[test]
     fn closing_it_cancels() {
-        let (w, rx) = win(vec![]);
+        let ctx = egui::Context::default();
+        let (mut w, rx) = win(vec![]);
+        frame(&mut w, &ctx, vec![]);
         drop(w);
         assert_eq!(rx.recv().unwrap(), None);
+        let (w, rx) = win(vec![]);
+        drop(w);
+        assert!(rx.recv().is_err(), "never shown: no answer");
     }
 }

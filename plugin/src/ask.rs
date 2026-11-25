@@ -2,7 +2,7 @@
 //! window the program draws in its own look. The job's thread waits for the
 //! answer.
 
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 use sal_plugin_api::Values;
 use sal_window::egui::{self, RichText, ViewportCommand};
@@ -11,6 +11,49 @@ use sal_window::{Content, Windows};
 /// The question's width, in points (the program's error question is 560,
 /// its smaller questions 480).
 pub const WIDTH: f32 = 480.0;
+
+/// Whether a window got onto the screen. The program takes a window to
+/// open on a thread of its own, and may refuse it there: the window is then
+/// dropped without ever being shown, and whoever opened it must fall back
+/// (a form, a message) instead of taking that as the person's answer.
+pub struct Opened {
+    tx: Option<Sender<bool>>,
+    shown: bool,
+}
+
+impl Opened {
+    /// A new one, and where to hear whether the window was shown.
+    pub fn new() -> (Opened, Receiver<bool>) {
+        let (tx, rx) = channel();
+        (Opened { tx: Some(tx), shown: false }, rx)
+    }
+
+    /// The window is being drawn.
+    pub fn shown(&mut self) {
+        self.shown = true;
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(true);
+        }
+    }
+
+    /// Whether it was ever drawn.
+    pub fn was_shown(&self) -> bool {
+        self.shown
+    }
+
+    /// Wait to hear whether the window got onto the screen.
+    pub fn wait(rx: &Receiver<bool>) -> bool {
+        rx.recv().unwrap_or(false)
+    }
+}
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(false);
+        }
+    }
+}
 
 /// A question with buttons.
 struct AskWin {
@@ -26,6 +69,7 @@ struct AskWin {
     /// The window was made a fixed dialog (not resizable, no minimize or
     /// maximize button).
     dialog_set: bool,
+    opened: Opened,
 }
 
 impl AskWin {
@@ -38,9 +82,12 @@ impl AskWin {
 
 impl Drop for AskWin {
     /// Closed by Esc, F10 or the close button, or the plugin stopped.
+    /// Never shown: no answer (the question couldn't be asked).
     fn drop(&mut self) {
-        let d = self.dismiss;
-        self.answer(d);
+        if self.opened.was_shown() {
+            let d = self.dismiss;
+            self.answer(d);
+        }
     }
 }
 
@@ -51,6 +98,7 @@ impl Content for AskWin {
 
     fn show(&mut self, ctx: &egui::Context) -> bool {
         use sal_ui::layout::{GAP, MARGIN};
+        self.opened.shown();
         let mut chosen = None;
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
             chosen = Some(self.default);
@@ -102,7 +150,7 @@ impl Content for AskWin {
 /// the plugin's windows.
 pub fn ask(windows: &Windows, look: Values, title: String, text: String, detail: String, buttons: Vec<String>, default: usize, dismiss: usize) -> Option<usize> {
     let (tx, rx) = channel();
-    let make: sal_window::Make = Box::new(move || Box::new(AskWin { title, text, detail, buttons, default, dismiss, tx: Some(tx), dialog_set: false }));
+    let make: sal_window::Make = Box::new(move || Box::new(AskWin { title, text, detail, buttons, default, dismiss, tx: Some(tx), dialog_set: false, opened: Opened::new().0 }));
     windows.open(make, look).ok()?;
     rx.recv().ok()
 }
@@ -114,8 +162,9 @@ pub fn ask(windows: &Windows, look: Values, title: String, text: String, detail:
 pub fn warn(windows: &Windows, look: Values, title: String, text: String, detail: String, wait: bool) -> bool {
     let (tx, rx) = channel();
     let buttons = vec![sal_plugin_api::tr("OK")];
-    let make: sal_window::Make = Box::new(move || Box::new(AskWin { title, text, detail, buttons, default: 0, dismiss: 0, tx: Some(tx), dialog_set: false }));
-    if windows.open_modal(make, look).is_err() {
+    let (opened, shown) = Opened::new();
+    let make: sal_window::Make = Box::new(move || Box::new(AskWin { title, text, detail, buttons, default: 0, dismiss: 0, tx: Some(tx), dialog_set: false, opened }));
+    if windows.open_modal(make, look).is_err() || !Opened::wait(&shown) {
         return false;
     }
     if wait {
@@ -142,6 +191,7 @@ mod tests {
             dismiss: 2,
             tx: Some(tx),
             dialog_set: false,
+            opened: Opened::new().0,
         };
         let ctx = egui::Context::default();
         sal_ui::layout::apply(&ctx);

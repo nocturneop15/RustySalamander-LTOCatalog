@@ -179,12 +179,42 @@ fn split(path: &str) -> (String, String) {
     }
 }
 
+/// Whether `path` is on a network share: a UNC path, or a drive letter
+/// mapped to one.
+pub fn on_network(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").map(|r| r.strip_prefix("UNC\\").map(|u| format!(r"\\{u}")).unwrap_or_else(|| r.to_owned())).unwrap_or_else(|| s.into_owned());
+    if s.starts_with(r"\\") || s.starts_with("//") {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let b = s.as_bytes();
+        if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+            let root: Vec<u16> = format!("{}:\\", b[0] as char).encode_utf16().chain(Some(0)).collect();
+            // DRIVE_REMOTE
+            return unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) } == 4;
+        }
+    }
+    false
+}
+
 impl Catalog {
-    /// Open (or create) the catalog at `path`.
+    /// Open (or create) the catalog at `path`. On a local disk it keeps a
+    /// write-ahead log (WAL); on a network share, where SQLite's WAL can't
+    /// work (its readers and writers must share the computer's memory), a
+    /// rollback journal, every change written through. A catalog in use
+    /// from several computers at once belongs on none of them: keep it
+    /// local, and copies on the share.
     pub fn open(path: &Path) -> Result<Catalog> {
         let db = Connection::open(path)?;
-        db.pragma_update(None, "journal_mode", "WAL")?;
-        db.pragma_update(None, "synchronous", "NORMAL")?;
+        if on_network(path) {
+            db.pragma_update(None, "journal_mode", "DELETE")?;
+            db.pragma_update(None, "synchronous", "FULL")?;
+        } else {
+            db.pragma_update(None, "journal_mode", "WAL")?;
+            db.pragma_update(None, "synchronous", "NORMAL")?;
+        }
         db.busy_timeout(std::time::Duration::from_secs(10))?;
         db.execute_batch(SCHEMA)?;
         upgrade(&db)?;
@@ -494,6 +524,23 @@ fn entry_row(r: &rusqlite::Row) -> rusqlite::Result<Entry> {
 mod tests {
     use super::*;
     use ltfs::{File, Times};
+
+    /// A catalog on a share keeps a rollback journal; a local one its WAL.
+    #[test]
+    fn a_catalog_on_a_share_has_no_wal() {
+        assert!(on_network(Path::new(r"\\server\share\catalog.sqlite")));
+        assert!(on_network(Path::new(r"\\?\UNC\server\share\catalog.sqlite")));
+        let local = std::env::temp_dir().join(format!("lto-catalog-wal-{}.sqlite", std::process::id()));
+        if !on_network(&local) {
+            let c = Catalog::open(&local).unwrap();
+            let mode: String = c.db.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+            assert_eq!(mode, "wal");
+            drop(c);
+        }
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", local.display()));
+        }
+    }
 
     /// Found by a part of the name or by a mask, any case, on one tape or all.
     #[test]

@@ -175,59 +175,109 @@ pub fn read_label(drive: &mut TapeDrive, p: u32) -> Result<Label> {
     Ok(l)
 }
 
-/// Whether the tape in the drive holds LTFS: its label, if it does.
+/// Whether the tape in the drive holds LTFS: its label, if it does. LTFS
+/// keeps the label in both partitions: the index partition's is read, and
+/// when it can't be (or isn't an LTFS label: overwritten, damaged) the data
+/// partition's. A tape is without LTFS only when neither partition holds
+/// an LTFS label; when one can't be read and the other isn't one, that is
+/// an error, not "no LTFS" (a listing isn't thrown away on a guess).
 pub fn probe(drive: &mut TapeDrive) -> Result<Option<Label>> {
+    Ok(either_label(drive)?.map(|(_, l)| l))
+}
+
+/// The label of either partition ([`probe`]): (its partition, it).
+fn either_label(drive: &mut TapeDrive) -> Result<Option<(u32, Label)>> {
     drive.set_variable_blocks()?;
     if drive.partitions()? < 2 {
         return Ok(None);
     }
-    match read_label(drive, 0) {
-        Ok(l) => {
-            log!("ltfs probe: LTFS volume {}, created by {}", l.volume_uuid, l.creator);
-            Ok(Some(l))
+    let mut failed = None;
+    let mut why = Vec::new();
+    for p in [0, 1] {
+        match read_label(drive, p) {
+            Ok(l) => {
+                if p == 1 {
+                    log!("ltfs probe: partition a has no LTFS label that can be read ({}): partition b's is used", why.join("; "));
+                }
+                log!("ltfs probe: LTFS volume {}, created by {}", l.volume_uuid, l.creator);
+                return Ok(Some((p, l)));
+            }
+            Err(Error::NotLtfs(w)) => why.push(w),
+            Err(e) => {
+                why.push(e.to_string());
+                failed.get_or_insert(e);
+            }
         }
-        Err(Error::NotLtfs(why)) => {
-            log!("ltfs probe: not LTFS: {why}");
+    }
+    match failed {
+        Some(e) => {
+            log!("ltfs probe: no LTFS label read, and one can't be read: {}", why.join("; "));
+            Err(e)
+        }
+        None => {
+            log!("ltfs probe: not LTFS: {}", why.join("; "));
             Ok(None)
         }
-        Err(e) => Err(e),
     }
+}
+
+/// The volume serial of partition `p`'s VOL1 label, if it has one.
+fn vol1_serial(drive: &mut TapeDrive, p: u32) -> Result<Option<String>> {
+    let mut buf = vec![0u8; 1024 * 1024];
+    drive.locate(p, 0)?;
+    Ok(match drive.read(&mut buf)? {
+        TapeRead::Record(n) if label::is_ltfs_vol1(&buf[..n]) => Some(String::from_utf8_lossy(&buf[4..10]).trim().to_owned()),
+        _ => None,
+    })
 }
 
 /// What tells the LTFS volume on the tape in `drive` apart: the volume
 /// serial of its VOL1 label (six characters, usually the start of the
 /// barcode) and its LTFS label (with the volume's UUID). `None` for a tape
 /// without LTFS.
+/// Either partition's label, as [`probe`] reads them.
 pub fn identify(drive: &mut TapeDrive) -> Result<Option<(String, Label)>> {
-    drive.set_variable_blocks()?;
-    if drive.partitions()? < 2 {
-        return Ok(None);
-    }
-    let mut buf = vec![0u8; 1024 * 1024];
-    drive.locate(0, 0)?;
-    let volser = match drive.read(&mut buf)? {
-        TapeRead::Record(n) if label::is_ltfs_vol1(&buf[..n]) => String::from_utf8_lossy(&buf[4..10]).trim().to_owned(),
-        _ => return Ok(None),
-    };
-    match read_label(drive, 0) {
-        Ok(l) => Ok(Some((volser, l))),
-        Err(Error::NotLtfs(_)) => Ok(None),
-        Err(e) => Err(e),
-    }
+    let Some((p, l)) = either_label(drive)? else { return Ok(None) };
+    let volser = vol1_serial(drive, p)?.unwrap_or_default();
+    Ok(Some((volser, l)))
 }
 
-/// Read records up to the next filemark, as text.
-fn read_text(drive: &mut TapeDrive, buf: &mut [u8]) -> Result<String> {
-    let mut out = Vec::new();
+/// Read records up to the next filemark onto the end of `out`.
+fn read_records(drive: &mut TapeDrive, buf: &mut [u8], out: &mut Vec<u8>) -> Result<()> {
     loop {
         match drive.read(buf)? {
             TapeRead::Record(n) => out.extend_from_slice(&buf[..n]),
-            TapeRead::Filemark | TapeRead::EndOfData => break,
+            TapeRead::Filemark | TapeRead::EndOfData => return Ok(()),
         }
         if out.len() > 4 << 30 {
             return Err(Error::Corrupt("an index larger than 4 GiB".into()));
         }
     }
+}
+
+/// How many filemark-delimited stretches before the end of a partition are
+/// looked at for its newest whole index.
+const INDEX_LOOKBACK: usize = 64;
+
+/// The text from here to the next filemark, if it can be an LTFS index: its
+/// first record starts as XML does. Anything else (file data between two
+/// indexes) is passed over without reading it to its end.
+fn read_index_text(drive: &mut TapeDrive, buf: &mut [u8]) -> Result<Option<String>> {
+    let n = match drive.read(buf)? {
+        TapeRead::Record(n) => n,
+        TapeRead::Filemark | TapeRead::EndOfData => return Ok(None),
+    };
+    let head = String::from_utf8_lossy(&buf[..n.min(64)]);
+    if !head.trim_start_matches('\u{feff}').trim_start().starts_with('<') {
+        return Ok(None);
+    }
+    let mut out = buf[..n].to_vec();
+    read_records(drive, buf, &mut out)?;
+    as_text(out).map(Some)
+}
+
+/// Records read as text (an index): the zeros padding its end left out.
+fn as_text(mut out: Vec<u8>) -> Result<String> {
     while out.last() == Some(&0) {
         out.pop();
     }
@@ -237,7 +287,10 @@ fn read_text(drive: &mut TapeDrive, buf: &mut [u8]) -> Result<String> {
 /// The last index of partition `p`: (its first block, it, the block after
 /// its closing filemark). `None` when none is found there. Data written
 /// after the last index without one of its own (writing cut short) is
-/// passed over: the index before it is found.
+/// passed over: the index before it is found. So is an index whose writing
+/// was cut short (it isn't whole), and the file data before it: the newest
+/// whole index is looked for further back, one that says it is where it
+/// was found.
 pub(crate) fn last_index(drive: &mut TapeDrive, p: u32, buf: &mut [u8]) -> Result<Option<(u64, Index, u64)>> {
     drive.locate(p, 0)?;
     drive.space_to_eod()?;
@@ -249,30 +302,60 @@ pub(crate) fn last_index(drive: &mut TapeDrive, p: u32, buf: &mut [u8]) -> Resul
     // the filemark before the last index: back over two, forward over one
     drive.space_filemarks(-2)?;
     drive.space_filemarks(1)?;
-    let start = drive.position()?.block;
-    let text = read_text(drive, buf)?;
-    let after = drive.position()?.block;
-    match Index::parse(&text) {
-        Ok(ix) => {
-            log!(
-                "ltfs last index of partition {}: blocks {start}..{after} (end of data at {eod}), generation {}, volume {}, says it is at {}:{}, previous {}, written {} by {}",
-                letter(p),
-                ix.generation,
-                ix.volume_uuid,
-                ix.location.partition,
-                ix.location.block,
-                ix.previous.map_or_else(|| "none".to_owned(), |l| format!("{}:{}", l.partition, l.block)),
-                ix.update_time.format(),
-                ix.creator
-            );
-            Ok(Some((start, ix, after)))
+    for back in 0..INDEX_LOOKBACK {
+        let start = drive.position()?.block;
+        // what can't be read as text (not UTF-8, too large) is no whole
+        // index: passed over like one that doesn't parse. The tape failing
+        // to read stops the look (the other partition's copy is used).
+        let text = match read_index_text(drive, buf) {
+            Ok(t) => Ok(t),
+            Err(Error::Corrupt(why)) => Err(why),
+            Err(e) => return Err(e),
+        };
+        let after = drive.position()?.block;
+        let why = match text.as_ref().map(|t| t.as_deref().map(Index::parse)) {
+            Err(why) => why.clone(),
+            Ok(None) => "no index there".to_owned(),
+            // an index says where it is: one found elsewhere isn't this
+            // partition's index at this place (a copy, file data)
+            Ok(Some(Ok(ix))) if ix.location.block != start || ix.location.partition != letter(p) => {
+                format!("an index that says it is at {}:{}", ix.location.partition, ix.location.block)
+            }
+            Ok(Some(Ok(ix))) => {
+                log!(
+                    "ltfs last index of partition {}: blocks {start}..{after} (end of data at {eod}), generation {}, volume {}, says it is at {}:{}, previous {}, written {} by {}",
+                    letter(p),
+                    ix.generation,
+                    ix.volume_uuid,
+                    ix.location.partition,
+                    ix.location.block,
+                    ix.previous.map_or_else(|| "none".to_owned(), |l| format!("{}:{}", l.partition, l.block)),
+                    ix.update_time.format(),
+                    ix.creator
+                );
+                if back > 0 {
+                    log!("ltfs last index of partition {}: what follows it is no whole index (its writing was cut short): this one is used", letter(p));
+                }
+                return Ok(Some((start, ix, after)));
+            }
+            Ok(Some(Err(e))) => {
+                let text = text.as_ref().ok().and_then(|t| t.as_deref()).unwrap_or("");
+                let head: String = text.chars().take(300).collect();
+                format!("not a whole index ({e}), {} bytes: {head:?}", text.len())
+            }
+        };
+        log!("ltfs last index of partition {}: blocks {start}..{after} (end of data at {eod}): {why}; looking further back", letter(p));
+        if start <= FIRST_INDEX {
+            break;
         }
-        Err(e) => {
-            let head: String = text.chars().take(300).collect();
-            log!("ltfs last index of partition {}: blocks {start}..{after} (end of data at {eod}) aren't an index ({e}), {} bytes: {head:?}", letter(p), text.len());
-            Ok(None)
-        }
+        // the stretch before: back over the filemark before this one and
+        // the one before that, forward over one
+        drive.locate(p, start)?;
+        drive.space_filemarks(-2)?;
+        drive.space_filemarks(1)?;
     }
+    log!("ltfs last index of partition {}: no whole index found (end of data at {eod})", letter(p));
+    Ok(None)
 }
 
 impl<'d> Volume<'d> {
@@ -296,11 +379,13 @@ impl<'d> Volume<'d> {
                 }
                 la
             }
-            (Ok(la), Err(e)) if other_copy_helps(&e) => {
+            // one label that can't be read, or that isn't an LTFS label any
+            // more (overwritten, damaged): the other's
+            (Ok(la), Err(e)) if other_copy_helps(&e) || matches!(e, Error::NotLtfs(_)) => {
                 lost(1, true, e, &mut damage);
                 la
             }
-            (Err(e), Ok(mut lb)) if other_copy_helps(&e) => {
+            (Err(e), Ok(mut lb)) if other_copy_helps(&e) || matches!(e, Error::NotLtfs(_)) => {
                 lost(0, true, e, &mut damage);
                 lb.location = 'a';
                 lb
@@ -399,6 +484,22 @@ impl<'d> Volume<'d> {
             warnings: Vec::new(),
             damage,
         })
+    }
+
+    /// The volume's newest index as the tape gives it now: read again from
+    /// both partitions, as a new mount would find it (not the one in
+    /// memory). What is checked against it is known to be findable.
+    pub fn index_on_tape(&mut self) -> Result<Index> {
+        let (ip, dp) = (part_number(self.label.index_partition), part_number(self.label.data_partition));
+        self.pos = None;
+        let a = last_index(self.drive, ip, &mut self.buf);
+        let b = last_index(self.drive, dp, &mut self.buf);
+        self.pos = None;
+        let newest = [a?, b?].into_iter().flatten().map(|(_, ix, _)| ix).max_by_key(|ix| ix.generation).ok_or_else(|| Error::Corrupt("no index was found on the tape".into()))?;
+        if newest.volume_uuid != self.label.volume_uuid {
+            return Err(Error::Corrupt("the index on the tape belongs to another volume".into()));
+        }
+        Ok(newest)
     }
 
     /// The drive, for anything else.
